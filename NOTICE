@@ -1,0 +1,46 @@
+BanyanPM
+Copyright (C) 2026 Sergey Pilipenko
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+--------------------------------------------------------------------------------
+This work incorporates and derives from the following.
+
+1. Bonsai — a gravitational N-body tree code for GPUs
+   Copyright the Bonsai authors: Jeroen Bedorf, Evghenii Gaburov and
+   Simon Portegies Zwart.
+   Licensed under the Apache License, Version 2.0.
+   http://www.apache.org/licenses/LICENSE-2.0
+
+   BanyanPM's tree construction, the warp-cooperative tree traversal, the device
+   memory abstractions and the program skeleton derive directly from Bonsai. The
+   code has been ported from CUDA to HIP and modified substantially: the force
+   kernel, the time integration, the timestep criterion, the softening, the
+   periodic TreePM split and the I/O have been rewritten to follow Gadget-2.
+
+   As required by the Apache License 2.0 Section 4, this notice is retained and
+   the files carry notice of modification. Apache-2.0 material may be relicensed
+   under GPLv3 in a combined work; the combined work as distributed here is
+   GPLv3.
+
+2. GADGET-2 — a cosmological N-body/SPH simulation code
+   Copyright Volker Springel.
+   Released under the GNU General Public License, version 2 or later.
+
+   GADGET-2 is the REFERENCE IMPLEMENTATION that BanyanPM's physics is modelled
+   on and validated against. Its algorithms were reimplemented here: the
+   opening criteria, the spline softening, the drift and kick factor tables,
+   the individual timestep criterion, the TreePM short/long-range split and the
+   snapshot and parameter-file formats. Source locations in GADGET-2 are cited
+   throughout the code comments so that any behaviour can be checked against the
+   original.
+
+   Volker Springel is not an author of BanyanPM and has no involvement in it.
+   Neither GADGET-2 nor its authors endorse this work.
+
+   GADGET-2's "version 2 or later" grant is what makes distribution under GPLv3
+   possible, and GPLv3 is what allows the Apache-2.0 Bonsai material to be
+   combined in.
