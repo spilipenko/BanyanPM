@@ -65,6 +65,46 @@ Full documentation of every build option, every `.param` key — including which
 which are parsed and ignored — and the differences from GADGET-2 is in the sections below and in
 [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) for the runtime switches.
 
+### ⚠ Known issue: GPU resets on a machine with a display attached
+
+On a GPU that also drives a desktop, runs die within a few steps with
+`HW Exception by GPU node-1 ... reason: GPU Hang`, and `dmesg` shows repeated GPU resets. This is
+**not** a fault in the simulation — it is the display stack being starved.
+
+The tree walk is issued as **a single kernel dispatch per step covering all active groups**, and at
+512³ with the Springel criterion that dispatch runs for **~7 seconds**. While it occupies the GPU
+the compositor cannot complete its work, so the graphics ring hits `amdgpu.lockup_timeout`
+(default **2000 ms**) and the driver resets the device. The simulation is collateral damage. The
+giveaway in `dmesg` is a **graphics** ring timeout immediately before each reset:
+
+```
+amdgpu: ring gfx_0.0.0 timeout, signaled seq=31272, emitted seq=31274
+```
+
+It looks like a code bug because it is reproducible, always at the same step, and specific to the
+Springel criterion — but only because that criterion produces the long dispatch. Geometric opening,
+or a loose `ErrTolForceAcc`, shortens the dispatch enough to fit inside the watchdog and appears to
+"work".
+
+Two workarounds, either sufficient:
+
+```bash
+# 1. run without a desktop -- nothing is submitting graphics work to starve
+sudo systemctl isolate multi-user.target        # ... run ...
+sudo systemctl isolate graphical.target
+
+# 2. give the rings enough headroom (Fedora; merges with existing kernel args, reboot required)
+sudo grubby --update-kernel=ALL --args="amdgpu.lockup_timeout=20000,20000,20000,20000"
+```
+
+Verified: with the timeout raised, 512³ Springel at `ErrTolForceAcc=0.002` runs with a desktop
+session active and zero GPU resets. Expect the desktop to freeze for several seconds at a time
+during dense steps — the GPU really is busy.
+
+The proper fix is in this code, not in your kernel parameters: the walk should be split into
+several dispatches so no single launch monopolises the GPU for seconds. Until then, a machine used
+for both display and simulation needs one of the workarounds above.
+
 ---
 
 ## Validation
