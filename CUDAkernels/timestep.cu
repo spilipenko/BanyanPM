@@ -10,14 +10,27 @@
 PROF_MODULE(timestep);
 
 #include "node_specs.h"
+#include "gadget_timeline.h"
+
+// Phase 2: the timeline is integer. Ticks govern WHEN things happen -- the sync point, whether a
+// particle is active, how long its step is -- and are exact by construction. The drift and kick
+// factor tables still want a scale factor, so ticks are converted to `a` at the point of use, in
+// double, which is strictly more accurate than the float32 `a` that used to be stored.
+__device__ __forceinline__ float gadget_ti_to_a(int ti, double logTimeBegin, double dPerTick,
+                                                int comoving)
+{
+  const double x = logTimeBegin + (double) ti * dPerTick;
+  return (float) (comoving ? exp(x) : x);
+}
+
 #include "gadget_driftfac.h"
 
 
 //Reduce function to get the minimum timestep
 static __device__ __forceinline__ void get_TnextD(const int n_bodies,
-                                     float2 *time,
-                                     float *tnext, volatile float *sdata) {
-  //float2 time : x is time begin, y is time end
+                                     int2 *time,
+                                     int *tnext, volatile int *sdata) {
+  //int2 time : x is Ti_begstep, y is Ti_endstep (ticks)
 
   // perform first level of reduction,
   // reading from global memory, writing to shared memory
@@ -25,15 +38,15 @@ static __device__ __forceinline__ void get_TnextD(const int n_bodies,
   unsigned int tid      = threadIdx.x;
   unsigned int i        = blockIdx.x*(blockSize*2) + threadIdx.x;
   unsigned int gridSize = blockSize*2*gridDim.x;
-  sdata[tid] = 1.0e10f;
-  float tmin = 1.0e10f;
+  sdata[tid] = GADGET_TIMEBASE + 1;
+  int tmin = GADGET_TIMEBASE + 1;
 
   // we reduce multiple elements per thread.  The number is determined by the
   // number of active thread blocks (via gridSize).  More blocks will result
   // in a larger gridSize and therefore fewer elements per thread
   while (i < n_bodies) {
-    if (i             < n_bodies) tmin = fminf(tmin, time[i            ].y);
-    if (i + blockSize < n_bodies) tmin = fminf(tmin, time[i + blockSize].y);
+    if (i             < n_bodies) tmin = min(tmin, time[i            ].y);
+    if (i + blockSize < n_bodies) tmin = min(tmin, time[i + blockSize].y);
 
     i += gridSize;
   }
@@ -42,8 +55,8 @@ static __device__ __forceinline__ void get_TnextD(const int n_bodies,
   __syncthreads();
 
   // do reduction in shared mem
-  if (blockSize >= 512) { if (tid < 256) { sdata[tid] = tmin = fminf(tmin, sdata[tid + 256]); } __syncthreads(); }
-  if (blockSize >= 256) { if (tid < 128) { sdata[tid] = tmin = fminf(tmin, sdata[tid + 128]); } __syncthreads(); }
+  if (blockSize >= 512) { if (tid < 256) { sdata[tid] = tmin = min(tmin, sdata[tid + 256]); } __syncthreads(); }
+  if (blockSize >= 256) { if (tid < 128) { sdata[tid] = tmin = min(tmin, sdata[tid + 128]); } __syncthreads(); }
   if (blockSize >= 128) { if (tid <  64) { sdata[tid] = tmin = fminf(tmin, sdata[tid +  64]); } __syncthreads(); }
   // Unsynchronised warp-reduction tail replaced (see gpu_boundaryReduction in build_tree.cu for
   // the instance where this was caught failing). EMUSYNC expands to NOTHING here, so these were
@@ -51,7 +64,7 @@ static __device__ __forceinline__ void get_TnextD(const int n_bodies,
   // instead; __syncthreads() is reached by every thread in the block.
   for (unsigned int s = 32; s > 0; s >>= 1)
   {
-    if (blockSize >= 2 * s && tid < s) { sdata[tid] = tmin = fminf(tmin, sdata[tid + s]); }
+    if (blockSize >= 2 * s && tid < s) { sdata[tid] = tmin = min(tmin, sdata[tid + s]); }
     __syncthreads();
   }
 
@@ -60,9 +73,9 @@ static __device__ __forceinline__ void get_TnextD(const int n_bodies,
 }
 
 KERNEL_DECLARE(get_Tnext)(const int n_bodies,
-                                     float2 *time,
-                                     float *tnext) {
-  extern __shared__ float sdata[];
+                                     int2 *time,
+                                     int *tnext) {
+  extern __shared__ int sdata[];
   get_TnextD(n_bodies, time, tnext, sdata);
 }
 
@@ -427,13 +440,15 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
 										real4 	*pos,
 										real4 	*vel,
 										real4 	*acc,
-										float2 	*time,
+										int2 	*time,
 										real4 	*pPos,
 										real4 	*pVel,
 										int     comovingIntegrationOn,
 										const float *driftTable,
 										const float *gravKickTable,
 										double  logTimeBegin,   // T29: double
+										double  dPerTick,       // Phase 2: ticks -> log(a)
+										int     tp_ti,          // Phase 2: previous sync point, ticks
 										double  logTimeMax){
   const uint bid = blockIdx.y * gridDim.x + blockIdx.x;
   const uint tid = threadIdx.x;
@@ -445,7 +460,9 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
   float4 p = pos [idx];
   float4 v = vel [idx];
   (void) acc; // no longer used: Gadget-2's DM drift has no acceleration term, see below
-  float tb = time[idx].x;
+  // Ti_begstep is a tick; the drift factor table wants a scale factor, so convert at the point of
+  // use, in double. This is strictly more accurate than the float32 `a` previously stored here.
+  const float tb = gadget_ti_to_a(time[idx].x, logTimeBegin, dPerTick, comovingIntegrationOn);
 
   #ifdef DO_BLOCK_TIMESTEP
     // T6 (contract C-D-01): the drift anchor must be the GLOBAL previous sync time, not this
@@ -473,7 +490,7 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
     const float t0 = t0_drift, t1 = tc;
   #else
     float dt_cb  = tc - tp;
-    time[idx].x  = tp;
+    time[idx].x  = tp_ti;
     const float t0 = tp, t1 = tc;
   #endif
 
@@ -514,8 +531,8 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
 // index-space hazard as the old Tickets 12/23/27 -- the fix is the same oriParticleOrder
 // translation correct_particles() already applies to this exact buffer.
 KERNEL_DECLARE(setActiveGroups)(const int n_bodies,
-                                            float tc,
-                                            float2 *time,
+                                            int tc,          // Ti_current, in ticks
+                                            int2 *time,
                                             uint  *body2grouplist,
                                             uint  *valid_list,
                                             const int n_groups,
@@ -528,7 +545,9 @@ KERNEL_DECLARE(setActiveGroups)(const int n_bodies,
 
   // C-D-03b: translate into the space bodies_time actually lives in.
   const uint timeIdx = g_cd03b_fix_index ? oriParticleOrder[idx] : idx;
-  float te = time[timeIdx].y;
+  // Integer equality. As float32 scale factors this comparison missed the rendezvous by 1 ULP and
+  // cost a whole system step (T24/T38); it cannot now.
+  const int te = time[timeIdx].y;
 
   //Set the group to active if the time current = time end of
   //this particle. Can be that multiple particles write to the
@@ -576,7 +595,7 @@ static __device__ __forceinline__ float tiMidpointD(const float a1, const float 
 
 KERNEL_DECLARE(correct_particles)(const int n_bodies,
                                   /*  1 */   float tc,
-                                  /*  2 */   float2 *time,
+                                  /*  2 */   int2   *time,        // ticks
                                   /*  3 */   uint   *active_list,
                                   /*  4 */   real4 *vel,
                                   /*  5 */   real4 *acc0,
@@ -588,12 +607,14 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
                                   /* 11 */   real4 *pVel,
                                   /* 12 */   uint  *unsorted,
                                   /* 13 */   real4 *acc0_new,
-                                  /* 14 */   float2 *time_new,
+                                  /* 14 */   int2   *time_new,    // ticks
                                   /* 15 */   int    comovingIntegrationOn,
                                   /* 16 */   const float *gravKickTable,
                                   /* 17 */   double logTimeBegin,   // T29: double
                                   /* 18 */   double logTimeMax,
-                                  /* 19 */   const float *newEnd)
+                                  /* 19 */   const int   *newEnd, // ticks
+                                  /* 20 */   double dPerTick,
+                                  /* 21 */   int    Ti_current)
 {
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid =  threadIdx.y * blockDim.x + threadIdx.x;
@@ -620,7 +641,7 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
     const uint cd03_unsorted = unsorted[idx];
     // C-D-03: a particle promoted by its group but not actually due keeps drifting, is not kicked,
     // and keeps its existing time bin -- exactly what Gadget-2 does for a non-due particle.
-    const bool cd03_notDue = g_cd03_strict_active && (time[cd03_unsorted].y != tc);
+    const bool cd03_notDue = g_cd03_strict_active && (time[cd03_unsorted].y != Ti_current);
     if (active_list[idx] != 1 || cd03_notDue)
     {
       const uint unsortedIdx = cd03_unsorted;
@@ -673,13 +694,13 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
 #if 0
   float4 v  = vel [idx];
   float4 a1 = acc1[idx];
-  float  tb = time[idx].x;
+  float  tb = gadget_ti_to_a(time[idx].x, logTimeBegin, dPerTick, comovingIntegrationOn);
   v = pVel[idx];
 #else
   const uint unsortedIdx = unsorted[idx];
 
   float4 a1 = acc1[idx];
-  float  tb = time[unsortedIdx].x;   // old Ti_begstep (of the step that just ended)
+  float  tb = gadget_ti_to_a(time[unsortedIdx].x, logTimeBegin, dPerTick, comovingIntegrationOn); // old Ti_begstep
   float4 v  = pVel[unsortedIdx];
 
 #endif
@@ -696,9 +717,13 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
   // C-D-02: end of the step that just ended -- the particle's own stored Ti_endstep, not the
   // global sync time (identical whenever the particle is genuinely due; different exactly when
   // group activation promoted it early).
-  const float teOld  = g_cd02_kick_tend ? time[unsortedIdx].y : tc;
+  const float teOld  = g_cd02_kick_tend
+                         ? gadget_ti_to_a(time[unsortedIdx].y, logTimeBegin, dPerTick, comovingIntegrationOn)
+                         : tc;
   const float tstart = tiMidpointD(tb, teOld, comovingIntegrationOn);        // midpoint of old step
-  const float tend   = tiMidpointD(tc, newEnd[idx], comovingIntegrationOn);  // midpoint of new step
+  const float tend   = tiMidpointD(tc,
+                         gadget_ti_to_a(newEnd[idx], logTimeBegin, dPerTick, comovingIntegrationOn),
+                         comovingIntegrationOn);  // midpoint of new step
 
   float dt_gravkick = tend - tstart;
   if (comovingIntegrationOn)
@@ -712,7 +737,7 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
   //Store the corrected velocity, accelaration and the new time step info
   vel     [idx] = v;
   acc0_new[idx] = a1;
-  time_new[idx] = make_float2(tc, newEnd[idx]);  // Ti_begstep = old Ti_endstep; Ti_endstep = new
+  time_new[idx] = make_int2(Ti_current, newEnd[idx]);  // Ti_begstep = old Ti_endstep; Ti_endstep = new
   unsorted[idx] = idx;  //Have to reset it in case we do not resort the particles
 
   //Adjust the search radius for the next iteration to get closer to the
@@ -763,15 +788,17 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
                                        float    minSizeTimestep,
                                        float    dtDisplacement,
                                        int      comovingFlag,
-                                       float    *newEnd,
-                                       float2   *time,          /* C-D-13: old (begin,end) pair */
+                                       int      *newEnd,        /* ticks */
+                                       int2     *time,          /* C-D-13: old (begin,end) pair, ticks */
                                        uint     *unsorted,      /* oriParticleOrder: time[] is in ORIGINAL order */
                                        real4    *bodies_acc,
                                        float    *bodies_forceSoftening,
                                        uint     *active_list,
                                        float    timelineSpan,
                                        float    timelineOrigin,
-                                       float    timeMax){      /* C-D-10: end of the timespan */
+                                       float    timeMax,       /* C-D-10: end of the timespan */
+                                       double   dPerTick,      /* Phase 2 */
+                                       int      Ti_current){   /* Phase 2 */
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid =  threadIdx.y * blockDim.x + threadIdx.x;
   const int dim =  blockDim.x * blockDim.y;
@@ -861,33 +888,10 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
   // All of this is done in double deliberately -- see tickets/T29. One tick is only ~2.3-3.7 float32
   // ULP wide, so a float32 tick index cannot be trusted to be exact, and this rule is a divisibility
   // test where being off by one tick inverts the answer.
-  if (g_cd04_timeline_ladder && timelineSpan > 0.0f)
-  {
-    const double dtick = (double) timelineSpan / gadget_timebase_ticks((double) timelineSpan);
-    const double tcAx  = comovingFlag ? log((double) tc) : (double) tc;
-    const long long n  = (long long) floor((tcAx - (double) timelineOrigin) / dtick + 0.5);
-
-    // INDEX SPACE: bodies_time is NOT resorted by the per-iteration sort, so it is in ORIGINAL
-    // order and must be read through oriParticleOrder -- exactly as correct_particles does
-    // (`time[cd03_unsorted]`, :574). Reading time[idx] here compared the WRONG particle's old step
-    // length; this rule is a divisibility test on that value, so a wrong read silently inverts the
-    // decision. Same class of defect as C-B-13/C-C-18/C-D-08.
-    const float2 told  = time[unsorted[idx]];
-    const double begAx = comovingFlag ? log((double) told.x) : (double) told.x;
-    const double endAx = comovingFlag ? log((double) told.y) : (double) told.y;
-    const long long sOld = (long long) floor((endAx - begAx) / dtick + 0.5);
-    const long long sNew = (long long) floor((double) dt / dtick + 0.5);
-    atomicAdd(&g_cd13_reached, 1u);
-    if (sOld > 0 && sNew > sOld) atomicAdd(&g_cd13_grow, 1u);
-
-    // sOld <= 0 is the first step (Gadget starts every particle at Ti_begstep == Ti_endstep == 0,
-    // where the test passes trivially because n == 0); leave those alone.
-    if (g_cd13_sync && sOld > 0 && sNew > sOld && (n % sNew) != 0)
-    {
-      dt = (float) ((double) sOld * dtick);
-      atomicAdd(&g_cd13_blocked, 1u);
-    }
-  }
+  // C-D-13's synchronisation rule is applied on the integer timeline further down, where
+  // ti_step is a power of two and the divisibility test is therefore satisfiable. The float-era
+  // version computed a non-power-of-two tick count from float32 times and blocked essentially
+  // every growth attempt (measured: grow_attempts == blocked, every iteration).
 
   // Phase 5 ticket 08 (PLAN.md): a real, serious bug found via this ticket's own end-to-end
   // comoving run -- confirmed by direct source citation, not assumption. Gadget-2's own
@@ -926,11 +930,31 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
     // Form the step-end time in DOUBLE and hand the snap that value directly -- see
     // snapToTimelineTick's comment. Rounding to float32 here first is what made the snap miss the
     // tick (and hence the rendezvous) in a measured 27.8% of cases.
-    const double rawD    = comovingFlag ? (double) tc * exp((double) dt)
-                                        : (double) tc + (double) dt;
-    const float  raw     = (float) rawD;
-    const float  snapped = snapToTimelineTick(rawD, timelineOrigin, timelineSpan, comovingFlag);
-    float end = (snapped > tc) ? snapped : raw;
+    // Phase 2: dt is in dloga (or linear time when not comoving). Convert it to a POWER-OF-TWO
+    // number of ticks, as GADGET-2 does (timestep.c:348-350). Power-of-two is not cosmetic: it is
+    // what makes every bin length divide TIMEBASE, so the bins form a nested lattice and one step
+    // of bin 2^k lands on exactly the tick two steps of bin 2^(k-1) reach. That is the property
+    // the float32 timeline could not provide, and its absence is what produced the 1-ULP phantom
+    // steps (T24/T38) -- 84-96% of all steps on a multi-species zoom IC.
+    const double wantTicks = (double) dt / dPerTick;
+    int ti_step = (int) gadget_tick_pow2_floor(wantTicks);
+
+    // GADGET-2's growth rule (timestep.c:352-357): a particle may only LENGTHEN its step when the
+    // new step still divides the remaining span, which keeps it on the lattice. This test was
+    // previously applied to a non-power-of-two tick count and was therefore essentially never
+    // satisfiable -- every growth was blocked (C-D-13).
+    const int tiEndOld = time[unsorted[idx]].y;
+    const int tiBegOld = time[unsorted[idx]].x;
+    const int sOldTick = tiEndOld - tiBegOld;
+    atomicAdd(&g_cd13_reached, 1u);
+    if (sOldTick > 0 && ti_step > sOldTick) atomicAdd(&g_cd13_grow, 1u);
+    if (g_cd13_sync && sOldTick > 0 && ti_step > sOldTick &&
+        ((GADGET_TIMEBASE - tiEndOld) % ti_step) != 0)
+    {
+      ti_step = sOldTick;
+      atomicAdd(&g_cd13_blocked, 1u);
+    }
+    if (ti_step < 1) ti_step = 1;
 
     // C-D-10: no particle may be scheduled beyond the end of the simulated timespan. Gadget-2
     // truncates the step so the last one lands exactly on TIMEBASE (timestep.c:248-252):
@@ -946,10 +970,11 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
     // Guarded on `timeMax > tc` so a particle already at (or past) the end is left alone rather
     // than given a zero-length step, which C-D-14's check would correctly treat as fatal; the
     // driver's loop-exit test ends the run in that case, exactly as Gadget's does.
-    if (timeMax > 0.0f && timeMax > tc && end > timeMax)
-      end = timeMax;
+    // C-D-10 in its exact GADGET-2 form, now that the timespan is an integer count: the last step
+    // lands precisely on TIMEBASE, so the final state sits at TimeMax rather than one step past it.
+    if (GADGET_TIMEBASE - Ti_current < ti_step) ti_step = GADGET_TIMEBASE - Ti_current;
 
-    newEnd[idx] = end;
+    newEnd[idx] = Ti_current + ti_step;
   }
 
   // C-D-14: deliberate stall injection, off unless GADGET_HIP_T7_INJECT=1 (see g_t7_injectStall).
@@ -1136,11 +1161,12 @@ static __device__ void compute_energy_double_prekickD(const int n_bodies,
                                             real4 *vel,
                                             real4 *acc,
                                             uint  *unsorted,
-                                            float2 *time,
+                                            int2   *time,   // Phase 2: ticks
                                             float  tc,
                                             int    comovingFlag,
                                             const float *gravKickTable,
                                             double logTimeBegin,   // T29: double
+                                            double dPerTick,       // Phase 2
                                             double logTimeMax,
                                             const float *forceSoftening,
                                             double selfCoef,
@@ -1166,8 +1192,11 @@ static __device__ void compute_energy_double_prekickD(const int n_bodies,
       real4 temp = vel[u];
       if (g_energy_extrap)
       {
-        const float2 t    = time[u];
-        const float  tmid = tiMidpointD(t.x, t.y, comovingFlag);
+        const int2   t    = time[u];
+        // Ti_begstep/Ti_endstep are ticks; convert before taking the kick midpoint.
+        const float  tmid = tiMidpointD(gadget_ti_to_a(t.x, logTimeBegin, dPerTick, comovingFlag),
+                                        gadget_ti_to_a(t.y, logTimeBegin, dPerTick, comovingFlag),
+                                        comovingFlag);
         const float  dtk  = comovingFlag
             ? driftFactorD(gravKickTable, logTimeBegin, logTimeMax, tmid, tc)
             : (tc - tmid);
@@ -1219,11 +1248,12 @@ KERNEL_DECLARE(compute_energy_double_prekick)(const int n_bodies,
                                             real4 *vel,
                                             real4 *acc,
                                             uint  *unsorted,
-                                            float2 *time,
+                                            int2   *time,   // Phase 2: ticks
                                             float  tc,
                                             int    comovingFlag,
                                             const float *gravKickTable,
                                             double logTimeBegin,   // T29: double
+                                            double dPerTick,       // Phase 2
                                             double logTimeMax,
                                             const float *forceSoftening,
                                             double selfCoef,
@@ -1231,7 +1261,7 @@ KERNEL_DECLARE(compute_energy_double_prekick)(const int n_bodies,
                                             double2 *energy) {
   extern __shared__ double shDDataKin[];
   compute_energy_double_prekickD(n_bodies, pos, vel, acc, unsorted, time, tc, comovingFlag,
-                                  gravKickTable, logTimeBegin, logTimeMax,
+                                  gravKickTable, logTimeBegin, dPerTick, logTimeMax,
                                   forceSoftening, selfCoef, cc10Coef, energy, shDDataKin);
 }
 
@@ -1247,29 +1277,29 @@ void timestep_test_compute_dt(int n, float tc, float errTolIntAccuracy, float at
 {
   real4  *d_acc = nullptr;
   float  *d_soft = nullptr;
-  float  *d_newEnd = nullptr;
+  int    *d_newEnd = nullptr;   // Phase 2: ticks
   uint   *d_active = nullptr;
 
   hipMalloc((void**)&d_acc,   n * sizeof(real4));
   hipMalloc((void**)&d_soft,  n * sizeof(float));
-  hipMalloc((void**)&d_newEnd,  n * sizeof(float));
+  hipMalloc((void**)&d_newEnd,  n * sizeof(int));
   hipMalloc((void**)&d_active, n * sizeof(uint));
 
   hipMemcpy(d_acc,  h_acc,          n * sizeof(real4), hipMemcpyHostToDevice);
   hipMemcpy(d_soft, h_forceSoftening, n * sizeof(float), hipMemcpyHostToDevice);
   std::vector<uint> ones(n, 1u);
   hipMemcpy(d_active, ones.data(), n * sizeof(uint), hipMemcpyHostToDevice);
-  hipMemset(d_newEnd, 0, n * sizeof(float));
+  hipMemset(d_newEnd, 0, n * sizeof(int));
 
   // C-D-13 added a `time` (begin,end) input. This harness passes timelineSpan = 0, which disables
   // both the ladder and the SYNCHRONIZATION rule, so the contents are never read -- but the buffer
   // must still be a valid allocation. Seed it with (tc,tc), the same "first step" state main.cpp
   // initialises real particles to, so the harness stays meaningful if the span is ever turned on.
-  float2 *d_time = nullptr;
-  CU_SAFE_CALL(hipMalloc((void**)&d_time, n * sizeof(float2)));
+  int2   *d_time = nullptr;     // Phase 2: (Ti_beg, Ti_end)
+  CU_SAFE_CALL(hipMalloc((void**)&d_time, n * sizeof(int2)));
   {
-    std::vector<float2> h_time(n, make_float2(tc, tc));
-    hipMemcpy(d_time, h_time.data(), n * sizeof(float2), hipMemcpyHostToDevice);
+    std::vector<int2> h_time(n, make_int2(0, 0));
+    hipMemcpy(d_time, h_time.data(), n * sizeof(int2), hipMemcpyHostToDevice);
   }
   // time[] is indexed through oriParticleOrder in the real call path; the harness is a flat
   // synthetic set, so identity is the correct mapping here.
@@ -1287,11 +1317,12 @@ void timestep_test_compute_dt(int n, float tc, float errTolIntAccuracy, float at
                       n, tc, errTolIntAccuracy, atime, fac1, hubble_a, maxSizeTimestep,
                       minSizeTimestep, dtDisplacement, comovingFlag, d_newEnd, d_time, d_unsorted,
                       d_acc, d_soft, d_active, /*timelineSpan=*/0.0f, /*timelineOrigin=*/0.0f,
-                      /*timeMax=*/0.0f);   // C-D-10: clamp disabled in the synthetic harness
+                      /*timeMax=*/0.0f,
+                     /*dPerTick*/ 1.0, /*Ti_current*/ 0);   // C-D-10: clamp disabled in the synthetic harness
   hipDeviceSynchronize();
 
   std::vector<float> h_newEnd(n);
-  hipMemcpy(h_newEnd.data(), d_newEnd, n * sizeof(float), hipMemcpyDeviceToHost);
+  hipMemcpy(h_newEnd.data(), d_newEnd, n * sizeof(int), hipMemcpyDeviceToHost);
   for (int i = 0; i < n; i++) h_dtOut[i] = h_newEnd[i] - tc;
 
   hipFree(d_acc); hipFree(d_soft); hipFree(d_newEnd); hipFree(d_active); hipFree(d_time); hipFree(d_unsorted);
@@ -1409,6 +1440,23 @@ KERNEL_DECLARE(gadget_refresh_softening)(const int n,
 //
 // Accumulation is in double via atomicAdd on 6 bins. The bin count is tiny and contention is
 // therefore high, so each block reduces privately in shared memory first and commits once.
+// Phase 0b instrument: number of out-of-range oriParticleOrder entries seen by the kernel. Zero
+// on a healthy run; non-zero identifies the stall as an index-space defect rather than contention.
+__device__ unsigned int g_dtglobals_badidx = 0;
+
+void dtglobals_reset_badidx(void)
+{
+  const unsigned int z = 0;
+  hipMemcpyToSymbol(HIP_SYMBOL(g_dtglobals_badidx), &z, sizeof(z));
+}
+
+unsigned int dtglobals_read_badidx(void)
+{
+  unsigned int v = 0;
+  hipMemcpyFromSymbol(&v, HIP_SYMBOL(g_dtglobals_badidx), sizeof(v));
+  return v;
+}
+
 KERNEL_DECLARE(gadget_timestep_globals)(const int n,
                                         const real4 *pos,          // current order: mass in .w
                                         const real4 *vel,          // ORIGINAL order
@@ -1435,21 +1483,41 @@ KERNEL_DECLARE(gadget_timestep_globals)(const int n,
     if (t >= 0 && t < 6)
     {
       const uint  o = unsorted[idx];
-      const real4 v = vel[o];
-      const double v2 = (double) v.x * v.x + (double) v.y * v.y + (double) v.z * v.z;
-      atomicAdd(&sVSum[t], v2);
-      atomicAdd(&sCount[t], 1ull);
-      // No double atomicMin; CAS on the bit pattern. Masses here are positive, so the ordering of
-      // positive doubles matches the ordering of their bit patterns as unsigned integers.
-      const double m = (double) pos[idx].w;
-      unsigned long long mBits = __double_as_longlong(m);
-      unsigned long long old = __double_as_longlong(sMinMass[t]);
-      while (mBits < old)
+      // Bounds guard: an out-of-range index here reads outside `vel`, which faults the device
+      // rather than returning a wrong answer, so it has to be checked and not assumed.
+      //
+      // T41: this used to `return`, which is undefined behaviour -- the HIP model requires every
+      // thread of a block to reach each __syncthreads(), and the returning thread does not.
+      // Being precise about when it actually bites, because it matters for how much weight to
+      // put on it: AMD's s_barrier counts WAVEFRONTS, not threads, and a wave stays alive while
+      // any lane is active. So partial-lane divergence is harmless in practice, and only an
+      // ENTIRE wavefront taking the return can deadlock the remaining waves at the barrier.
+      // That is unlikely here but not impossible -- bad indices would arrive in runs of 64
+      // if oriParticleOrder were stale over a contiguous range, which is exactly the failure
+      // this guard was added to catch. So the guard written to diagnose a hang could, in its
+      // worst case, cause one. Skip the particle instead; every thread still reaches the barrier.
+      if (o >= (uint) n)
       {
-        const unsigned long long prev =
-            atomicCAS((unsigned long long *) &sMinMass[t], old, mBits);
-        if (prev == old) break;
-        old = prev;
+        atomicAdd(&g_dtglobals_badidx, 1u);
+      }
+      else
+      {
+        const real4 v = vel[o];
+        const double v2 = (double) v.x * v.x + (double) v.y * v.y + (double) v.z * v.z;
+        atomicAdd(&sVSum[t], v2);
+        atomicAdd(&sCount[t], 1ull);
+        // No double atomicMin; CAS on the bit pattern. Masses here are positive, so the ordering
+        // of positive doubles matches the ordering of their bit patterns as unsigned integers.
+        const double m = (double) pos[idx].w;
+        unsigned long long mBits = __double_as_longlong(m);
+        unsigned long long old = __double_as_longlong(sMinMass[t]);
+        while (mBits < old)
+        {
+          const unsigned long long prev =
+              atomicCAS((unsigned long long *) &sMinMass[t], old, mBits);
+          if (prev == old) break;
+          old = prev;
+        }
       }
     }
   }

@@ -20,7 +20,9 @@
 #include <tuple>
 #include <cstring>
 
-bool gadget_hip_debug_log = false;   // set from main.cpp (--debug / GADGET_HIP_DEBUG)
+bool gadget_hip_debug_log = false;
+// T40: GPU time of the previous step's tree walk, in ms (see hipEventElapsedTime below).
+static float g_t40LastWalkMs = 0.0f;   // set from main.cpp (--debug / GADGET_HIP_DEBUG)
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -193,8 +195,8 @@ static void cd01_trace(tree_structure &tree, const char *stage, int iter, double
         const real4  p  = tree.bodies_Ppos[i];
         const real4  pp = tree.bodies_Ppos[i];
         const real4  v  = tree.bodies_vel[i];
-        const float2 t  = tree.bodies_time[i];
-        fprintf(stderr, "[CD01] %-5s iter=%d id=%llu idx=%d tb=%.9g te=%.9g tp=%.9g tc=%.9g "
+        const int2   t  = tree.bodies_time[i];   // Phase 2: (Ti_beg, Ti_end) in ticks
+        fprintf(stderr, "[CD01] %-5s iter=%d id=%llu idx=%d tb=%d te=%d tp=%.9g tc=%.9g "
                         "pos=%.9g,%.9g,%.9g Ppos=%.9g,%.9g,%.9g vel=%.9g,%.9g,%.9g\n",
                 stage, iter, ids[k], i, t.x, t.y, tp, tc,
                 p.x, p.y, p.z, pp.x, pp.y, pp.z, v.x, v.y, v.z);
@@ -246,7 +248,7 @@ static void traceParticleTrajectory(tree_structure &tree, const char *stage, int
     real4 p  = tree.bodies_Ppos[i];
     real4 v  = tree.bodies_vel[i];
     real4 a  = tree.bodies_acc0[i];
-    float2 bt = tree.bodies_time[i];
+    int2 bt = tree.bodies_time[i];
     double amag = sqrt((double)a.x * a.x + (double)a.y * a.y + (double)a.z * a.z);
     fprintf(flog,
             "iter=%d stage=%s t=%.9g id=%llu pos=(%.9g,%.9g,%.9g) vel=(%.9g,%.9g,%.9g) "
@@ -1822,6 +1824,10 @@ bool octree::iterate_once(IterationData &idata) {
     float ms=0, msLET=0;
 #if 1 //enable when load-balancing, gets the accurate GPU time from events
     CU_SAFE_CALL(hipEventElapsedTime(&ms, startLocalGrav, endLocalGrav));
+    // T40: remember the walk's own GPU time so the next step can size its chunks from measurement
+    // rather than a guess. These events are already recorded and already read here, so this costs
+    // nothing and adds no synchronisation.
+    g_t40LastWalkMs = ms;
     if(nProcs > 1)  CU_SAFE_CALL(hipEventElapsedTime(&msLET,startRemoteGrav, endRemoteGrav));
 
     msLET += runningLETTimeSum;
@@ -2249,7 +2255,7 @@ void octree::predict(tree_structure &tree)
 
   //First we get the minimum time, which is the next integration time
   #ifdef DO_BLOCK_TIMESTEP
-    getTNext.set_args(sizeof(float)*128, &tree.n, tree.bodies_time.p(), tnext.p());
+    getTNext.set_args(sizeof(int)*128, &tree.n, tree.bodies_time.p(), tnext.p());
     getTNext.setWork(-1, 128, NBLOCK_REDUCE);
     getTNext.execute2(execStream->s());
 
@@ -2258,19 +2264,27 @@ void octree::predict(tree_structure &tree)
     //in block step we need syncs and global communication
     if(tree.n == 0)
     {
-      t_previous  =  t_current;
-      t_current  += timeStep;
+      Ti_previous = Ti_current;
+      Ti_current  = std::min<gadget_tick_t>(Ti_current + 1, GADGET_TIMEBASE);
+      t_previous  = (float) gadgetTimeline.toTime(Ti_previous);
+      t_current   = (float) gadgetTimeline.toTime(Ti_current);
     }
     else
     {
       //Reduce the last parts on the host
       tnext.d2h();
-      t_previous = t_current;
-      t_current  = tnext[0];
+      // Phase 2: the sync point is an INTEGER minimum over Ti_endstep. Every particle that should
+      // meet here holds the identical tick, so the meeting is exact -- the float32 version missed
+      // it by 1 ULP and burned a whole system step on the miss (T24/T38).
+      Ti_previous = Ti_current;
+      Ti_current  = tnext[0];
       for (int i = 1; i < NBLOCK_REDUCE ; i++)
       {
-          t_current = std::min(t_current, tnext[i]);
+          Ti_current = std::min(Ti_current, tnext[i]);
       }
+      // The derived scale factors, for everything downstream that wants one.
+      t_previous = (float) gadgetTimeline.toTime(Ti_previous);
+      t_current  = (float) gadgetTimeline.toTime(Ti_current);
       // C-D-23 invariant probe (GADGET_HIP_INVARIANTS=1): t_current must be EXACTLY the minimum
       // over every particle's bodies_time[].y. This contract is worth checking rather than
       // assuming: its own probe notes that tnext[] had already been caught holding denormal bit
@@ -2282,14 +2296,14 @@ void octree::predict(tree_structure &tree)
         if (invOn)
         {
           tree.bodies_time.d2h();
-          float trueMin = tree.bodies_time[0].y;
-          int   nAtMin  = 0;
+          int trueMin = tree.bodies_time[0].y;
+          int nAtMin  = 0;
           for (int i = 1; i < tree.n; i++) trueMin = std::min(trueMin, tree.bodies_time[i].y);
           for (int i = 0; i < tree.n; i++) if (tree.bodies_time[i].y == trueMin) nAtMin++;
           fprintf(stderr,
-            "[INVARIANT] C-D-23 active-set argmin: %s  reduced=%.9g true_min=%.9g "
+            "[INVARIANT] C-D-23 active-set argmin: %s  reduced=%d true_min=%d "
             "(particles at min: %d/%d)\n",
-            (t_current == trueMin) ? "OK" : "VIOLATED", (double)t_current, (double)trueMin,
+            (Ti_current == trueMin) ? "OK" : "VIOLATED", Ti_current, trueMin,
             nAtMin, tree.n);
         }
       }
@@ -2336,7 +2350,7 @@ void octree::predict(tree_structure &tree)
           for (int k = 0; k < 6; k++) {
             int idx = sampleIdx[k];
             if (idx < 0 || idx >= tree.n) continue;
-            float2 bt = tree.bodies_time[idx];
+            int2 bt = tree.bodies_time[idx];
             uint32_t xb, yb;
             memcpy(&xb, &bt.x, sizeof(xb));
             memcpy(&yb, &bt.y, sizeof(yb));
@@ -2444,7 +2458,7 @@ void octree::predict(tree_structure &tree)
     predictParticles.set_args(0, &tree.n, &t_current, &t_previous, tree.bodies_Ppos.p(), tree.bodies_vel.p(),
                     tree.bodies_acc0.p(), tree.bodies_time.p(), tree.bodies_Ppos.p(), tree.bodies_Pvel.p(),
                     &predictComovingFlag, gadgetDriftTable.p(), gadgetGravKickTable.p(),
-                    &gadgetLogTimeBegin, &gadgetLogTimeMax);
+                    &gadgetLogTimeBegin, &gadgetDPerTick, &Ti_previous, &gadgetLogTimeMax);
     predictParticles.setWork(tree.n, 128);
     predictParticles.execute2(execStream->s());
 
@@ -3006,12 +3020,28 @@ void octree::recomputeSoftening(tree_structure &tree)
   static const bool t35NoDeviceSoft = (getenv("GADGET_HIP_T35_NO_DEVICE_SOFT") != NULL);
   const bool softeningOnDevice = gadgetTypeByIdOk && !gadgetIdToType.empty() && !t35NoDeviceSoft;
 
-  if (!softeningOnDevice && !gadgetIdToType.empty())
+  // Host bodies_type must follow the sort for EVERY multi-type IC, not only when the softening
+  // itself is computed on the host: the zoom region (recomputeZoomRegion / pm_zoom_region_out_of_
+  // range) and the snapshot writer (data.type[i] = bodies_type[i]) read it against the CURRENT
+  // (sorted) particle order. With T35's device softening this rebuild was skipped, so on a
+  // multi-species IC the zoom region came out as the whole box ("crosses the periodic box
+  // boundary") and snapshots would have carried the wrong type per particle. Uniform ICs leave
+  // gadgetIdToType empty and are unaffected. Use the flat id->type table when it exists (a
+  // 1e8-particle zoom IC makes the unordered_map path far too slow per rebuild).
+  if (!gadgetIdToType.empty())
   {
     tree.bodies_ids.d2h();
     const int n = (int) tree.bodies_type.size();
-    for (int i = 0; i < n; ++i)
-      tree.bodies_type[i] = gadgetIdToType.at(tree.bodies_ids[i]);
+    if (gadgetTypeByIdOk && !gadgetTypeById.empty())
+    {
+      for (int i = 0; i < n; ++i)
+        tree.bodies_type[i] = gadgetTypeById[tree.bodies_ids[i]];
+    }
+    else
+    {
+      for (int i = 0; i < n; ++i)
+        tree.bodies_type[i] = gadgetIdToType.at(tree.bodies_ids[i]);
+    }
   }
 
   GadgetSofteningState state;
@@ -3148,7 +3178,13 @@ void octree::recomputeSoftening(tree_structure &tree)
 
 void octree::recomputeTimestepGlobals(tree_structure &tree)
 {
-  static const bool t35NoDeviceDtPre = (getenv("GADGET_HIP_T35_NO_DEVICE_DT") != NULL);
+  // T41: the device reduction is the default again. It is decided ONCE, here, because the
+  // previous shape had two conditions that had to agree -- a copy guard and dtOnDevice --
+  // and when one was flipped without the other the host path silently ran on every
+  // uniform-box run, costing 1.05 s/step (28% of wall clock at 512^3) for two weeks.
+  // GADGET_HIP_T35_NO_DEVICE_DT=1 forces the host path for comparison or if a kernel
+  // stall reappears; GADGET_HIP_T35_DT_CROSSCHECK=1 validates one against the other.
+  static const bool t35NoDeviceDt = (getenv("GADGET_HIP_T35_NO_DEVICE_DT") != NULL);
   if (!haveGadgetParams || gadgetParams.ComovingIntegrationOn == 0)
   {
     // Matches find_dt_displacement_constraint()'s own early-out (timestep.c:574): no comoving
@@ -3161,7 +3197,13 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
   // method's own call site), not every timestep.
   // T35: these three copies (4.8 GB at 512^3) exist only to feed the host reduction below, which
   // the device path replaces -- so on that path they are skipped entirely.
-  if (t35NoDeviceDtPre || !gadgetTypeByIdOk || gadgetIdToType.empty())
+  const bool dtOnDevice = !t35NoDeviceDt && gadgetTypeByIdOk && !gadgetIdToType.empty();
+
+  // These three copies (4.8 GB at 512^3) exist ONLY to feed the host reduction below, so
+  // they are skipped whenever the device path runs. Both later consumers of the host
+  // arrays -- the snapshot/energy gather and the statisticsIter block -- issue their own
+  // d2h(), so nothing downstream depends on this one having happened.
+  if (!dtOnDevice)
   {
     tree.bodies_Ppos.d2h();
     tree.bodies_vel.d2h();
@@ -3188,8 +3230,18 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
   // T35: reduce on the device when we can. GADGET_HIP_T35_NO_DEVICE_DT=1 forces the host path, so
   // the two can be compared on one binary -- this feeds gadgetDtDisplacement, hence every
   // subsequent timestep, so "the step sequence is identical" is the equivalence test.
-  static const bool t35NoDeviceDt = (getenv("GADGET_HIP_T35_NO_DEVICE_DT") != NULL);
-  const bool dtOnDevice = !t35NoDeviceDt && gadgetTypeByIdOk && !gadgetIdToType.empty();
+  // History (T41): this kernel was switched off by default after it stalled the GPU on the
+  // 1e8-particle multi-species zoom ICs (once at step 5, and a driver "GPU Hang" at step 2).
+  // The comment that replaced it claimed "only multi-type ICs reach this branch at all, so
+  // the uniform-box production runs never exercised it" -- that was WRONG. The copy guard
+  // keyed off the same flag, so disabling the kernel put EVERY run on the host path.
+  // Measured cost at 512^3: 1.05 s/step, 28%% of wall clock (tickets/T41).
+  // One cause of the stall is now understood and fixed: the bounds guard added later to
+  // diagnose it did `return` from inside the block, leaving that thread short of the
+  // __syncthreads() the rest of the block was waiting at -- a divergent barrier, undefined
+  // and a hang on AMD. That guard postdates the original stalls, so it cannot be their
+  // cause; it is fixed in timestep.cu regardless. Whether the zoom stall itself is gone is
+  // an empirical question -- benchmarks B and C are the test.
   long long aggCount[6]  = {0,0,0,0,0,0};
   double    aggVSum[6]   = {0,0,0,0,0,0};
   double    aggMinMass[6] = {1e30,1e30,1e30,1e30,1e30,1e30};
@@ -3209,6 +3261,20 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
                                    dtAggVSum.p(), dtAggMinMass.p(), dtAggCount.p());
     gadgetTimestepGlobals.setWork(n, 128);
     gadgetTimestepGlobals.execute2(execStream->s());
+    // Phase 0b: the kernel indexes vel[] through oriParticleOrder. A stale or out-of-range entry
+    // there is an out-of-bounds device read, which is the leading suspect for the indefinite
+    // stalls seen on the 1e8-particle multi-species zoom ICs. Report it rather than let a wrong
+    // answer (or a hang) pass silently; the check costs one symbol read per step.
+    {
+      const unsigned int bad = dtglobals_read_badidx();
+      if (bad != 0)
+      {
+        fprintf(stderr, "[P0B] gadget_timestep_globals: %u out-of-range oriParticleOrder entries "
+                        "at iter=%d (n=%d) -- index-space defect, NOT contention\n",
+                bad, iter, localTree.n);
+        dtglobals_reset_badidx();
+      }
+    }
     execStream->sync();
     dtAggVSum.d2h(); dtAggMinMass.d2h(); dtAggCount.d2h();
 
@@ -3361,6 +3427,14 @@ void octree::initComovingTables()
   gadgetLogTimeBegin = tables.logTimeBegin;   // T29: keep double
   gadgetLogTimeMax   = tables.logTimeMax;
   haveGadgetComovingTables = true;
+
+  // Phase 2: the integer timeline, initialised at the first point where TimeBegin, TimeMax and the
+  // comoving flag are all known. From here ticks are the clock and t_current is derived from them.
+  initTimeline(gadgetParams.TimeBegin, gadgetParams.TimeMax, gadgetParams.ComovingIntegrationOn);
+  fprintf(stderr, "[TIMELINE] integer timeline: TIMEBASE=%d dPerTick=%.17g Ti_current=%d "
+                  "(TimeBegin=%.17g TimeMax=%.17g comoving=%d)\n",
+          GADGET_TIMEBASE, gadgetDPerTick, Ti_current,
+          gadgetParams.TimeBegin, gadgetParams.TimeMax, gadgetParams.ComovingIntegrationOn);
 }
 
 #ifdef GADGET_HIP_HIGHRES
@@ -3870,7 +3944,11 @@ void octree::approximate_gravity(tree_structure &tree)
   }
 
   //Set the kernel parameters, many!
-  approxGrav.set_args(0, &tree.n_active_groups,
+  // T40: the kernel's stop condition is `bid >= n_active_groups`, so passing a reduced value
+  // bounds a dispatch to a chunk. set_args stores the POINTER (my_cuda_rt.h), so this variable is
+  // re-read at every launch and can be advanced between chunks without re-issuing the arguments.
+  int t40GroupEnd = tree.n_active_groups;
+  approxGrav.set_args(0, &t40GroupEnd,
                          &tree.n,
                          tree.bodies_forceSoftening.p(), // Phase 5 ticket 03: per-particle Gadget-2
                                                           // ForceSoftening, replacing flat eps2
@@ -3947,7 +4025,58 @@ void octree::approximate_gravity(tree_structure &tree)
 #endif
   const bool t31_timeWalk = (getenv("GADGET_HIP_T31_TIME_WALK") != NULL);
   const double t31_walk0 = t31_timeWalk ? get_time() : 0.0;
-  approxGrav.execute2(gravStream->s());  //First half
+  {
+    // GADGET_HIP_WALK_CHUNKS: >0 forces a fixed chunk count, 0 disables chunking (one dispatch,
+    // the pre-T40 behaviour and the A/B control), unset/-1 sizes adaptively.
+    static const int t40Fixed = getenv("GADGET_HIP_WALK_CHUNKS")
+                                  ? atoi(getenv("GADGET_HIP_WALK_CHUNKS")) : -1;
+    static const double t40TargetMs = getenv("GADGET_HIP_WALK_CHUNK_MS")
+                                  ? atof(getenv("GADGET_HIP_WALK_CHUNK_MS")) : 300.0;
+    const int nAG = tree.n_active_groups;
+
+    int nChunks = 1;
+    if (t40Fixed > 0)      nChunks = t40Fixed;
+    else if (t40Fixed < 0)
+    {
+      // No measurement yet on the first walk of a run. Falling back to a single dispatch there
+      // leaves exactly the dispatch this ticket exists to bound -- measured at 3624 ms against a
+      // 293 ms median once sizing kicks in -- so start pessimistic and let the measurement correct
+      // it from the next step onward.
+      nChunks = (g_t40LastWalkMs > 0.0f)
+                  ? (int) ceil((double) g_t40LastWalkMs / t40TargetMs)
+                  : 16;
+    }
+    if (nChunks < 1)  nChunks = 1;
+    if (nChunks > 64) nChunks = 64;             // launch overhead is not free either
+    if (nAG > 0 && nChunks > nAG) nChunks = nAG;
+
+    if (nChunks <= 1 || nAG <= 0)
+    {
+      t40GroupEnd = nAG;
+      approxGrav.execute2(gravStream->s());     //First half
+    }
+    else
+    {
+      // The counter lives at activePartlist[n] and the retry lock at [n+1] (build.cpp sizes the
+      // buffer n+2). activePartlist is ALSO the walk's output mask, so only the counter slot may
+      // be touched between chunks -- re-zeroing the array would erase the previous chunks' output.
+      // Presetting is required rather than letting the counter carry over: blocks that race past
+      // the end still increment it, so it overshoots and would skip groups.
+      static uint t40Lo[65];
+      // .p() yields the address OF the device pointer (that is what set_args consumes); the device
+      // pointer itself comes from get_devMem(). Doing pointer arithmetic on .p() targets host
+      // memory and hipMemcpyAsync rejects it with "invalid argument".
+      uint *counter = ((uint *) tree.activePartlist.get_devMem()) + tree.n;
+      for (int c = 0; c < nChunks; ++c)
+      {
+        t40Lo[c]    = (uint) ((long long) nAG * c / nChunks);
+        t40GroupEnd = (int)  ((long long) nAG * (c + 1) / nChunks);
+        CU_SAFE_CALL(hipMemcpyAsync(counter, &t40Lo[c], sizeof(uint),
+                                    hipMemcpyHostToDevice, gravStream->s()));
+        approxGrav.execute2(gravStream->s());
+      }
+    }
+  }
   if (t31_timeWalk)
   {
     gravStream->sync();
@@ -4254,11 +4383,11 @@ void octree::correct(tree_structure &tree)
   LOG("Active particles: %d \n", tree.n_active_particles);
 
 
-  my_dev::dev_mem<float2>  float2Buffer;
+  my_dev::dev_mem<int2>    timeBuffer;    // Phase 2: bodies_time is ticks
   my_dev::dev_mem<real4>   real4Buffer1;
-  my_dev::dev_mem<float>   newEndBuffer;
+  my_dev::dev_mem<int>     newEndBuffer;   // Phase 2: the new Ti_endstep, in ticks
 
-  int memOffset = float2Buffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
+  int memOffset = timeBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
       memOffset = real4Buffer1.cmalloc_copy(tree.generalBuffer1, tree.n, memOffset);
       memOffset = newEndBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, memOffset);
 
@@ -4336,7 +4465,8 @@ void octree::correct(tree_structure &tree)
                           tree.bodies_acc1.p(),
                           tree.bodies_forceSoftening.p(),
                           tree.activePartlist.p(), &ts_timelineSpan, &ts_timelineOrigin,
-                          &ts_timeMax);   // C-D-10
+                          &ts_timeMax,
+                          &gadgetDPerTick, &Ti_current);   // C-D-10
     // C-D-14: Gadget-2 treats an unrepresentable (non-advancing) timestep as a hard error --
     // endrun(818), timestep.c:537-552. The port already counted the condition in compute_dt, but
     // t7_reset_nonadvancing()/t7_read_nonadvancing() were declared and defined and NEVER CALLED,
@@ -4399,20 +4529,21 @@ void octree::correct(tree_structure &tree)
                             tree.bodies_vel.p(), tree.bodies_acc0.p(), tree.bodies_acc1.p(),
                             tree.bodies_h.p(), tree.bodies_dens.p(), tree.bodies_Ppos.p(),
                             tree.bodies_Ppos.p(), tree.bodies_Pvel.p(), tree.oriParticleOrder.p(),
-                            real4Buffer1.p(), float2Buffer.p(),
+                            real4Buffer1.p(), timeBuffer.p(),
                             &correctComovingFlag, gadgetGravKickTable.p(),
-                            &gadgetLogTimeBegin, &gadgetLogTimeMax, newEndBuffer.p());
+                            &gadgetLogTimeBegin, &gadgetLogTimeMax, newEndBuffer.p(),
+                            &gadgetDPerTick, &Ti_current);
   correctParticles.setWork(tree.n, 128);
   correctParticles.execute2(execStream->s());
 
   //Copy the shuffled items back to their original buffers
   if (gadget_hip_debug_log)
-  fprintf(stderr, "[BUG4-COPYBACK] tree.n=%d real4Buffer1.get_size()=%d float2Buffer.get_size()=%d "
+  fprintf(stderr, "[BUG4-COPYBACK] tree.n=%d real4Buffer1.get_size()=%d timeBuffer.get_size()=%d "
                    "bodies_acc0.get_size()=%d bodies_time.get_size()=%d\n",
-          tree.n, real4Buffer1.get_size(), float2Buffer.get_size(),
+          tree.n, real4Buffer1.get_size(), timeBuffer.get_size(),
           tree.bodies_acc0.get_size(), tree.bodies_time.get_size());
   tree.bodies_acc0.copy_devonly(real4Buffer1, tree.n);
-  tree.bodies_time.copy_devonly(float2Buffer, float2Buffer.get_size());
+  tree.bodies_time.copy_devonly(timeBuffer, timeBuffer.get_size());
   {
     static int bug4CorrectIdx = -1;
     bug4CorrectIdx++;
@@ -4422,7 +4553,7 @@ void octree::correct(tree_structure &tree)
       int sIdx[6] = {0, 1, 1000, 16384, 32000, tree.n - 1};
       for (int k = 0; k < 6; k++) {
         int idx = sIdx[k];
-        float2 bt = tree.bodies_time[idx];
+        int2 bt = tree.bodies_time[idx];
         uint32_t xb, yb; memcpy(&xb,&bt.x,sizeof(xb)); memcpy(&yb,&bt.y,sizeof(yb));
         fprintf(stderr, "[BUG4-BRACKET] correctIdx=%d AFTER_COPYBACK bodies_time[%d]=(0x%08x(%.9g), 0x%08x(%.9g)) active_list[%d]=%u\n",
                 bug4CorrectIdx, idx, xb, bt.x, yb, bt.y, idx, tree.activePartlist[idx]);
@@ -4526,7 +4657,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     computeEnergyPreKick.set_args(sizeof(double)*128*2, &tree.n, tree.bodies_Ppos.p(), tree.bodies_Pvel.p(),
                                    tree.bodies_acc1.p(), tree.oriParticleOrder.p(), tree.bodies_time.p(),
                                    &t_current, &energyComovingFlag, gadgetGravKickTable.p(),
-                                   &gadgetLogTimeBegin, &gadgetLogTimeMax,
+                                   &gadgetLogTimeBegin, &gadgetDPerTick, &gadgetLogTimeMax,
                                    tree.bodies_forceSoftening.p(), &t30_selfCoef, &t30_cc10Coef,
                                    energy.p());
     computeEnergyPreKick.setWork(-1, 128, blockSize);
@@ -4981,8 +5112,9 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
       const real4 p  = tree.bodies_Ppos[i];
       const real4 v  = tree.bodies_vel[i];
       const real4 ac = tree.bodies_acc0[i];
-      const float2 bt = tree.bodies_time[i];
-      const double dtSinceKick = (double)this->t_current - (double)bt.x;
+      const int2 bt = tree.bodies_time[i];
+      // .x is Ti_begstep (ticks); convert before differencing against a scale factor.
+      const double dtSinceKick = (double)this->t_current - gadgetTimeline.toTime(bt.x);
       const double vx = (double)v.x + (double)ac.x * dtSinceKick;
       const double vy = (double)v.y + (double)ac.y * dtSinceKick;
       const double vz = (double)v.z + (double)ac.z * dtSinceKick;
@@ -5062,8 +5194,9 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
       const real4 p  = tree.bodies_Ppos[i];
       const real4 v  = tree.bodies_vel[i];
       const real4 ac = tree.bodies_acc0[i];
-      const float2 bt = tree.bodies_time[i];
-      const double dtSinceKick = (double)this->t_current - (double)bt.x;
+      const int2 bt = tree.bodies_time[i];
+      // .x is Ti_begstep (ticks); convert before differencing against a scale factor.
+      const double dtSinceKick = (double)this->t_current - gadgetTimeline.toTime(bt.x);
 
       const double potExtrapW = (double)ac.w
           - ((double)ac.x * (double)v.x + (double)ac.y * (double)v.y + (double)ac.z * (double)v.z)
@@ -5252,7 +5385,10 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
 // (load) order, so a resume is indistinguishable from a fresh IC load.
 // ==============================================================================================
 #define GADGET_HIP_RESTART_MAGIC   0x47484952u   /* "GHIR" */
-#define GADGET_HIP_RESTART_VERSION 1
+// v2: bodies_time holds (Ti_begstep, Ti_endstep) as int2 ticks rather than float2 scale factors.
+// The record is the same WIDTH, so a v1 file would deserialise without error and be interpreted as
+// ticks -- every particle's schedule silently wrong. Refusing on version is the only guard.
+#define GADGET_HIP_RESTART_VERSION 2
 
 struct GadgetHipRestartHeader
 {
@@ -5333,7 +5469,7 @@ bool octree::writeRestartFile(const char *path)
   ok = ok && fwrite(ids.data(),               sizeof(ullong), n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_vel[0],      sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_Pvel[0],     sizeof(real4),  n, f) == (size_t) n;
-  ok = ok && fwrite(&tree.bodies_time[0],     sizeof(float2), n, f) == (size_t) n;
+  ok = ok && fwrite(&tree.bodies_time[0],     sizeof(int2), n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_acc0[0],     sizeof(real4),  n, f) == (size_t) n;
   if (fclose(f) != 0) ok = false;
 
@@ -5379,7 +5515,7 @@ bool octree::readRestartFile(const char *path)
   ok = ok && fread(&tree.bodies_ids[0],  sizeof(ullong), n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_vel[0],  sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_Pvel[0], sizeof(real4),  n, f) == (size_t) n;
-  ok = ok && fread(&tree.bodies_time[0], sizeof(float2), n, f) == (size_t) n;
+  ok = ok && fread(&tree.bodies_time[0], sizeof(int2), n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_acc0[0], sizeof(real4),  n, f) == (size_t) n;
   fclose(f);
   if (!ok) { fprintf(stderr, "FATAL: restart: %s is truncated (short read)\n", path); return false; }

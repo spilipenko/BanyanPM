@@ -38,6 +38,10 @@ void t6_set_drift_anchor(int fromTp);
 // Ticket T9 (contracts C-B-06 / C-B-10b): fixed octree cell size as the MAC node-size term.
 void t9_set_cellsize_geo(int on);
 void t9_set_cellsize_bj(int on);
+
+// Phase 0b: out-of-range oriParticleOrder entries seen by gadget_timestep_globals.
+void dtglobals_reset_badidx(void);
+unsigned int dtglobals_read_badidx(void);
 void t9_set_no_s(int on);
 
 // Ticket T10: per-rebuild group-boundary rotation (decorrelates the group-corner force bias).

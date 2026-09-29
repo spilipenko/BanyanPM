@@ -5,6 +5,7 @@
 extern "C" void thrustDataReorderU4 (const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<uint4>  &dIn, my_dev::dev_mem<uint4>  &dOut);
 extern "C" void thrustDataReorderF4 (const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<float4> &dIn, my_dev::dev_mem<float4> &dOut);
 extern "C" void thrustDataReorderF2 (const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<float2> &dIn, my_dev::dev_mem<float2> &dOut);
+extern "C" void thrustDataReorderI2 (const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<int2>   &dIn, my_dev::dev_mem<int2>   &dOut);
 extern "C" void thrustDataReorderULL(const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<ullong> &dIn, my_dev::dev_mem<ullong> &dOut);
 extern "C" void thrustDataReorderF1 (const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<float>  &dIn, my_dev::dev_mem<float>  &dOut);
 
@@ -231,7 +232,7 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
     //Call the reorder data functions
     //generalBuffer is always at least 3xfloat4*N
     my_dev::dev_mem<real4>    real4Buffer1;
-    my_dev::dev_mem<float2>   float2Buffer;
+    my_dev::dev_mem<int2>     timeBuffer;   // Phase 2: bodies_time is ticks
     my_dev::dev_mem<ullong>   ullBuffer;
     my_dev::dev_mem<float>    realBuffer;
     // C-A-22, same reasoning as the !doFullShuffle branch above: one shared region, because every
@@ -239,7 +240,7 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
     // call's scratch. real4Buffer1 is already reused across six consecutive calls here, which is
     // the same argument applied to one type; this extends it across types. 9N uints -> 4N.
     real4Buffer1.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
-    float2Buffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
+    timeBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
     ullBuffer.   cmalloc_copy(tree.generalBuffer1, tree.n, 0);
     realBuffer.  cmalloc_copy(tree.generalBuffer1, tree.n, 0);
 
@@ -255,7 +256,7 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_acc1, real4Buffer1);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Ppos, real4Buffer1);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Pvel, real4Buffer1);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_time, float2Buffer);
+    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_time, timeBuffer);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_ids, ullBuffer);
 
     //Density values
@@ -333,6 +334,10 @@ template<> void octree::dataReorder2<float4>(const int N, my_dev::dev_mem<uint> 
 template<> void octree::dataReorder2<float2>(const int N, my_dev::dev_mem<uint> &permutation,
                                   my_dev::dev_mem<float2>  &dIn, my_dev::dev_mem<float2>  &dOut) {
   thrustDataReorderF2(N, permutation, dIn, dOut);
+}
+template<> void octree::dataReorder2<int2>(const int N, my_dev::dev_mem<uint> &permutation,
+                                  my_dev::dev_mem<int2>  &dIn, my_dev::dev_mem<int2>  &dOut) {
+  thrustDataReorderI2(N, permutation, dIn, dOut);
 }
 template<> void octree::dataReorder2<float>(const int N, my_dev::dev_mem<uint> &permutation,
                                  my_dev::dev_mem<float>  &dIn, my_dev::dev_mem<float>  &dOut) {

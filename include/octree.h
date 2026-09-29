@@ -2,6 +2,8 @@
 #ifndef _OCTREE_H_
 #define _OCTREE_H_
 
+#include "gadget_timeline.h"
+
 #include "gadget_params.h"
 #include "gadget_softening.h"
 #include "gadget_cosmology.h"
@@ -238,7 +240,11 @@ class tree_structure
     my_dev::dev_mem<real4>  bodies_vel;     //Velocities
     my_dev::dev_mem<real4>  bodies_acc0;    //Acceleration
     my_dev::dev_mem<real4>  bodies_acc1;    //Acceleration
-    my_dev::dev_mem<float2> bodies_time;    //The timestep details (.x=tb, .y=te
+    // Phase 2: INTEGER timeline. .x = Ti_begstep, .y = Ti_endstep, in ticks (GADGET-2
+    // allvars.h uses int Ti_begstep). Two particles that should re-synchronise now hold
+    // bit-identical values by construction; as float32 scale factors they differed by 1 ULP
+    // and the rendezvous was missed, costing a whole system step (T24/T38).
+    my_dev::dev_mem<int2>   bodies_time;    //The timestep details (.x=Ti_beg, .y=Ti_end
     my_dev::dev_mem<ullong> bodies_ids;
     my_dev::dev_mem<real4>  bodies_Ppos;    //Predicted position
     my_dev::dev_mem<real4>  bodies_Pvel;    //Predicted velocity
@@ -385,6 +391,12 @@ protected:
 
    //Simulation properties
   int           iter;
+  // Phase 2: ticks are the state of record; t_current/t_previous are DERIVED from them for the
+  // many call sites that legitimately want a scale factor (output epochs, snapshot headers,
+  // drift/kick table inputs). Nothing stores `a` as state any more.
+  gadget_tick_t Ti_current, Ti_previous;
+  GadgetTimeline gadgetTimeline;
+  double        gadgetDPerTick;   // == gadgetTimeline.dPerTick; set_args needs an addressable copy
   float         t_current, t_previous;
   float         snapshotIter;   
   float         quickDump, quickRatio;
@@ -566,7 +578,7 @@ public:
 
 
    //Memory used in the whole system, not depending on a certain number of particles
-   my_dev::dev_mem<float> 	tnext;
+   my_dev::dev_mem<int>   	tnext;   // Phase 2: sync point in ticks
    my_dev::dev_mem<uint>  	nactive;
    //General memory buffers
    my_dev::dev_mem<float3>  devMemRMIN;
@@ -988,9 +1000,24 @@ inline bool gadget_hip_stage_trace()
 
   //End library functions
 
-  void set_t_current(const float t) { t_current = t_previous = t; }
+  // Phase 2: ticks are the state of record. Setting a scale factor (IC epoch, restart, snapshot
+  // resume) re-derives them; if the timeline is not up yet, initTimeline() does it afterwards.
+  void set_t_current(const float t)
+  {
+    t_current = t_previous = t;
+    if (gadgetDPerTick > 0.0) Ti_current = Ti_previous = gadgetTimeline.toTick((double) t);
+  }
+  // Called once before the step loop. With --param the span comes from TimeBegin/TimeMax; without
+  // it (the --plummer/--cube development paths) the timeline is linear over [t_current, tEnd].
+  void initTimeline(double tBegin, double tMax, int comoving)
+  {
+    gadgetTimeline.init(tBegin, tMax, comoving);
+    gadgetDPerTick = gadgetTimeline.dPerTick;
+    Ti_current = Ti_previous = gadgetTimeline.toTick((double) t_current);
+  }
   void set_nextSnapTime(const float t) { nextSnapTime = t; }
   float get_t_current() const       { return t_current; }
+  gadget_tick_t get_Ti_current() const { return Ti_current; }
   void setUseDirectGravity(bool s)  { useDirectGravity = s;    }
   bool getUseDirectGravity() const  { return useDirectGravity; }
   void setErrTolForceAcc(float e)   { errTolForceAcc = e;      }
@@ -1017,6 +1044,8 @@ inline bool gadget_hip_stage_trace()
   {
     iter            = 0;
     t_current       = t_previous = 0;
+    Ti_current      = Ti_previous = 0;
+    gadgetDPerTick  = 0.0;
     src_directory   = NULL;
 
     if(argv != NULL)  execPath = argv[0];

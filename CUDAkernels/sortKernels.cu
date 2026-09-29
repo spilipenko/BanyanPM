@@ -129,6 +129,12 @@ extern "C" void thrustDataReorderF4(const int N, my_dev::dev_mem<uint> &permutat
 extern "C" void thrustDataReorderF2(const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<float2> &dIn, my_dev::dev_mem<float2> &dOut) {
   thrust::gather(permutation.thrustPtr(), permutation.thrustPtr() + N, dIn.thrustPtr(), dOut.thrustPtr());
 }
+extern "C" void thrustDataReorderI2(const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<int2> &dIn, my_dev::dev_mem<int2> &dOut) {
+  // Phase 2: bodies_time is (Ti_begstep, Ti_endstep) in ticks. A reorder is a pure permutation, so
+  // this is the F2 gather with the payload type corrected -- reinterpreting ticks as floats would
+  // work by accident here and break the moment anyone touched the values.
+  thrust::gather(permutation.thrustPtr(), permutation.thrustPtr() + N, dIn.thrustPtr(), dOut.thrustPtr());
+}
 extern "C" void thrustDataReorderF1(const int N, my_dev::dev_mem<uint> &permutation, my_dev::dev_mem<float> &dIn, my_dev::dev_mem<float> &dOut) {
   thrust::gather(permutation.thrustPtr(), permutation.thrustPtr() + N, dIn.thrustPtr(), dOut.thrustPtr());
 }

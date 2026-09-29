@@ -113,6 +113,7 @@ extern void displayTimers()
 }
 
 #include "octree.h"
+#include "gadget_timeline.h"
 #include "pm.h"
 #include "timestep_test.h"
 #include "gadget_cosmology.h"
@@ -438,6 +439,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		ADDUSAGE(" -r  --rebuild #        rebuild tree every # steps [" << rebuild_tree_rate << "]");
 		ADDUSAGE("     --restart-file #   restart-state path; written periodically and at end of run");
 		ADDUSAGE("     --resume           resume from --restart-file instead of the IC's state");
+		ADDUSAGE("     --timeline-test    one-shot integer-timeline self-check; exits after printing");
 		ADDUSAGE("     --debug            per-step developer probes (device pointers, buffer\n                        sizes, group-max traces); also GADGET_HIP_DEBUG=1");
 		ADDUSAGE("     --reducebodies #   cut down bodies dataset by # factor ");
 #ifdef USE_DUST
@@ -525,6 +527,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 			// different resume mechanisms, and with no --param both would fire on the same run.
 			opt.setFlag  ( "resume" );
 		opt.setFlag  ( "debug" );
+		opt.setFlag  ( "timeline-test" );
     opt.setOption( "plummer");
 #ifdef GALACTICS
     opt.setOption( "milkyway");
@@ -678,6 +681,42 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     if ((optarg = opt.getValue("restart-file"))) restartFilePath    = std::string(optarg);
     if (opt.getFlag("resume"))                   resumeFromRestart  = true;
     if (opt.getFlag("debug") || getenv("GADGET_HIP_DEBUG")) gadget_hip_debug_log = true;
+    if (opt.getFlag("timeline-test"))
+    {
+      // Properties the rest of Phase 2 depends on. If any of these fail the refactor is unsound,
+      // and it is far cheaper to learn that here than from a diverged 9,000-step run.
+      GadgetTimeline tl; tl.init(0.01, 1.0, 1);
+      int bad = 0;
+      // 1. Tick -> time -> tick is the identity. This is the property float32 could not provide.
+      for (long long ti = 0; ti <= GADGET_TIMEBASE; ti += (GADGET_TIMEBASE / 997) + 1)
+      {
+        const gadget_tick_t t = (gadget_tick_t) ti;
+        if (tl.toTick(tl.toTime(t)) != t) { bad++; if (bad < 4)
+          fprintf(stderr, "  ROUNDTRIP FAIL ti=%d -> %.17g -> %d\n", t, tl.toTime(t), tl.toTick(tl.toTime(t))); }
+      }
+      // 2. Endpoints are exact.
+      if (tl.toTime(0) != 0.01)  { bad++; fprintf(stderr, "  BEGIN FAIL %.17g\n", tl.toTime(0)); }
+      if (fabs(tl.toTime(GADGET_TIMEBASE) - 1.0) > 1e-15) { bad++; fprintf(stderr, "  END FAIL %.17g\n", tl.toTime(GADGET_TIMEBASE)); }
+      // 3. The rendezvous property, which is the whole point: one step of bin 2^k must land on the
+      //    same tick as two steps of bin 2^(k-1), exactly, for every k.
+      for (int k = 1; k <= 28; k++)
+      {
+        const gadget_tick_t coarse = (gadget_tick_t) 1 << k;
+        const gadget_tick_t fine   = coarse >> 1;
+        for (gadget_tick_t base = 0; base < (gadget_tick_t) 4 * coarse; base += coarse)
+          if (base + coarse != (base + fine) + fine) { bad++; break; }
+      }
+      // 4. Power-of-two flooring: the result divides TIMEBASE and does not exceed the request.
+      for (double want = 1.0; want < (double) GADGET_TIMEBASE; want *= 1.7)
+      {
+        const gadget_tick_t s2 = gadget_tick_pow2_floor(want);
+        if ((double) s2 > want || (GADGET_TIMEBASE % s2) != 0) { bad++;
+          fprintf(stderr, "  POW2 FAIL want=%.6g -> %d\n", want, s2); }
+      }
+      fprintf(stderr, "[TIMELINE-TEST] TIMEBASE=%d dPerTick=%.17g (dloga)\n", GADGET_TIMEBASE, tl.dPerTick);
+      fprintf(stderr, "[TIMELINE-TEST] %s (%d failures)\n", bad ? "FAILED" : "PASSED", bad);
+      return bad ? 1 : 0;
+    }
     if ((optarg = opt.getValue("reducebodies"))) reduce_bodies_factor = atoi  (optarg);
     if ((optarg = opt.getValue("reducedust")))	 reduce_dust_factor = atoi  (optarg);
 #if USE_OPENGL
@@ -1692,7 +1731,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     tree->localTree.bodies_vel[i]  = bodyVelocities[i];
     tree->localTree.bodies_Pvel[i] = bodyVelocities[i];
     tree->localTree.bodies_ids[i]  = bodyIDs[i];
-    tree->localTree.bodies_time[i] = make_float2(tree->get_t_current(), tree->get_t_current());
+    // Phase 2: GADGET-2 starts every particle at Ti_begstep == Ti_endstep == Ti_current
+    // (timestep.c), which makes the first step's synchronisation trivially exact.
+    tree->localTree.bodies_time[i] = make_int2(tree->get_Ti_current(), tree->get_Ti_current());
   }
 
   tree->localTree.bodies_time.h2d();

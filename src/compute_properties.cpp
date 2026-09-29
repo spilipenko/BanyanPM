@@ -47,7 +47,7 @@ void octree::compute_properties(tree_structure &tree) {
   //Set valid list to zero to reset the active particles
   tree.activeGrpList.zeroMemGPUAsync(execStream->s());
 
-  setActiveGrps.set_args(0, &tree.n, &t_current, tree.bodies_time.p(), tree.body2group_list.p(), tree.activeGrpList.p(), &tree.n_groups, tree.oriParticleOrder.p());
+  setActiveGrps.set_args(0, &tree.n, &Ti_current, tree.bodies_time.p(), tree.body2group_list.p(), tree.activeGrpList.p(), &tree.n_groups, tree.oriParticleOrder.p());
   setActiveGrps.setWork(tree.n, 128);
   setActiveGrps.execute2(execStream->s());
 

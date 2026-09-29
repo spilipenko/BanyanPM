@@ -65,28 +65,31 @@ Full documentation of every build option, every `.param` key — including which
 which are parsed and ignored — and the differences from GADGET-2 is in the sections below and in
 [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) for the runtime switches.
 
-### ⚠ Known issue: GPU resets on a machine with a display attached
+### GPU resets on a machine with a display attached — fixed, but read this if you see it
 
-On a GPU that also drives a desktop, runs die within a few steps with
-`HW Exception by GPU node-1 ... reason: GPU Hang`, and `dmesg` shows repeated GPU resets. This is
-**not** a fault in the simulation — it is the display stack being starved.
+On a GPU that also drives a desktop, runs used to die within a few steps with
+`HW Exception by GPU node-1 ... reason: GPU Hang`, and `dmesg` showed repeated GPU resets. This was
+**not** a fault in the physics — it was the display stack being starved.
 
-The tree walk is issued as **a single kernel dispatch per step covering all active groups**, and at
-512³ with the Springel criterion that dispatch runs for **~7 seconds**. While it occupies the GPU
-the compositor cannot complete its work, so the graphics ring hits `amdgpu.lockup_timeout`
-(default **2000 ms**) and the driver resets the device. The simulation is collateral damage. The
+The tree walk was issued as **a single kernel dispatch per step covering all active groups**, and at
+512³ with the Springel criterion that dispatch ran for **~7 seconds**. While it occupied the GPU
+the compositor could not complete its work, so the graphics ring hit `amdgpu.lockup_timeout`
+(default **2000 ms**) and the driver reset the device. The simulation was collateral damage. The
 giveaway in `dmesg` is a **graphics** ring timeout immediately before each reset:
 
 ```
 amdgpu: ring gfx_0.0.0 timeout, signaled seq=31272, emitted seq=31274
 ```
 
-It looks like a code bug because it is reproducible, always at the same step, and specific to the
+It looked like a code bug because it was reproducible, always at the same step, and specific to the
 Springel criterion — but only because that criterion produces the long dispatch. Geometric opening,
 or a loose `ErrTolForceAcc`, shortens the dispatch enough to fit inside the watchdog and appears to
-"work".
+"work", which sent the diagnosis down a blind alley for a while.
 
-Two workarounds, either sufficient:
+**The walk is now split into chunks of active groups**, sized adaptively from the previous step's
+measured walk time, so no single launch monopolises the device. The longest dispatch at 512³ fell
+from ~7300 ms to ~540 ms. If you are on an older build, or still see resets, either workaround
+below is sufficient:
 
 ```bash
 # 1. run without a desktop -- nothing is submitting graphics work to starve
@@ -98,12 +101,8 @@ sudo grubby --update-kernel=ALL --args="amdgpu.lockup_timeout=20000,20000,20000,
 ```
 
 Verified: with the timeout raised, 512³ Springel at `ErrTolForceAcc=0.002` runs with a desktop
-session active and zero GPU resets. Expect the desktop to freeze for several seconds at a time
-during dense steps — the GPU really is busy.
-
-The proper fix is in this code, not in your kernel parameters: the walk should be split into
-several dispatches so no single launch monopolises the GPU for seconds. Until then, a machine used
-for both display and simulation needs one of the workarounds above.
+session active and zero GPU resets. Expect the desktop to be sluggish during dense steps — the GPU
+really is busy.
 
 ---
 
@@ -134,6 +133,35 @@ ordinary between two independent codes.
 
 **Force accuracy.** 0.39% rms on the fine-particle force against the same reference.
 
+**Halo mass function across redshift.** A second run of the same ICs on the integer-timeline build,
+compared against the CPU reference at all seven epochs where the two output schedules coincide.
+Rockstar catalogues on both sides, 20 bins from the 20-particle mass (1.27e10 M⊙/h) upward; haloes
+are matched only when a counterpart agrees in **both** position and mass:
+
+| z | N(>20 p) GPU/CPU | N(>100 p) GPU/CPU | matched | median offset | mass bias |
+|---|---|---|---|---|---|
+| 6.00 | 0.9989 | 1.0199 | 98.86% | 0.0144 | +0.79% |
+| 4.39 | 0.9934 | 1.0060 | 98.64% | 0.0151 | +0.81% |
+| 3.14 | 0.9918 | 1.0051 | 98.32% | 0.0156 | +0.64% |
+| 2.19 | 0.9906 | 1.0008 | 98.21% | 0.0153 | +0.44% |
+| 1.45 | 0.9902 | 0.9998 | 98.32% | 0.0154 | +0.30% |
+| 0.89 | 0.9908 | 0.9990 | 98.37% | 0.0152 | +0.20% |
+| 0.45 | 0.9907 | 0.9999 | 98.53% | 0.0152 | +0.23% |
+
+![Halo mass function, CPU GADGET-2 vs BanyanPM at seven epochs](docs/massfunc-multi-epoch.png)
+
+Offsets in Mpc/h. No mass bin deviates by more than 3σ Poisson at any epoch, and at z = 0.45 the
+eight most massive bins reproduce the CPU counts *exactly* (300, 99, 43, 22, 8, 4, 3). The median
+halo offset is flat at **15 kpc/h** across a factor of five in expansion factor — it does not grow,
+even though individual particle trajectories diverge chaotically (rms 6e-2 Mpc/h between two runs
+of the same binary). The residual ~0.9% deficit is confined to the 20–100 particle resolution
+limit; above 100 particles the catalogues agree to 3 haloes in 58,240.
+
+**Restart.** Stopping a run and resuming from a checkpoint reproduces the uninterrupted run to
+within the PM-atomics noise floor — verified by comparing the stop/resume divergence against a
+control of two *uninterrupted* runs of the same binary, which agree no better (median 6.98e-4 vs
+6.71e-4 Mpc/h, rms 6.02e-2 vs 6.02e-2).
+
 Note that this validates dark-matter-only, periodic, TreePM runs at one resolution. Nothing else
 has been tested.
 
@@ -149,6 +177,12 @@ Same problem, same machine class — 512³ to z = 0, AMD Strix Halo (gfx1151) ag
 
 Both runs were 9,200–9,600 steps. The gain is concentrated at late times, where clustering makes
 the mesh assignment expensive; early steps are roughly at parity.
+
+That wall clock was measured on the float-timeline build. The integer timeline has not been timed
+over a full z = 0 run, so rather than extrapolate one, here is what *is* measured: per-step cost at
+matched expansion factor (a = 0.733), where the current build sits at **3.52 s/step** against
+**3.39–3.48 s/step** for the build the table above describes — parity, inside the spread between
+two different seeds of the older build.
 
 A per-phase breakdown of any run is in its `cpu.txt`. On a late step the cost is dominated by the
 tree walk on dense steps (~47%) and by the tree rebuild otherwise (~40%) — the long-range force is
@@ -168,10 +202,12 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   in kinetic energy and was withdrawn.
 - **The tree is rebuilt every step.** GADGET rebuilds at `TreeDomainUpdateFrequency` and drifts node
   centres of mass in between. **Open**, and the largest remaining cost.
-- **Time is float32**, not GADGET's integer timeline. Sync points are snapped to a tick lattice
-  whose spacing scales with the run's `log(a)` span so that one tick stays wider than a float32
-  ULP. **Open** — integer tick storage would remove this class of problem. One consequence: a run
-  restarted from a snapshot is not step-for-step identical to the run it continues.
+- **Integer timeline**, as in GADGET-2. Step boundaries are stored as integer ticks on a 2²⁸
+  lattice spanning `log(a)` from `TimeBegin` to `TimeMax`, so a sync point is exact rather than the
+  nearest representable float32, and the step ladder is a true power-of-two hierarchy. This
+  replaced a float32 clock whose rounding produced phantom sub-ULP steps — on a zoom test the step
+  count fell from 68,780 to ~2,710 against GADGET-2's 2,690. Restart files carry a version tag and
+  a build refuses to read the older float layout rather than reinterpret it.
 - **Not bit-reproducible.** PM mass assignment uses atomics; the floor is ~1e-8 relative. Establish
   that noise floor by running the same binary twice before attributing any difference to a change.
 - **I/O**: GADGET-2 format 1 only; one file per snapshot. `energy.txt` and `timings.txt` are not
