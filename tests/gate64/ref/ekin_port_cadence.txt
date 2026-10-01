@@ -1,0 +1,34 @@
+# Mean Ekin per statistics epoch over 4 known-good CADENCE runs of this port, AFTER T47.
+#
+# Re-measured 2026-10-01 because T47 knowingly changed the timestep criterion: its long-range term
+# was 43.007106x too small. That shifts this trajectory, and against the pre-T47 reference a good
+# run already sat at +0.653 of the 1.0 percent tolerance, i.e. on its way to failing at random.
+# Updating a reference is only legitimate when the physics is KNOWN to have changed; this is that
+# case, and the noise floor was re-measured at the same time, as the README requires.
+#
+# Run-to-run spread of these four: 0.510 percent, consistent with the
+# 0.42-0.51 percent floor in T46. Step counts: 2695, 2658, 2615, 2672 (mean 2660),
+# against GADGET-2s own 2657 at this resolution. Before T47 the port averaged about 2620.
+#
+# Columns: a   Ekin   (GADGET energy.txt column 4 units, i.e. the port Ekin divided by a squared)
+0.010000 1.339970e+10
+0.060430 8.039860e+10
+0.110152 1.479320e+11
+0.160353 2.209710e+11
+0.210022 3.043352e+11
+0.260039 3.992918e+11
+0.310241 5.047612e+11
+0.360280 6.159540e+11
+0.410009 7.202245e+11
+0.460089 8.206142e+11
+0.510227 9.084200e+11
+0.560133 1.003348e+12
+0.610099 1.084965e+12
+0.660055 1.148242e+12
+0.710098 1.215292e+12
+0.760080 1.253978e+12
+0.810385 1.292632e+12
+0.860142 1.336330e+12
+0.910392 1.380478e+12
+0.960333 1.451435e+12
+1.000000 1.488008e+12

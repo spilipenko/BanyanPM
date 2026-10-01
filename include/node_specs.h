@@ -6,6 +6,17 @@ typedef unsigned int uint;
 typedef float real;
 typedef float4 real4;
 
+// Moved here from octree.h (a host-only header) so that the kernel declarations in
+// devFunctionDefinitions.h can name the SAME type the kernels are defined with. That header
+// previously carried a duplicate called setupParams2, which made three scanKernels declarations
+// disagree with their definitions by type while being layout-compatible.
+typedef struct setupParams {
+  int jobs;                     //Minimal number of jobs for each 'processor'
+  int blocksWithExtraJobs;      //Some ' processors'  do one extra job all with bid < bWEJ
+  int extraElements;            //The elements that didn't fit completely
+  int extraOffset;              //Start of the extra elements
+} setupParams;
+
 //Dont uncomment this yet
 #define DO_BLOCK_TIMESTEP
 

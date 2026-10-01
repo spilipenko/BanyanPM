@@ -1,5 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "pm.h"
+#include "gadget_units.h"
+#include "gadget_index_spaces.h"   // CurrentOrder / IdSpace (T44 item 1)   // GFreeAcc: PM output carries no G until someone applies it
 #include <cstdlib>
 
 // Flattened index into the padded density grid (row-major x,y,z with z the fastest/padded axis).
@@ -272,53 +274,88 @@ void pm_add_potential_to_acc(float4 *d_acc, const float *d_potential, int n, hip
 // energies while quietly scrambling the long-range force. Storing by particle ID instead makes the
 // association permanent: ids are dense here (the same property T35's softening table relies on,
 // and checked the same way), so the id IS the index.
-__global__ void pm_scatter_by_id_kernel(const int n, const unsigned long long *ids,
-                                        const float *fx, const float *fy, const float *fz,
-                                        const float *pot,
-                                        float *outX, float *outY, float *outZ, float *outPot)
+__global__ void pm_scatter_by_id_kernel(const int n,
+                                        CurrentOrder<const unsigned long long> ids,
+                                        CurrentOrder<const float> fx,
+                                        CurrentOrder<const float> fy,
+                                        CurrentOrder<const float> fz,
+                                        CurrentOrder<const float> pot,
+                                        IdSpace<GFreeAcc> outX, IdSpace<GFreeAcc> outY,
+                                        IdSpace<GFreeAcc> outZ, IdSpace<float> outPot)
 {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  const unsigned long long id = ids[i];
-  if (id >= (unsigned long long) n) return;   // guarded by the same dense-id check as T35
-  outX[id] = fx[i]; outY[id] = fy[i]; outZ[id] = fz[i]; outPot[id] = pot[i];
+  // This kernel IS the space change: it reads the PM solve's output in post-sort order and writes it
+  // into id space, which is the whole reason the stored long-range force survives the re-sort
+  // between PM steps.
+  const CurrentIdx i = { blockIdx.x * blockDim.x + threadIdx.x };
+  if (i.v >= (unsigned int) n) return;
+  const ParticleId id = id_at(i, ids);
+  if (id.v >= (unsigned long long) n) return;   // guarded by the same dense-id check as T35
+  // The PM solve is called with gravityConstant = 1.0f, so what it produces is G-free. Tagging
+  // it at the point of STORAGE is what makes every later consumer declare which G it applies.
+  // (outPot stays a plain float: the potential's G travels with the t30 coefficients in
+  // compute_energies, a different and more tangled path -- see the note in pm.h.)
+  outX[id].v = fx[i]; outY[id].v = fy[i]; outZ[id].v = fz[i]; outPot[id] = pot[i];
 }
 
 void pm_scatter_by_id(const unsigned long long *d_ids, const float *d_fx, const float *d_fy,
                       const float *d_fz, const float *d_pot,
-                      float *d_outX, float *d_outY, float *d_outZ, float *d_outPot,
+                      GFreeAcc *d_outX, GFreeAcc *d_outY, GFreeAcc *d_outZ, float *d_outPot,
                       int n, hipStream_t stream)
 {
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
+  // The wrappers are the boundary: raw device pointers in, space-tagged views out. Constructing
+  // them here rather than at every caller keeps include/pm.h's interface unchanged.
   hipLaunchKernelGGL(pm_scatter_by_id_kernel, dim3(blocks), dim3(threads), 0, stream,
-                     n, d_ids, d_fx, d_fy, d_fz, d_pot, d_outX, d_outY, d_outZ, d_outPot);
+                     n, CurrentOrder<const unsigned long long>{d_ids},
+                     CurrentOrder<const float>{d_fx}, CurrentOrder<const float>{d_fy},
+                     CurrentOrder<const float>{d_fz}, CurrentOrder<const float>{d_pot},
+                     IdSpace<GFreeAcc>{d_outX}, IdSpace<GFreeAcc>{d_outY},
+                     IdSpace<GFreeAcc>{d_outZ}, IdSpace<float>{d_outPot});
 }
 
 // Gather-and-add, masked. The gather is the price of id-space storage, but it is paid only for
 // ACTIVE particles -- 1.6% of them on the sparse steps this exists to speed up -- because the mask
 // is tested before the indirection.
-__global__ void pm_add_by_id_masked_kernel(float4 *acc, const unsigned long long *ids,
-                                           const float *byIdX, const float *byIdY,
-                                           const float *byIdZ, const float *byIdPot,
-                                           int n, const int *active)
+__global__ void pm_add_by_id_masked_kernel(CurrentOrder<float4> acc,
+                                           CurrentOrder<const unsigned long long> ids,
+                                           IdSpace<const GFreeAcc> byIdX,
+                                           IdSpace<const GFreeAcc> byIdY,
+                                           IdSpace<const GFreeAcc> byIdZ,
+                                           IdSpace<const float> byIdPot,
+                                           int n, CurrentOrder<const int> active)
 {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n || active[i] == 0) return;
-  const unsigned long long id = ids[i];
-  if (id >= (unsigned long long) n) return;
-  acc[i].x += byIdX[id];
-  acc[i].y += byIdY[id];
-  acc[i].z += byIdZ[id];
-  acc[i].w += byIdPot[id];
+  const CurrentIdx i = { blockIdx.x * blockDim.x + threadIdx.x };
+  if (i.v >= (unsigned int) n || active[i] == 0) return;
+  const ParticleId id = id_at(i, ids);
+  if (id.v >= (unsigned long long) n) return;
+  // Phase 3 wants the POTENTIAL without the force: under the PM cadence the long-range force is
+  // applied as a separate kick, so folding it into acc here would double-count it, but the
+  // potential is a diagnostic and still belongs in acc.w. Each group is therefore optional --
+  // previously all four were dereferenced unconditionally, and passing NULL for the force faulted
+  // the GPU at NULL + id*4.
+  // This is the one path where staying G-free is correct: acc is bodies_acc1, and
+  // pm_scale_acc_masked multiplies the whole of it by G a few lines later in the caller. The escape
+  // is named at length so that using it is a decision rather than a reflex.
+  if (!byIdX.is_null())
+  {
+    acc[i].x += byIdX[id].raw_because_acc1_is_G_scaled_downstream();
+    acc[i].y += byIdY[id].raw_because_acc1_is_G_scaled_downstream();
+    acc[i].z += byIdZ[id].raw_because_acc1_is_G_scaled_downstream();
+  }
+  if (!byIdPot.is_null()) acc[i].w += byIdPot[id];
 }
 
 void pm_add_by_id_masked(float4 *d_acc, const unsigned long long *d_ids,
-                         const float *d_byIdX, const float *d_byIdY, const float *d_byIdZ,
+                         const GFreeAcc *d_byIdX, const GFreeAcc *d_byIdY,
+                         const GFreeAcc *d_byIdZ,
                          const float *d_byIdPot, int n, const int *d_active, hipStream_t stream)
 {
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   hipLaunchKernelGGL(pm_add_by_id_masked_kernel, dim3(blocks), dim3(threads), 0, stream,
-                     d_acc, d_ids, d_byIdX, d_byIdY, d_byIdZ, d_byIdPot, n, d_active);
+                     CurrentOrder<float4>{d_acc}, CurrentOrder<const unsigned long long>{d_ids},
+                     IdSpace<const GFreeAcc>{d_byIdX}, IdSpace<const GFreeAcc>{d_byIdY},
+                     IdSpace<const GFreeAcc>{d_byIdZ}, IdSpace<const float>{d_byIdPot},
+                     n, CurrentOrder<const int>{d_active});
 }

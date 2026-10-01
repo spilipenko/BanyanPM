@@ -3,10 +3,53 @@ cmake_minimum_required(VERSION 3.21)
 # HIP-native fork of bonsai/runtime, stripped to a headless TreePM core
 # (no renderer/OpenGL/dust/galactics). See AMD_PORT_PLAN.md.
 
-# ROCm's own clang++ is used as the host C++ compiler, not stock GCC: hip_runtime_api.h on this
-# install hits a real compile error under g++ 16 (hipHostMallocDefault "not declared" at its use
-# site despite being #define'd earlier in the same header) that doesn't reproduce under clang.
-set(CMAKE_CXX_COMPILER /usr/lib64/rocm/llvm/bin/clang++)
+# ROCm's own clang++ is used as the host C++ compiler, not stock GCC: hip_runtime_api.h hits a real
+# compile error under g++ 16 (hipHostMallocDefault "not declared" at its use site despite being
+# #define'd earlier in the same header) that does not reproduce under clang.
+#
+# The path is SEARCHED rather than hardcoded: it was pinned to /usr/lib64/rocm (Fedora's layout) and
+# that made the repository unconfigurable on any machine whose ROCm lives elsewhere -- /opt/rocm-X.Y
+# is the more common layout. Set CMAKE_CXX_COMPILER explicitly to override, or ROCM_PATH to point at
+# a specific install.
+if(NOT CMAKE_CXX_COMPILER)
+  set(_rocm_hints "")
+  if(DEFINED ENV{ROCM_PATH})
+    list(APPEND _rocm_hints "$ENV{ROCM_PATH}")
+  endif()
+  list(APPEND _rocm_hints /usr/lib64/rocm /opt/rocm)
+  file(GLOB _rocm_versioned /opt/rocm-*)
+  list(SORT _rocm_versioned)
+  list(REVERSE _rocm_versioned)          # prefer the newest versioned install
+  list(APPEND _rocm_hints ${_rocm_versioned})
+  foreach(_r IN LISTS _rocm_hints)
+    foreach(_sub llvm/bin lib/llvm/bin)
+      if(EXISTS "${_r}/${_sub}/clang++")
+        set(CMAKE_CXX_COMPILER "${_r}/${_sub}/clang++")
+        break()
+      endif()
+    endforeach()
+    if(CMAKE_CXX_COMPILER)
+      break()
+    endif()
+  endforeach()
+  if(NOT CMAKE_CXX_COMPILER)
+    message(FATAL_ERROR
+      "Could not find ROCm's clang++. Looked under: ${_rocm_hints} (llvm/bin and lib/llvm/bin).\n"
+      "Set -DCMAKE_CXX_COMPILER=/path/to/rocm/llvm/bin/clang++ or ROCM_PATH.")
+  endif()
+  message(STATUS "Host C++ compiler (ROCm clang++): ${CMAKE_CXX_COMPILER}")
+  # ...and remember where that ROCm lives, so find_package(hip) below does not also need to be told.
+  get_filename_component(_rocm_root "${CMAKE_CXX_COMPILER}" DIRECTORY)   # .../llvm/bin
+  get_filename_component(_rocm_root "${_rocm_root}" DIRECTORY)           # .../llvm
+  get_filename_component(_rocm_root "${_rocm_root}" DIRECTORY)           # ROCm root (or .../lib)
+  if(EXISTS "${_rocm_root}/lib/cmake/hip" OR EXISTS "${_rocm_root}/hip")
+    list(APPEND CMAKE_PREFIX_PATH "${_rocm_root}")
+  else()
+    get_filename_component(_rocm_root "${_rocm_root}" DIRECTORY)         # one more for lib/llvm/bin
+    list(APPEND CMAKE_PREFIX_PATH "${_rocm_root}")
+  endif()
+  message(STATUS "ROCm root: ${_rocm_root}")
+endif()
 
 project(gadget-hip LANGUAGES CXX HIP)
 
@@ -22,7 +65,18 @@ if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
 endif()
 
 find_package(hip REQUIRED)
-find_package(MPI REQUIRED)
+# MPI is NOT required to build the simulation. T17 removed -DUSE_MPI, so every USE_MPI block is
+# compiled out and the core library contains zero MPI references -- verified with
+# `nm -uC libgadget_hip_core.a | grep -c MPI_` -> 0, and `nm -uC gadget_hip | grep -i mpi` -> empty,
+# while `ldd gadget_hip` still showed libmpi.so.40 purely because MPI::MPI_CXX was linked anyway.
+# The only real consumers are three legacy Bonsai-era utilities (bonsai_io, bonsai_driver,
+# bonsai_clrshm) which `#include <mpi.h>` unconditionally and have nothing to do with the Gadget
+# port. They are off by default; turn them on with -DGADGET_HIP_BUILD_BONSAI_TOOLS=ON, which then
+# requires MPI.
+option(GADGET_HIP_BUILD_BONSAI_TOOLS "Build the legacy Bonsai utilities (needs MPI)" OFF)
+if(GADGET_HIP_BUILD_BONSAI_TOOLS)
+  find_package(MPI REQUIRED)
+endif()
 find_package(OpenMP REQUIRED)
 # hipCUB/rocPRIM are header-only here and already live under /usr/include (default search
 # path) -- deliberately NOT using find_package(hipcub)/find_package(rocprim) + their imported
@@ -253,7 +307,7 @@ add_library(gadget_hip_core STATIC
   )
 
 target_include_directories(gadget_hip_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(gadget_hip_core PUBLIC hip::host MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_link_libraries(gadget_hip_core PUBLIC hip::host OpenMP::OpenMP_CXX)
 if(GADGET_HIP_PMGRID)
   target_link_libraries(gadget_hip_core PUBLIC roc::rocfft)
 endif()
@@ -270,14 +324,19 @@ set_source_files_properties(src/parallel.cpp PROPERTIES COMPILE_OPTIONS "-msse4;
 add_executable(gadget_hip src/main.cpp)
 target_include_directories(gadget_hip PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(gadget_hip PRIVATE -fPIE -Wno-main)
-target_link_libraries(gadget_hip PRIVATE gadget_hip_core hip::host MPI::MPI_CXX OpenMP::OpenMP_CXX -lrt)
+target_link_libraries(gadget_hip PRIVATE gadget_hip_core hip::host OpenMP::OpenMP_CXX -lrt)
 
-add_executable(bonsai_clrshm src/bonsai_clrshm.cpp)
-target_link_libraries(bonsai_clrshm PRIVATE MPI::MPI_CXX -lrt)
+# Legacy Bonsai utilities. Not part of the simulation: bonsai_io/driver/clrshm are the Bonsai-era
+# shared-memory IO plumbing, and src/bonsai_io.cpp and src/driver.cpp `#include <mpi.h>` on line 2
+# with no guard, which is what made MPI a hard build dependency for everyone.
+if(GADGET_HIP_BUILD_BONSAI_TOOLS)
+  add_executable(bonsai_clrshm src/bonsai_clrshm.cpp)
+  target_link_libraries(bonsai_clrshm PRIVATE MPI::MPI_CXX -lrt)
 
-add_executable(bonsai_io src/bonsai_io.cpp src/anyoption.cpp)
-target_include_directories(bonsai_io PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(bonsai_io PRIVATE MPI::MPI_CXX -lrt)
+  add_executable(bonsai_io src/bonsai_io.cpp src/anyoption.cpp)
+  target_include_directories(bonsai_io PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bonsai_io PRIVATE MPI::MPI_CXX -lrt)
 
-add_executable(bonsai_driver src/driver.cpp)
-target_link_libraries(bonsai_driver PRIVATE MPI::MPI_CXX -ldl -lrt)
+  add_executable(bonsai_driver src/driver.cpp)
+  target_link_libraries(bonsai_driver PRIVATE MPI::MPI_CXX -ldl -lrt)
+endif()

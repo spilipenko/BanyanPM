@@ -4,6 +4,12 @@ typedef unsigned int uint;
 
 #include "stdio.h"
 
+// Host-side declarations of the kernels defined below. Included deliberately: it makes the compiler
+// compare each declaration against its definition, so a signature that drifts is a build error.
+// Without this, the declarations are used only for their address and a wrong one is silent -- which
+// is how 25 of them came to diverge (see devFunctionDefinitions.h).
+#include "devFunctionDefinitions.h"
+
 //Warp based summation
 static __device__ __forceinline__ int inexclusive_scan_warp(volatile int *ptr,bool inclusive, const unsigned int idx, int value) {
   const unsigned int lane = idx & 31;
@@ -76,15 +82,8 @@ KERNEL_DECLARE(exclusive_scan_block)(int *ptr, const int N, int *count)
   }
 }
 
-#ifndef _OCTREE_H_
-typedef struct setupParams
-{
-  int jobs;                     //Minimal number of jobs for each 'processor'
-  int blocksWithExtraJobs;      //Some ' processors'  do one extra job all with bid < bWEJ
-  int extraElements;            //The elements that didn't fit completely
-  int extraOffset;              //Start of the extra elements
-}setupParams;
-#endif
+// setupParams comes from node_specs.h (via devFunctionDefinitions.h): one definition, so the
+// kernel declarations can name the same type the kernels are defined with.
 
 
 //Warp based prefix sum, using extra buffer space to remove the need for if statements

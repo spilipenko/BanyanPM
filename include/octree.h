@@ -104,13 +104,7 @@ typedef unsigned long long ullong; //ulonglong1
 
 
 
-typedef struct setupParams {
-  int jobs;                     //Minimal number of jobs for each 'processor'
-  int blocksWithExtraJobs;      //Some ' processors'  do one extra job all with bid < bWEJ
-  int extraElements;            //The elements that didn't fit completely
-  int extraOffset;              //Start of the extra elements
-
-} setupParams;
+// setupParams moved to node_specs.h, so kernel declarations can name the same type.
 
 
 typedef struct sampleRadInfo
@@ -322,6 +316,8 @@ class tree_structure
     // forced-descent rule actually tests -- hence the sign channel rather than a second buffer.
     // Sized and indexed exactly like cellSizeInfo, which the walk already fetches per cell.
     my_dev::dev_mem<float>  nodeSoftInfo;
+    my_dev::dev_mem<float>  bodies_aoldMag;   //T45: per-particle |tree + PM| in ORIGINAL order (matches
+                                             //bodies_acc0); only allocated when the PM cadence is on
     my_dev::dev_mem<float>  groupMaxAccInfo;  //Per-group max |a_old|, Springel(2005) MAC input (Phase 3)
     my_dev::dev_mem<float>  groupMaxSofteningInfo;  //T27: per-group max Gadget-2 ForceSoftening,
                                                      //softening-based bJ floor input (mirrors groupMaxAccInfo)
@@ -551,6 +547,9 @@ protected:
   my_dev::kernel gadgetTimestepGlobals;   // T35: device-side per-type (count, v2sum, min mass)
   my_dev::kernel gadgetRefreshSoftening;   // T35: device-side per-particle softening/type refresh
   my_dev::kernel gadgetBoxWrap;            // T37: Gadget's do_box_wrapping, applied before the tree build
+  my_dev::kernel gadgetPMKick;             // Phase 3: GADGET-2's long-range kick over the PM interval
+  my_dev::kernel gadgetAoldMag;            // T45: |tree + PM| per particle, the Springel MAC's OldAcc
+  my_dev::kernel gadgetPMStaleness;        // Phase 3 rung 2: drift of the long-range force per interval
   my_dev::kernel computeEnergy;
   my_dev::kernel computeEnergyPreKick;  // T19: pre-kick energy sample, matches Gadget-2's timing
 
@@ -1014,6 +1013,48 @@ inline bool gadget_hip_stage_trace()
     gadgetTimeline.init(tBegin, tMax, comoving);
     gadgetDPerTick = gadgetTimeline.dPerTick;
     Ti_current = Ti_previous = gadgetTimeline.toTick((double) t_current);
+
+    // The run MUST begin on tick 0, and this is not cosmetic -- an offset origin silently
+    // destroys the timestep ladder.
+    //
+    // C-D-13's growth rule (timestep.c:352-357, compute_dt in timestep.cu) lets a particle
+    // lengthen its step only when ((TIMEBASE - Ti_endstep) % ti_step) == 0. With the run starting
+    // at tick T0, every Ti_endstep is T0 + k*2^n, and since TIMEBASE is a power of two the test
+    // reduces to (T0 % ti_step) == 0. For ODD T0 that holds for ti_step == 1 and nothing else:
+    // no particle may ever grow its step beyond ONE TICK. Steps then only shrink, the ladder
+    // ratchets down, and the global clock stalls -- C-D-14 aborts the run.
+    //
+    // Measured: restarting from snapshot_006, whose stored time reads back as 0.689350247 against
+    // TimeBegin 0.68935, put T0 at 259 (odd). The run died at step 257 with every reduction block
+    // reporting the same minimum, Ti_current + 1. Runs started from the ICs never hit this because
+    // their IC time equals TimeBegin exactly and T0 is 0 -- which is why every benchmark passed.
+    //
+    // GADGET-2 has no such failure mode: init() sets All.Time = All.TimeBegin and Ti_Current = 0
+    // by construction. Do the same. A fresh start IS at TimeBegin; a tick offset here is float
+    // rounding in the IC epoch, not physics. Resume overwrites Ti_current from the restart file
+    // afterwards, where it is already lattice-aligned, so this does not disturb that path.
+    if (Ti_current != 0)
+    {
+      const double tb = gadgetTimeline.toTime(0);
+      const double rel = (tBegin != 0.0) ? fabs((double) t_current - tBegin) / fabs(tBegin) : 0.0;
+      if (rel < 1e-5)
+      {
+        fprintf(stderr, "[TIMELINE] start snapped to tick 0 (was tick %d, t=%.9g vs TimeBegin "
+                        "%.9g, %.3g relative). An offset origin would cap every timestep at one "
+                        "tick -- see the C-D-13 note in octree.h.\n",
+                Ti_current, (double) t_current, tBegin, rel);
+        Ti_current = Ti_previous = 0;
+        t_current = t_previous = (float) tb;
+      }
+      else
+      {
+        fprintf(stderr, "[TIMELINE] WARNING: run begins at tick %d, not 0 (t=%.9g vs TimeBegin "
+                        "%.9g, %.3g relative). If that tick is odd, C-D-13's growth rule will cap "
+                        "every timestep at one tick and the run will stall. Set TimeBegin to the "
+                        "IC epoch.\n",
+                Ti_current, (double) t_current, tBegin, rel);
+      }
+    }
   }
   void set_nextSnapTime(const float t) { nextSnapTime = t; }
   float get_t_current() const       { return t_current; }

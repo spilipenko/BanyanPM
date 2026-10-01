@@ -2,6 +2,12 @@
 #include "bonsai.h"
 #include "gadget_spline_force.cuh"   // C-C-03: the SAME spline the tree path uses
 
+// Host-side declarations of the kernels defined below. Included deliberately: it makes the compiler
+// compare each declaration against its definition, so a signature that drifts is a build error.
+// Without this, the declarations are used only for their address and a wrong one is silent -- which
+// is how 25 of them came to diverge (see devFunctionDefinitions.h).
+#include "devFunctionDefinitions.h"
+
 // C-C-03: this used to be a flat Plummer kernel (`distSqr += eps2`) with the CLI `eps` as the
 // length scale. Three differences from the tree path, all silent:
 //   (1) kernel SHAPE     -- Plummer, not Gadget-2's cubic spline;

@@ -1603,7 +1603,26 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
       }
     }
 
-    tree->set_t_current((float) snapHeader.time);
+    // Start the clock at TimeBegin, not at the IC header's own stored time. The check above has
+    // already refused any real disagreement (>1e-6 relative), so what is left is float rounding in
+    // the header -- and that rounding is not harmless. initTimeline() puts tick 0 at TimeBegin, so
+    // a header time a few ULP away lands the run on a NONZERO start tick, and C-D-13's growth rule
+    // then caps every timestep at one tick for the rest of the run (see the note in octree.h):
+    // every Ti_endstep is T0 + k*2^n, TIMEBASE is a power of two, so growth needs T0 % ti_step == 0,
+    // which for odd T0 admits only ti_step == 1. Measured: snapshot_006 reads back as 0.689350247
+    // against TimeBegin 0.68935, T0 = 259, and the run died at step 257 with the global clock
+    // unable to advance. GADGET-2 has no such mode -- init() sets All.Time = All.TimeBegin.
+    const bool startAtTimeBegin = haveGadgetParams && gadgetParams.ComovingIntegrationOn &&
+                                  gadgetParams.TimeBegin > 0.0;
+    tree->set_t_current((float) (startAtTimeBegin ? gadgetParams.TimeBegin : snapHeader.time));
+    // ... and re-anchor the tick clock, because set_t_current() can only take a FLOAT. One float32
+    // ULP at a = 0.69 is ~63 ticks wide on this timeline, so even passing TimeBegin itself lands
+    // the run 9 ticks off zero -- odd, and therefore still fatal to the growth rule. initTimeline()
+    // snaps to tick 0 when the epoch matches (and says so), which is the only way to get an exact
+    // origin without routing the value through float.
+    if (startAtTimeBegin)
+      tree->initTimeline(gadgetParams.TimeBegin, gadgetParams.TimeMax,
+                         gadgetParams.ComovingIntegrationOn);
   }
   else if ((nPlummer == -1 && nSphere == -1  && nCube == -1 && !diskmode && nMilkyWay == -1 && !haveGadgetIC) || restartSim)
   {
@@ -2885,6 +2904,16 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 
 int main(int argc, char *argv[])
 {
+  // Line-buffer stdout. Redirected to a file it is block-buffered by default while stderr is
+  // unbuffered, so a diagnostic written to stderr lands spliced into the MIDDLE of a stdout line:
+  //
+  //   Begin Step 86, Time: 0.0469759, ... Dlo[PM-ENERGY] long-range term ... ACTIVE
+  //
+  // Nearly all verification in this project is log scraping, and an anchored pattern (^\[PM-ENERGY\])
+  // silently matches nothing when that happens -- which is how the 64^3 gate's refusal audit came to
+  // check one feature while appearing to check two. Line buffering costs a flush per line on a
+  // stream that already carries one line per step, and makes the log mean what it looks like.
+  setvbuf(stdout, NULL, _IOLBF, 0);
 #ifdef USE_MPI
   return bonsai_main(argc, argv, MPI_COMM_WORLD, 0);
 #else

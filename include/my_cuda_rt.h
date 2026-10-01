@@ -885,6 +885,16 @@ namespace my_dev {
     T* raw_p() {return  hDeviceMem;}
 
     void*   p() {return &hDeviceMem;}
+    // Space-tagged view, for kernels whose parameters declare which index space they mean
+    // (include/gadget_index_spaces.h). The space is NOT a property of the buffer -- it depends on
+    // where in the step you are -- so it is named here, at the call site, by the author who knows.
+    //   tree.bodies_vel.as<OriginalOrder>()   ->  OriginalOrder<T>*  for set_args
+    // Space<T> holds exactly one T* and is standard-layout, so this is the same object with a type
+    // on it; set_args dereferences the address at launch exactly as before.
+    template <template <class> class Space> Space<T>* as()
+    { return reinterpret_cast<Space<T>*>(&hDeviceMem); }
+    template <template <class> class Space> Space<const T>* as_const()
+    { return reinterpret_cast<Space<const T>*>(&hDeviceMem); }
     void*   a(int offset)
     {
       //Calculate the new memory offset

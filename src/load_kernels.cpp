@@ -52,6 +52,9 @@ void octree::load_kernels() {
   gadgetTimestepGlobals.create("gadget_timestep_globals", (const void*)&gadget_timestep_globals);
   gadgetRefreshSoftening.create("gadget_refresh_softening", (const void*)&gadget_refresh_softening);
   gadgetBoxWrap.create("gadget_box_wrap", (const void*)&gadget_box_wrap);
+  gadgetPMKick.create("gadget_pm_kick", (const void*)&gadget_pm_kick);
+  gadgetAoldMag.create("gadget_aold_mag", (const void*)&gadget_aold_mag);
+  gadgetPMStaleness.create("gadget_pm_staleness", (const void*)&gadget_pm_staleness);
   setActiveGrps.   create("setActiveGroups", 	     (const void*)&setActiveGroups);
   computeEnergy.   create("compute_energy_double",   (const void*)&compute_energy_double);
   computeEnergyPreKick.create("compute_energy_double_prekick", (const void*)&compute_energy_double_prekick);

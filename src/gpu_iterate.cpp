@@ -1,6 +1,8 @@
 #include "hip/hip_runtime.h"
 #undef NDEBUG
 #include "octree.h"
+#include "gadget_units.h"          // GFreeAcc / GCarrier (T44 item 1)
+#include "gadget_index_spaces.h"   // CurrentOrder / OriginalOrder / IdSpace (T44 item 1)
 #include "buffer_registry.h"
 #include  "postProcessModules.h"
 #include "pm.h"
@@ -689,6 +691,35 @@ struct GadgetCpuAcc {
 static GadgetCpuAcc s_cpuAcc = {0,0,0,0,0,0,0,0,0,0};
 double *gadget_cpu_snapshot_acc() { return &s_cpuAcc.snapshot; }
 
+// ------------------------------------------------------------------------------------------
+// Phase 3: GADGET-2's long-range force as a separate kick over the PM interval.
+//
+// File scope rather than locals of iterate_once() because octree::correct() -- same translation
+// unit -- needs all of it: the stored force for the timestep criterion, and the interval state to
+// decide whether this step owes every particle a long-range kick.
+//
+// PM_Ti_begstep/endstep are All.PM_Ti_begstep/All.PM_Ti_endstep. Both the PM solve (in the
+// gravity phase) and the kick (in correct()) test `PM_Ti_endstep == Ti_current`, and the interval
+// is advanced only in correct(), so the two see the same pre-advance value within one step --
+// which is precisely how GADGET-2 orders compute_accelerations() and advance_and_find_timesteps().
+// GFreeAcc, not float: the PM solve runs with gravityConstant = 1.0f, so these owe a factor G and
+// every consumer must say which one it applies. See include/gadget_units.h; it is what finally
+// made T42's missing G, and T47's, impossible to write. The potential stays a plain float -- its
+// G travels with the t30 coefficients in compute_energies(), a different path.
+static GFreeAcc *s_gravPMx = nullptr, *s_gravPMy = nullptr, *s_gravPMz = nullptr;
+static float    *s_gravPMpot = nullptr;
+static bool   s_pmCadenceActive = false;   // the mode actually in effect, not what was requested
+static gadget_tick_t s_PM_Ti_begstep = 0, s_PM_Ti_endstep = 0;
+static GadgetDriftTables s_gadgetTables;
+static bool   s_gadgetTablesOk = false;
+static unsigned char *s_pmKickAudit = nullptr;   // validation rung 1; NULL unless audited
+static void  *s_nullDevPtr = nullptr;            // set_args dereferences its arguments
+static long   s_pmKickCount = 0;
+static int    s_pmKickNoPerm = 0;   // write-target A/B, see gadget_pm_kick                 // long-range kicks applied, for the banner
+
+void pmstale_reset(void);
+void pmstale_read(double *num, double *den);
+
 bool octree::iterate_once(IterationData &idata) {
   static const bool phaseTimePrint = (getenv("GADGET_HIP_PHASE_TIME") != NULL);
   // Gadget writes cpu.txt unconditionally; a diagnostic that is off by default is not there when
@@ -1369,7 +1400,10 @@ bool octree::iterate_once(IterationData &idata) {
           // indexed by current sort order and the tree re-sorts every step -- see pm_cic.cu.
           static double s_pmNextTime = -1.0;
           static int    s_pmStoredN  = 0;
-          static float *s_d_pmIdX = nullptr, *s_d_pmIdY = nullptr, *s_d_pmIdZ = nullptr, *s_d_pmIdPot = nullptr;
+          // Phase 3: these ARE GravPM. Bound by reference to the file-scope buffers so correct()
+          // can reach them; the code below is unchanged.
+          GFreeAcc *&s_d_pmIdX = s_gravPMx; GFreeAcc *&s_d_pmIdY = s_gravPMy;
+          GFreeAcc *&s_d_pmIdZ = s_gravPMz; float *&s_d_pmIdPot = s_gravPMpot;
           // T36 IS OFF BY DEFAULT -- it cost accuracy, measured. See the block below and
           // tickets/T35-sparse-step-cost.md "Round 3 RETRACTED".
           // GADGET_HIP_PM_CADENCE=1 opts back in for experiments; PM_EVERY_STEP is kept as the
@@ -1382,9 +1416,11 @@ bool octree::iterate_once(IterationData &idata) {
           if (s_pmStoredN != localTree.n)
           {
             if (s_d_pmIdX) { hipFree(s_d_pmIdX); hipFree(s_d_pmIdY); hipFree(s_d_pmIdZ); hipFree(s_d_pmIdPot); }
-            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdX,   localTree.n * sizeof(float)));
-            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdY,   localTree.n * sizeof(float)));
-            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdZ,   localTree.n * sizeof(float)));
+            // sizeof(GFreeAcc) == sizeof(float): a single-float struct, so the allocation, the
+            // scatter and every memcpy below are byte-for-byte what they were.
+            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdX,   localTree.n * sizeof(GFreeAcc)));
+            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdY,   localTree.n * sizeof(GFreeAcc)));
+            CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdZ,   localTree.n * sizeof(GFreeAcc)));
             CU_SAFE_CALL(hipMalloc((void**)&s_d_pmIdPot, localTree.n * sizeof(float)));
             s_pmStoredN = localTree.n;
             s_pmNextTime = -1.0;      // force a recompute after any resize
@@ -1425,14 +1461,51 @@ bool octree::iterate_once(IterationData &idata) {
           // at first: that was wrong, because it makes the trajectory depend on how often you ask
           // for statistics. Gadget keeps them separate too -- its statistics call
           // compute_potential() for a fresh pass that never touches the GravPM used for dynamics.
-          const bool pmDue = pmEveryStep || !pmIdSpaceOk || (s_pmNextTime < 0.0) ||
-                             ((double) t_current >= s_pmNextTime);
+          // Phase 3: the PM step is chosen on the integer timeline exactly as GADGET-2 chooses it
+          // (timestep.c:345-357) -- the largest power-of-two tick count not exceeding
+          // dt_displacement -- instead of the float wall-clock comparison the retracted T36 used.
+          // The cadence needs the id-space store to survive the re-sort between PM steps, so it
+          // cannot be active without it.
+          s_pmCadenceActive = !pmEveryStep && pmIdSpaceOk && haveGadgetComovingTables &&
+                              s_gadgetTablesOk;
+          // ">=", not "==". GADGET-2 tests All.PM_Ti_endstep == All.Ti_Current and is entitled
+          // to, because its run always begins at Ti_Current == 0 and every sync point lands on
+          // the tick lattice. This port can begin mid-timeline -- restarting from a snapshot
+          // whose stored time differs from TimeBegin in the last few digits puts Ti_current at
+          // some nonzero tick on step 0 -- and then exact equality is a DEADLOCK: PM_Ti_endstep
+          // starts at 0 and is only advanced inside the branch the equality guards, while
+          // Ti_current only grows, so the condition can never become true and the long-range
+          // force is never computed or applied at all. Measured: restarting at a=0.68935 from
+          // snapshot_006, the cadence silently did nothing for the whole run.
+          const bool pmDue = !s_pmCadenceActive || (Ti_current >= s_PM_Ti_endstep);
 
           if (pmDue)
           {
             pm_compute_forces_periodic(s_pmSolver, localTree.bodies_Ppos.raw_p(), localTree.n,
                                         s_d_pmfx, s_d_pmfy, s_d_pmfz, gravStream->s(),
                                         /*gravityConstant=*/1.0f, s_d_pmpot);
+            // Phase 3 validation rung 2. Right here -- and only here -- the fresh long-range force
+            // and the one the run has been using since the last PM step both exist, so the drift
+            // across the interval can be measured without keeping a second copy of GravPM.
+            // Deliberately before the scatter below, which overwrites GravPM.
+            static const bool pmStaleness = (getenv("GADGET_HIP_PM_STALENESS") != NULL);
+            if (pmStaleness && s_pmCadenceActive && s_pmKickCount > 0)
+            {
+              gravStream->sync();
+              pmstale_reset();
+              gadgetPMStaleness.set_args(0, &localTree.n,
+                                         (void *) localTree.bodies_ids.as_const<CurrentOrder>(),
+                                         (void *) &s_d_pmfx, (void *) &s_d_pmfy, (void *) &s_d_pmfz,
+                                         (void *) &s_gravPMx, (void *) &s_gravPMy, (void *) &s_gravPMz);
+              gadgetPMStaleness.setWork(localTree.n, 128);
+              gadgetPMStaleness.execute2(gravStream->s());
+              gravStream->sync();
+              double num = 0.0, den = 0.0;
+              pmstale_read(&num, &den);
+              fprintf(stderr, "[PM-STALENESS] interval %ld  rms|da|/|a| = %.6e  "
+                              "(sum|da|^2=%.6e sum|a|^2=%.6e)\n",
+                      s_pmKickCount, (den > 0.0) ? sqrt(num / den) : 0.0, num, den);
+            }
             if (pmIdSpaceOk)
             {
               pm_scatter_by_id(localTree.bodies_ids.raw_p(), s_d_pmfx, s_d_pmfy, s_d_pmfz, s_d_pmpot,
@@ -1471,11 +1544,48 @@ bool octree::iterate_once(IterationData &idata) {
               }
             }
           }
+          // Probe (GADGET_HIP_PM_ADD_PROBE=1): rms|acc1| immediately BEFORE and AFTER the PM add,
+          // plus rms of the array actually handed to it, all in the same run at the same instant.
+          // Subtracting rms values across separate runs implied a PM contribution of ~441 while
+          // the array measures ~9.4; this measures the contribution instead of inferring it.
+          static const bool addProbe = (getenv("GADGET_HIP_PM_ADD_PROBE") != NULL);
+          static int addCount = 0;
+          double rmsBefore = 0.0;
+          if (addProbe && addCount < 3)
+          {
+            gravStream->sync(); execStream->sync();
+            localTree.bodies_acc1.d2h();
+            double sa = 0.0;
+            for (int i = 0; i < localTree.n; ++i)
+            { const real4 a = localTree.bodies_acc1[i];
+              sa += (double)a.x*a.x + (double)a.y*a.y + (double)a.z*a.z; }
+            rmsBefore = sqrt(sa/localTree.n);
+          }
           // T23: masked. bodies_acc1 is refreshed by the tree walk for ACTIVE particles only, so
           // adding PM to the whole buffer double-counts it for every particle that stayed inactive.
           // tree.activePartlist is the walk's own output mask (zeroed before it, set to 1 for each
           // particle it writes), so it marks exactly the entries that are fresh.
-          if (pmIdSpaceOk)
+          // Phase 3 bisect (GADGET_HIP_PM_KEEP_IN_ACC=1): fold the long-range force into acc1 the
+          // way the every-step path does, while still solving PM on the cadence. Combined with
+          // GADGET_HIP_PM_NO_KICK=1 this separates the three things the cadence changes at once:
+          // acc1 content, the timestep criterion, and the separate kick.
+          static const bool pmKeepInAcc = (getenv("GADGET_HIP_PM_KEEP_IN_ACC") != NULL);
+          if (s_pmCadenceActive && !pmKeepInAcc)
+          {
+            // Phase 3: DO NOT fold the long-range force into bodies_acc1. That is the retracted
+            // T36 operator, and it is wrong twice over: it reaches only active particles, and it
+            // lets each of them integrate the long-range force over its own timestep instead of
+            // over the PM interval. acc1 stays short-range only; the long-range part is applied
+            // once per PM interval, to every particle, by gadget_pm_kick in correct().
+            //
+            // The POTENTIAL is a different matter -- it is a diagnostic, not dynamics -- so the
+            // id-space potential is still folded in for the active particles that were just
+            // refreshed, keeping the reported Etot a total rather than a short-range-only number.
+            pm_add_by_id_masked(localTree.bodies_acc1.raw_p(), localTree.bodies_ids.raw_p(),
+                                nullptr, nullptr, nullptr, s_d_pmIdPot, localTree.n,
+                                (const int *) localTree.activePartlist.raw_p(), gravStream->s());
+          }
+          else if (pmIdSpaceOk)
           {
             // One masked gather-add for force AND potential together, from the id-space store.
             pm_add_by_id_masked(localTree.bodies_acc1.raw_p(), localTree.bodies_ids.raw_p(),
@@ -1495,6 +1605,38 @@ bool octree::iterate_once(IterationData &idata) {
                                        gravStream->s());
           }
           gravStream->sync();
+          if (addProbe && addCount < 3)
+          {
+            execStream->sync();
+            localTree.bodies_acc1.d2h();
+            double sa = 0.0;
+            for (int i = 0; i < localTree.n; ++i)
+            { const real4 a = localTree.bodies_acc1[i];
+              sa += (double)a.x*a.x + (double)a.y*a.y + (double)a.z*a.z; }
+            std::vector<float> gx(localTree.n);
+            double sg = 0.0;
+            if (s_gravPMx)
+            {
+              // Diagnostic only: GFreeAcc is layout-identical to float, so this reads the raw
+              // G-free components into a float vector for an rms.
+              CU_SAFE_CALL(hipMemcpy(&gx[0], s_gravPMx, (size_t)localTree.n*sizeof(GFreeAcc),
+                                     hipMemcpyDeviceToHost));
+              for (int i = 0; i < localTree.n; ++i) sg += (double)gx[i]*gx[i];
+            }
+            std::vector<float> fxh(localTree.n);
+            double sf = 0.0;
+            if (s_d_pmfx)
+            {
+              CU_SAFE_CALL(hipMemcpy(&fxh[0], s_d_pmfx, (size_t)localTree.n*sizeof(float),
+                                     hipMemcpyDeviceToHost));
+              for (int i = 0; i < localTree.n; ++i) sf += (double)fxh[i]*fxh[i];
+            }
+            fprintf(stderr, "[PM-ADD-PROBE] iter=%d  acc1 before=%.6e after=%.6e   "
+                            "rms(GravPM_x)=%.6e  rms(pmfx)=%.6e  cadence=%d\n",
+                    iter, rmsBefore, sqrt(sa/localTree.n),
+                    sqrt(sg/localTree.n), sqrt(sf/localTree.n), (int) s_pmCadenceActive);
+            addCount++;
+          }
         }
       }
     }
@@ -2539,7 +2681,56 @@ void octree::direct_gravity(tree_structure &tree)
 // matters; only called when built with _MAC_SPRINGEL_.
 void octree::computeGroupMaxAccel(tree_structure &tree)
 {
-  tree.bodies_acc0.d2h();
+  // T45: the Springel MAC's aold must include the long-range force, as Gadget's does
+  // (gravtree.c:309-311). With the cadence ON, GravPM is not in bodies_acc0, so the magnitude is
+  // formed on the device by gadget_aold_mag -- see that kernel for why it is not done here.
+  const bool aoldWithPM = s_pmCadenceActive && s_gravPMx != nullptr && tree.n > 0;
+  static const bool t45KeepAcc0 = (getenv("GADGET_HIP_T45_KEEP_ACC0_D2H") != NULL);
+  if (aoldWithPM)
+  {
+    if (tree.bodies_aoldMag.get_size() < (size_t) tree.n)
+      tree.bodies_aoldMag.cmalloc(tree.n, true);
+    // Not const: set_args stores a non-const void* and dereferences it at launch.
+    GCarrier aoldG = GCarrier::just_G(
+        (!useDirectGravity && haveGadgetParams && gadgetParams.G > 0.0) ? (float) gadgetParams.G : 1.0f);
+    // bodies_acc0 and the output are both in the unpermuted (original) space; bodies_ids is in the
+    // post-sort space. See include/gadget_index_spaces.h and buffer_registry.h.
+    gadgetAoldMag.set_args(0, &tree.n,
+                           (void *) tree.bodies_acc0.as_const<OriginalOrder>(),
+                           (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
+                           (void *) tree.bodies_ids.as_const<CurrentOrder>(),
+                           (void *) &s_gravPMx, (void *) &s_gravPMy,
+                           (void *) &s_gravPMz, &aoldG,
+                           (void *) tree.bodies_aoldMag.as<OriginalOrder>());
+    gadgetAoldMag.setWork(tree.n, 128);
+    gadgetAoldMag.execute2(execStream->s());
+    execStream->sync();
+    tree.bodies_aoldMag.d2h();
+    static bool s_aoldReported = false;
+    if (!s_aoldReported)
+    {
+      s_aoldReported = true;
+      fprintf(stderr, "[T45-AOLD-PM] %s (G = %.6f)\n",
+              t45KeepAcc0 ? "kernel runs but the reduction uses the OLD tree-only vector "
+                            "(GADGET_HIP_T45_KEEP_ACC0_D2H=1)"
+                          : "Springel aold includes the long-range force",
+              (double) aoldG.v);
+    }
+  }
+  else if (s_pmCadenceActive)
+  {
+    // T44 item 3: a feature that declines to engage must say so.
+    static bool s_aoldOffReported = false;
+    if (!s_aoldOffReported)
+    {
+      s_aoldOffReported = true;
+      fprintf(stderr, "[T45-AOLD-PM] OFF -- the cadence is on but GravPM is not in aold; "
+                      "the MAC will open more nodes than Gadget's\n");
+    }
+  }
+  // The vector is only needed on the host for the non-PM path; the device path reads acc0 on the
+  // device. GADGET_HIP_T45_KEEP_ACC0_D2H=1 restores the unconditional transfer for A/B work.
+  if (!aoldWithPM || t45KeepAcc0) tree.bodies_acc0.d2h();
   tree.groupSizeInfo.d2h();
   tree.oriParticleOrder.d2h();
 
@@ -2614,14 +2805,18 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
   const double t31_t0 = get_time();
   static bool t31_reported = false;
   static const bool t31_verbose = (getenv("GADGET_HIP_T31_STATS") != NULL);
-  for (int g = 0; g < tree.n_groups; g++)
+  // This host loop walks the GROUP space on the outside and the PARTICLE spaces on the inside, which
+  // is exactly the mixture T23 Bug 2 got wrong: it read bodies_acc0 (unpermuted) with the current
+  // slot index, so every group's MAC input silently used a different set of particles. The spaces are
+  // named here for the same reason they are named in the kernels.
+  for (GroupIdx g = {0}; g.v < (unsigned int) tree.n_groups; g.v++)
   {
-    const int groupData = *reinterpret_cast<const int*>(&tree.groupSizeInfo[g].w);
+    const int groupData = *reinterpret_cast<const int*>(&tree.groupSizeInfo[g.v].w);
     const uint start = groupData & CRITMASK;
     const uint nb_i   = ((groupData & INVCMASK) >> CRITBIT) + 1;
-    if (t31_verbose && !t31_reported && g < 3)
-      fprintf(stderr, "[T31] group %d: raw=0x%08x start=%u nb_i=%u  (n_groups=%d, tree.n=%d, CRITBIT=%d)\n",
-              g, (unsigned) groupData, start, nb_i, tree.n_groups, tree.n, CRITBIT);
+    if (t31_verbose && !t31_reported && g.v < 3)
+      fprintf(stderr, "[T31] group %u: raw=0x%08x start=%u nb_i=%u  (n_groups=%d, tree.n=%d, CRITBIT=%d)\n",
+              g.v, (unsigned) groupData, start, nb_i, tree.n_groups, tree.n, CRITBIT);
     t31_visited += nb_i;
 
     float maxAcc2 = 0.0f;
@@ -2630,15 +2825,29 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
     float maxSoftening = 0.0f;  // T27: per-group max Gadget-2 ForceSoftening, softening-based bJ floor input
     for (uint i = 0; i < nb_i; i++)
     {
-      const uint oldIdx = tree.oriParticleOrder[start + i];
-      const real4 a = tree.bodies_acc0[oldIdx];
-      const float a2 = a.x*a.x + a.y*a.y + a.z*a.z;
+      // start + i is a CURRENT slot; oldIdx is the matching ORIGINAL slot. Both are particle
+      // spaces, and neither is the group index g driving the loop.
+      const CurrentIdx slot = { start + i };
+      const uint oldIdx = tree.oriParticleOrder[slot.v];
+      // T45: with the cadence on this is |tree + PM| (gadget_aold_mag); otherwise PM is already
+      // inside acc0 and the vector is read directly, exactly as before.
+      float a2;
+      if (aoldWithPM && !t45KeepAcc0)
+      {
+        const float m = tree.bodies_aoldMag[oldIdx];
+        a2 = m * m;
+      }
+      else
+      {
+        const real4 a = tree.bodies_acc0[oldIdx];
+        a2 = a.x*a.x + a.y*a.y + a.z*a.z;
+      }
       if (a2 > maxAcc2) maxAcc2 = a2;
       if (a2 < minAcc2) minAcc2 = a2;                 // T1
       sumAcc += sqrt((double) a2);                    // T1
       if (a2 > t24_globalMax2) {
         t24_globalMax2 = a2;
-        t24_globalMaxGroup = g;
+        t24_globalMaxGroup = (int) g.v;
         t24_globalMaxOldIdx = oldIdx;
         t24_globalMaxStart = start;
         t24_globalMaxNbi = nb_i;
@@ -2661,8 +2870,8 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
     if      (t1_reduce == 1) t1_aold = (nb_i > 0) ? sqrtf(minAcc2) : 0.0f;
     else if (t1_reduce == 2) t1_aold = (nb_i > 0) ? (float)(sumAcc / (double) nb_i) : 0.0f;
     else                     t1_aold = sqrtf(maxAcc2);
-    tree.groupMaxAccInfo[g] = t1_aold * t4g_aoldScale;
-    tree.groupMaxSofteningInfo[g] = maxSoftening;
+    tree.groupMaxAccInfo[g.v] = t1_aold * t4g_aoldScale;
+    tree.groupMaxSofteningInfo[g.v] = maxSoftening;
   }
   if (t31_verbose && !t31_reported)
   {
@@ -3427,6 +3636,10 @@ void octree::initComovingTables()
   gadgetLogTimeBegin = tables.logTimeBegin;   // T29: keep double
   gadgetLogTimeMax   = tables.logTimeMax;
   haveGadgetComovingTables = true;
+  // Phase 3: the long-range kick factor is evaluated on the HOST, once per PM interval, so the
+  // table has to outlive this function.
+  s_gadgetTables   = tables;
+  s_gadgetTablesOk = true;
 
   // Phase 2: the integer timeline, initialised at the first point where TimeBegin, TimeMax and the
   // comoving flag are all known. From here ticks are the clock and t_current is derived from them.
@@ -4454,6 +4667,22 @@ void octree::correct(tree_structure &tree)
     // C-D-10: end of the simulated timespan, so compute_dt can truncate the last step onto it
     // exactly as Gadget-2 does. 0 disables the clamp (no --param, hence no TimeMax).
     float ts_timeMax = haveGadgetParams ? (float) gadgetParams.TimeMax : 0.0f;
+    // T47: bodies_acc1 reaching compute_dt is already G-scaled (pm_scale_acc_masked, :1784) while
+    // GravPM is not, so the kernel must apply G to the long-range term. Not const: set_args stores a
+    // non-const void* and dereferences it at launch.
+    // GADGET_HIP_T47_NO_G=1 restores the old (wrong) behaviour, so the effect of this one fix can be
+    // measured on its own -- same idiom as GADGET_HIP_T4_FIX_G and GADGET_HIP_T45_KEEP_ACC0_D2H.
+    static const bool t47NoG = (getenv("GADGET_HIP_T47_NO_G") != NULL);
+    static bool t47Reported = false;
+    GCarrier ts_pmG = GCarrier::just_G(
+        (!t47NoG && !useDirectGravity && haveGadgetParams && gadgetParams.G > 0.0)
+          ? (float) gadgetParams.G : 1.0f);
+    if (!t47Reported && s_pmCadenceActive)
+    {
+      t47Reported = true;
+      fprintf(stderr, "[T47] timestep criterion: long-range term scaled by G = %.6f%s\n",
+              (double) ts_pmG.v, t47NoG ? "  (GADGET_HIP_T47_NO_G=1: the pre-fix behaviour)" : "");
+    }
     float ts_timelineOrigin = 0.0f;
     if (haveGadgetParams)
       ts_timelineOrigin = ts_comovingFlag ? (float) gadgetLogTimeBegin
@@ -4461,12 +4690,24 @@ void octree::correct(tree_structure &tree)
     computeDt.set_args(0, &tree.n, &t_current, &ts_errTolIntAccuracy, &ts_atime, &ts_fac1,
                           &ts_hubble_a, &ts_maxSizeTimestep, &ts_minSizeTimestep, &ts_dtDisplacement,
                           &ts_comovingFlag,
-                          newEndBuffer.p(), tree.bodies_time.p(), tree.oriParticleOrder.p(),
-                          tree.bodies_acc1.p(),
-                          tree.bodies_forceSoftening.p(),
-                          tree.activePartlist.p(), &ts_timelineSpan, &ts_timelineOrigin,
+                          (void *) newEndBuffer.as<CurrentOrder>(),
+                          (void *) tree.bodies_time.as<OriginalOrder>(),
+                          (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
+                          (void *) tree.bodies_acc1.as_const<CurrentOrder>(),
+                          (void *) tree.bodies_forceSoftening.as_const<CurrentOrder>(),
+                          (void *) tree.activePartlist.as_const<CurrentOrder>(),
+                          &ts_timelineSpan, &ts_timelineOrigin,
                           &ts_timeMax,
-                          &gadgetDPerTick, &Ti_current);   // C-D-10
+                          &gadgetDPerTick, &Ti_current,   // C-D-10
+                          // Phase 3: GADGET sizes the step from GravAccel + GravPM
+                          // (timestep.c:443-445). With the cadence off acc1 already holds both and
+                          // these are NULL, which is what the kernel tests.
+                          s_pmCadenceActive ? (void *) tree.bodies_ids.as_const<CurrentOrder>()
+                                            : (void *) &s_nullDevPtr,
+                          s_pmCadenceActive ? (void *) &s_gravPMx : &s_nullDevPtr,
+                          s_pmCadenceActive ? (void *) &s_gravPMy : &s_nullDevPtr,
+                          s_pmCadenceActive ? (void *) &s_gravPMz : &s_nullDevPtr,
+                          &ts_pmG);
     // C-D-14: Gadget-2 treats an unrepresentable (non-advancing) timestep as a hard error --
     // endrun(818), timestep.c:537-552. The port already counted the condition in compute_dt, but
     // t7_reset_nonadvancing()/t7_read_nonadvancing() were declared and defined and NEVER CALLED,
@@ -4524,17 +4765,281 @@ void octree::correct(tree_structure &tree)
 
   // Phase 5 ticket 05 (PLAN.md): see predict()'s own comment on why comovingIntegrationOn is a
   // non-const local passed by address.
+  // ------------------------------------------------------------------------------------------
+  // Phase 3: GADGET-2's long-range kick (timestep.c:345-384).
+  //
+  // Runs BEFORE correct_particles, where the index spaces are still the documented ones
+  // (bodies_vel in ORIGINAL order, reached through oriParticleOrder; ids in CURRENT order).
+  // correct_particles resets oriParticleOrder to identity at the end of its own kernel, so after
+  // it the translation this kernel needs no longer exists. Order does not matter physically --
+  // the two kicks are independent additive impulses on the same velocity.
+  // Phase 3 bisect (GADGET_HIP_PM_NO_KICK=1): run everything except the impulse. With the kick
+  // off and PM excluded from acc1 the run has NO long-range force at all, which is the reference
+  // for "how bad is missing PM" -- if the cadence matches that, the kick is contributing nothing.
+  static const bool pmNoKick = (getenv("GADGET_HIP_PM_NO_KICK") != NULL);
+  if (s_pmCadenceActive && !pmNoKick && Ti_current >= s_PM_Ti_endstep)   // ">=": see pmDue
+  {
+    // The next PM interval: the largest power-of-two tick count not exceeding dt_displacement,
+    // with GADGET's own growth rule -- lengthen only if an integer number of the new steps still
+    // reaches the end of the timeline, otherwise stay put (timestep.c:348-357).
+    gadget_tick_t ti_step = (gadgetDtDisplacement > 0.0 && gadgetDPerTick > 0.0)
+        ? gadget_tick_pow2_floor(gadgetDtDisplacement / gadgetDPerTick)
+        : (gadget_tick_t) 1;
+    // GADGET_HIP_PM_INTERVAL_SHIFT=k shortens the PM interval by 2^k. This is the convergence
+    // knob, and it is what actually decides whether this operator is right.
+    //
+    // Comparing the cadence against PM-every-step cannot decide it: GADGET-2 uses the cadence
+    // too, and with the long-range force drifting ~15% per interval (rung 2) ANY correct cadence
+    // differs from every-step by a large factor. What distinguishes a correct midpoint kick is
+    // that the difference is SECOND ORDER in the interval -- halve the interval, the deviation
+    // falls ~4x. The retracted T36 operator (stale force folded into each particle's own step,
+    // active particles only) does not converge that way, because it is not a discretisation of
+    // the same operator at all.
+    static const int pmShift = getenv("GADGET_HIP_PM_INTERVAL_SHIFT")
+                             ? atoi(getenv("GADGET_HIP_PM_INTERVAL_SHIFT")) : 0;
+    if (pmShift > 0) ti_step >>= pmShift;
+    if (ti_step < 1) ti_step = 1;
+    const gadget_tick_t oldSpan = s_PM_Ti_endstep - s_PM_Ti_begstep;
+    if (oldSpan > 0 && ti_step > oldSpan &&
+        ((GADGET_TIMEBASE - s_PM_Ti_endstep) % ti_step) != 0)
+      ti_step = oldSpan;
+    if (Ti_current == GADGET_TIMEBASE) ti_step = 0;   // the final step closes the interval
+
+    // Midpoint to midpoint. This is what makes the long-range force a leapfrog kick rather than
+    // an acceleration: on the first step PM_Ti_beg == PM_Ti_end == 0, so tstart == 0 and the
+    // particle receives the half-kick that starts the sequence; on the last, ti_step == 0 closes
+    // it with the matching half. Getting this wrong is invisible over a few steps and shows up as
+    // a percent-level energy drift by z=0.
+    // Anchor a mid-timeline start. Without this the first interval would be measured from tick 0
+    // and its midpoint-to-midpoint factor would span everything since the beginning of the run.
+    if (s_PM_Ti_begstep == 0 && s_PM_Ti_endstep == 0 && Ti_current > 0)
+      s_PM_Ti_begstep = s_PM_Ti_endstep = Ti_current;
+    const gadget_tick_t tiStart = (s_PM_Ti_begstep + s_PM_Ti_endstep) / 2;
+    const gadget_tick_t tiEnd   = s_PM_Ti_endstep + ti_step / 2;
+    const double aStart = gadgetTimeline.toTime(tiStart);
+    const double aEnd   = gadgetTimeline.toTime(tiEnd);
+    // Not const: set_args stores a non-const void* to whatever it is handed and dereferences
+    // it at launch, so a const object cannot be passed through it.
+    float dtGravKick = (float) gadget_get_gravkick_factor(s_gadgetTables, aStart, aEnd);
+
+    // THE FACTOR G. The tree kernel and every PM call produce G-FREE accelerations -- PM is called
+    // with /*gravityConstant=*/1.0f, hardcoded, mirroring GADGET-2's forcetree.c convention -- and
+    // G is applied ONCE afterwards, to the summed bodies_acc1, by pm_scale_acc_masked() below.
+    //
+    // GravPM is stored BEFORE that scaling. With the cadence off, the long-range force sits inside
+    // acc1 and is scaled along with everything else. With the cadence ON it never enters acc1, so
+    // it never meets pm_scale_acc_masked at all, and this kick must apply G itself.
+    //
+    // Measured: acc1 read 3.262 in the PM block and 140.3 at correct_particles -- ratio 43.0,
+    // exactly G = 43.007106. Without this the long-range impulse was 43x too small, which is why
+    // the cadence reproduced "no PM at all" (-94.9% in Ekin) while still passing every check on
+    // the impulse itself: right particle, right direction, right count, right time factor, and
+    // the one scale factor nobody multiplied by.
+    //
+    // Same class as T4-FIX-G, where the whole per-step dynamics silently ran at G=1: invisible in
+    // any test at G=1, because there "forgot to multiply by G" and "multiplied by 1" agree.
+    if (!useDirectGravity && haveGadgetParams && gadgetParams.G > 0.0)
+      dtGravKick = (float) (dtGravKick * gadgetParams.G);
+    // Phase 3 probe: scale the long-range impulse. If the dynamics barely respond to a 10x kick,
+    // the impulse is not reaching the trajectory and the size of the factor is beside the point;
+    // if they respond proportionally, the plumbing is fine and the factor is what is wrong.
+    static const double kickScale = getenv("GADGET_HIP_PM_KICK_SCALE")
+                                  ? atof(getenv("GADGET_HIP_PM_KICK_SCALE")) : 1.0;
+    dtGravKick = (float) (dtGravKick * kickScale);
+    // The factor G is already inside dtGravKick, which is precisely what GCarrier asserts. Wrapping
+    // it here rather than multiplying inside the kernel keeps the arithmetic v * (dt*G) -- the same
+    // float it has always been -- while making `gpm[id] * someFloat` fail to compile.
+    GCarrier dtGravKickG = GCarrier::gravkick_times_G(dtGravKick);
+
+    s_PM_Ti_begstep = s_PM_Ti_endstep;
+    s_PM_Ti_endstep = s_PM_Ti_begstep + ti_step;
+
+    // Validation rung 1: one byte per particle, counting the long-range kicks it received this
+    // interval. Every entry must be exactly 1. This is the assertion that would have caught the
+    // retracted T36 outright -- there, inactive particles scored 0.
+    static const bool kickAudit = (getenv("GADGET_HIP_PM_KICK_AUDIT") != NULL);
+    s_pmKickNoPerm = (getenv("GADGET_HIP_PM_KICK_NOPERM") != NULL) ? 1 : 0;
+    if (kickAudit && !s_pmKickAudit)
+      CU_SAFE_CALL(hipMalloc((void **) &s_pmKickAudit, (size_t) tree.n * sizeof(unsigned char)));
+
+    // bodies_Pvel, NOT bodies_vel. bodies_vel is a pure OUTPUT of correct_particles, which
+    // reconstructs it wholesale from pVel every step:
+    //     vel[idx] = pVel[unsortedIdx];            (inactive branch)
+    //     float4 v = pVel[unsortedIdx]; ... kick    (active branch)
+    // so an impulse written into bodies_vel here is overwritten a few microseconds later and has
+    // no effect whatsoever. Measured exactly that way: quartering the PM interval changed the
+    // final state only in the 7th significant digit, because the long-range kick was being
+    // applied and then discarded. The index expression is unchanged -- pVel uses the same
+    // unsorted[] space bodies_vel did -- only the array is wrong.
+    static const bool kickBoth = (getenv("GADGET_HIP_PM_KICK_BOTH") != NULL);
+    // Each buffer now NAMES the space it is being used in, at the point where the author decides
+    // it. bodies_Pvel is not permuted by the per-step sort, so it is OriginalOrder here; bodies_ids
+    // is permuted, so CurrentOrder; the GravPM store is id-indexed. See buffer_registry.h.
+    gadgetPMKick.set_args(0, &tree.n,
+                          (void *) tree.bodies_Pvel.as<OriginalOrder>(),
+                          kickBoth ? (void *) tree.bodies_vel.as<OriginalOrder>()
+                                   : (void *) &s_nullDevPtr,
+                          (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
+                          (void *) tree.bodies_ids.as_const<CurrentOrder>(),
+                          (void *) &s_gravPMx, (void *) &s_gravPMy,
+                          (void *) &s_gravPMz, &dtGravKickG,
+                          kickAudit ? (void *) &s_pmKickAudit : &s_nullDevPtr,
+                          &s_pmKickNoPerm);
+    // Phase 3 probe (GADGET_HIP_PM_DV_PROBE=1): observe the velocity change the kick ACTUALLY
+    // produces, instead of inferring it. Three probes were spent reasoning about an impulse that
+    // every indirect check said was correct; this reads bodies_Pvel immediately before and after
+    // the kernel and reports the rms difference. Expected |dv| = rms|GravPM| * dtGravKick.
+    static const bool dvProbe = (getenv("GADGET_HIP_PM_DV_PROBE") != NULL);
+    std::vector<real4> vBefore;
+    if (dvProbe && s_pmKickCount < 3)
+    {
+      execStream->sync();
+      tree.bodies_Pvel.d2h();
+      vBefore.assign(&tree.bodies_Pvel[0], &tree.bodies_Pvel[0] + tree.n);
+    }
+    gadgetPMKick.setWork(tree.n, 128);
+    gadgetPMKick.execute2(execStream->s());
+    if (dvProbe && s_pmKickCount < 3)
+    {
+      execStream->sync();
+      tree.bodies_Pvel.d2h();
+      double sdv = 0.0, sv = 0.0; long changed = 0;
+      for (int i = 0; i < tree.n; ++i)
+      {
+        const real4 a = vBefore[i], b = tree.bodies_Pvel[i];
+        const double dx = (double)b.x-a.x, dy = (double)b.y-a.y, dz = (double)b.z-a.z;
+        if (dx || dy || dz) changed++;
+        sdv += dx*dx + dy*dy + dz*dz;
+        sv  += (double)a.x*a.x + (double)a.y*a.y + (double)a.z*a.z;
+      }
+      fprintf(stderr, "[PM-DV-PROBE] interval %ld  dtGravKick=%.6e  rms|dv|=%.6e  rms|v_before|=%.6e"
+                      "  changed=%ld/%d  |dv|/|v|=%.6e\n",
+              s_pmKickCount + 1, dtGravKick, sqrt(sdv/tree.n), sqrt(sv/tree.n),
+              changed, tree.n, sqrt(sdv/std::max(sv,1e-300)));
+    }
+    s_pmKickCount++;
+
+    if (kickAudit)
+    {
+      execStream->sync();
+      std::vector<unsigned char> h(tree.n);
+      CU_SAFE_CALL(hipMemcpy(&h[0], s_pmKickAudit, (size_t) tree.n * sizeof(unsigned char),
+                             hipMemcpyDeviceToHost));
+      long zero = 0, one = 0, many = 0;
+      for (int i = 0; i < tree.n; ++i)
+      { if (h[i] == 0) zero++; else if (h[i] == 1) one++; else many++; }
+      fprintf(stderr, "[PM-KICK-AUDIT] interval %ld  ti=[%d,%d)  dtGravKick=%.9g  "
+                      "kicked-once=%ld  never=%ld  more-than-once=%ld  %s\n",
+              s_pmKickCount, s_PM_Ti_begstep, s_PM_Ti_endstep, dtGravKick, one, zero, many,
+              (zero == 0 && many == 0) ? "OK" : "*** IMPULSE ACCOUNTING VIOLATED ***");
+      CU_SAFE_CALL(hipMemset(s_pmKickAudit, 0, (size_t) tree.n * sizeof(unsigned char)));
+    }
+
+    // Phase 3 probe (GADGET_HIP_PM_ACC_PROBE=1): how big is the long-range force compared with the
+    // short-range one it was split out of? If |GravPM| is comparable to |acc1| then the kick, with
+    // the analytically-correct factor, must matter as much as folding PM into acc1 did -- and it
+    // demonstrably does not. Reading both back is cheap at this box size.
+    static const bool accProbe = (getenv("GADGET_HIP_PM_ACC_PROBE") != NULL);
+    if (accProbe && s_pmKickCount <= 3)
+    {
+      execStream->sync();
+      tree.bodies_acc1.d2h();
+      std::vector<float> gx(tree.n), gy(tree.n), gz(tree.n);
+      // Diagnostic only; layout-identical, see the note at the other memcpy of these arrays.
+      CU_SAFE_CALL(hipMemcpy(&gx[0], s_gravPMx, (size_t)tree.n*sizeof(GFreeAcc), hipMemcpyDeviceToHost));
+      CU_SAFE_CALL(hipMemcpy(&gy[0], s_gravPMy, (size_t)tree.n*sizeof(GFreeAcc), hipMemcpyDeviceToHost));
+      CU_SAFE_CALL(hipMemcpy(&gz[0], s_gravPMz, (size_t)tree.n*sizeof(GFreeAcc), hipMemcpyDeviceToHost));
+      double sa = 0.0, sg = 0.0;
+      for (int i = 0; i < tree.n; ++i)
+      {
+        const real4 a = tree.bodies_acc1[i];
+        sa += (double)a.x*a.x + (double)a.y*a.y + (double)a.z*a.z;
+        sg += (double)gx[i]*gx[i] + (double)gy[i]*gy[i] + (double)gz[i]*gz[i];
+      }
+      fprintf(stderr, "[PM-ACC-PROBE] interval %ld  rms|acc1(short)|=%.6e  rms|GravPM|=%.6e  "
+                      "ratio PM/short=%.4f  dtGravKick=%.6e  rms dv=%.6e\n",
+              s_pmKickCount + 1, sqrt(sa/tree.n), sqrt(sg/tree.n),
+              sqrt(sg/std::max(sa,1e-300)), dtGravKick, sqrt(sg/tree.n)*dtGravKick);
+    }
+
+    static bool s_pmPhase3Logged = false;
+    if (!s_pmPhase3Logged)
+    {
+      fprintf(stderr, "[PM] Phase 3 long-range kick ACTIVE: PM interval %d ticks (%.6g dloga), "
+                      "one kick per particle per interval.\n",
+              (int) ti_step, ti_step * gadgetDPerTick);
+      s_pmPhase3Logged = true;
+    }
+  }
+
   int correctComovingFlag = haveGadgetComovingTables ? 1 : 0;
-  correctParticles.set_args(0, &tree.n, &t_current, tree.bodies_time.p(), tree.activePartlist.p(),
-                            tree.bodies_vel.p(), tree.bodies_acc0.p(), tree.bodies_acc1.p(),
-                            tree.bodies_h.p(), tree.bodies_dens.p(), tree.bodies_Ppos.p(),
-                            tree.bodies_Ppos.p(), tree.bodies_Pvel.p(), tree.oriParticleOrder.p(),
-                            real4Buffer1.p(), timeBuffer.p(),
+  // Spaces per include/buffer_registry.h. This is the Phase 3 kernel, so the buffers it WRITES are
+  // named in the current space -- that write is what re-unifies the two -- while everything it reads
+  // from the previous step's layout (bodies_acc0, bodies_Pvel, bodies_time) is original-space.
+  // `pos` and `pPos` are deliberately the same buffer: bodies_pos is no longer a distinct array, so
+  // `pos[idx] = pPos[idx]` inside the kernel is a self-copy.
+  correctParticles.set_args(0, &tree.n, &t_current,
+                            (void *) tree.bodies_time.as<OriginalOrder>(),
+                            (void *) tree.activePartlist.as_const<CurrentOrder>(),
+                            (void *) tree.bodies_vel.as<CurrentOrder>(),
+                            (void *) tree.bodies_acc0.as_const<OriginalOrder>(),
+                            (void *) tree.bodies_acc1.as_const<CurrentOrder>(),
+                            (void *) tree.bodies_h.as<CurrentOrder>(),
+                            (void *) tree.bodies_dens.as_const<CurrentOrder>(),
+                            (void *) tree.bodies_Ppos.as<CurrentOrder>(),
+                            (void *) tree.bodies_Ppos.as_const<CurrentOrder>(),
+                            (void *) tree.bodies_Pvel.as_const<OriginalOrder>(),
+                            (void *) tree.oriParticleOrder.as<CurrentOrder>(),
+                            (void *) real4Buffer1.as<CurrentOrder>(),
+                            (void *) timeBuffer.as<CurrentOrder>(),
                             &correctComovingFlag, gadgetGravKickTable.p(),
-                            &gadgetLogTimeBegin, &gadgetLogTimeMax, newEndBuffer.p(),
+                            &gadgetLogTimeBegin, &gadgetLogTimeMax,
+                            (void *) newEndBuffer.as_const<CurrentOrder>(),
                             &gadgetDPerTick, &Ti_current);
+  // Probe (GADGET_HIP_PM_ACC1_PROBE=1): rms|acc1| as correct_particles is about to consume it.
+  // Runs in EVERY mode too, unlike PM-ACC-PROBE which sits inside the cadence-only block. The
+  // point: `every` and `cadence` diverge 5.4x in per-step velocity growth at identical timesteps,
+  // which is 41x more than the measured GravPM impulse can explain. If acc1 differs by that
+  // factor between the modes, then what pm_add_by_id_masked contributes is not what the kick
+  // multiplies -- even though both are supposed to read the same array.
+  {
+    static const bool acc1Probe = (getenv("GADGET_HIP_PM_ACC1_PROBE") != NULL);
+    static int acc1Count = 0;
+    if (acc1Probe && acc1Count < 6)
+    {
+      execStream->sync();
+      tree.bodies_acc1.d2h();
+      double sa = 0.0; double mx = 0.0;
+      for (int i = 0; i < tree.n; ++i)
+      { const real4 a = tree.bodies_acc1[i];
+        const double m = (double)a.x*a.x + (double)a.y*a.y + (double)a.z*a.z;
+        sa += m; if (m > mx) mx = m; }
+      fprintf(stderr, "[PM-ACC1-PROBE] iter=%d  rms|acc1 into correct| = %.10e  max=%.6e\n",
+              iter, sqrt(sa/tree.n), sqrt(mx));
+      acc1Count++;
+    }
+  }
   correctParticles.setWork(tree.n, 128);
   correctParticles.execute2(execStream->s());
+  // Phase 3 probe (GADGET_HIP_PM_VEL_PROBE=1): the LAST unverified link. The kick is measured
+  // landing in bodies_Pvel, but bodies_vel is what the drift reads, and correct_particles
+  // rebuilds it from pVel. Report rms|bodies_vel| right after that rebuild; comparing this
+  // between GADGET_HIP_PM_KICK_SCALE=0 and =1 shows directly whether the impulse survives.
+  {
+    static const bool velProbe = (getenv("GADGET_HIP_PM_VEL_PROBE") != NULL);
+    static int velProbeCount = 0;
+    if (velProbe && velProbeCount < 8)
+    {
+      execStream->sync();
+      tree.bodies_vel.d2h();
+      double sv = 0.0;
+      for (int i = 0; i < tree.n; ++i)
+      { const real4 v = tree.bodies_vel[i]; sv += (double)v.x*v.x + (double)v.y*v.y + (double)v.z*v.z; }
+      fprintf(stderr, "[PM-VEL-PROBE] iter=%d  rms|bodies_vel after correct| = %.10e\n",
+              iter, sqrt(sv/tree.n));
+      velProbeCount++;
+    }
+  }
 
   //Copy the shuffled items back to their original buffers
   if (gadget_hip_debug_log)
@@ -4654,12 +5159,74 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     // itself uses, since bodies_Pvel (unlike bodies_Ppos) is never resorted -- see
     // compute_energy_double_prekick's own comment (timestep.cu) for the full mechanism.
     int energyComovingFlag = haveGadgetComovingTables ? 1 : 0;
-    computeEnergyPreKick.set_args(sizeof(double)*128*2, &tree.n, tree.bodies_Ppos.p(), tree.bodies_Pvel.p(),
-                                   tree.bodies_acc1.p(), tree.oriParticleOrder.p(), tree.bodies_time.p(),
+    // The long-range term of Gadget's energy synchronisation (global.c:79-87). Gadget calls
+    // energy_statistics() BEFORE advance_and_find_timesteps() (run.c), so PM_Ti_begstep/endstep
+    // still describe the interval we are INSIDE -- and so does this port: compute_energies() runs
+    // at the top of the step, the long-range kick in correct(). The factor is the same for every
+    // particle, so it is a scalar here and only the per-particle GravPM goes to the device.
+    //
+    // Not const: set_args stores a non-const void* and dereferences it at launch.
+    float dtGravKickPM = 0.0f;
+    const bool pmEnergyTerm = s_pmCadenceActive && s_gravPMx != nullptr &&
+                              haveGadgetComovingTables && s_gadgetTablesOk &&
+                              s_PM_Ti_endstep > s_PM_Ti_begstep;
+    if (pmEnergyTerm)
+    {
+      const gadget_tick_t tiMid = (s_PM_Ti_begstep + s_PM_Ti_endstep) / 2;
+      const double aBeg = gadgetTimeline.toTime(s_PM_Ti_begstep);
+      const double aMid = gadgetTimeline.toTime(tiMid);
+      const double aCur = gadgetTimeline.toTime(Ti_current);
+      // Gadget's own two-term spelling, kept verbatim rather than collapsed to a single
+      // midpoint->now integral, so the sign convention is inherited instead of re-derived.
+      double d = gadget_get_gravkick_factor(s_gadgetTables, aBeg, aCur)
+               - gadget_get_gravkick_factor(s_gadgetTables, aBeg, aMid);
+      // Same factor G as the kick itself: GravPM is stored G-FREE here (the cadence applies G in
+      // the kick because the stored force never meets pm_scale_acc_masked), while Gadget stores it
+      // G-scaled -- hence Gadget's GravPM[j]/All.G in gravtree.c and no G here in global.c.
+      if (!useDirectGravity && haveGadgetParams && gadgetParams.G > 0.0) d *= gadgetParams.G;
+      dtGravKickPM = (float) d;
+    }
+    // Same contract as the kick: G is already folded in above, so the wrapper is an assertion about
+    // what this number is, not a change to it.
+    GCarrier dtGravKickPMG = GCarrier::gravkick_times_G(dtGravKickPM);
+    computeEnergyPreKick.set_args(sizeof(double)*128*2, &tree.n,
+                                   (void *) tree.bodies_Ppos.as_const<CurrentOrder>(),
+                                   (void *) tree.bodies_Pvel.as_const<OriginalOrder>(),
+                                   (void *) tree.bodies_acc1.as_const<CurrentOrder>(),
+                                   (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
+                                   (void *) tree.bodies_time.as_const<OriginalOrder>(),
                                    &t_current, &energyComovingFlag, gadgetGravKickTable.p(),
                                    &gadgetLogTimeBegin, &gadgetDPerTick, &gadgetLogTimeMax,
-                                   tree.bodies_forceSoftening.p(), &t30_selfCoef, &t30_cc10Coef,
+                                   (void *) tree.bodies_forceSoftening.as_const<CurrentOrder>(),
+                                   &t30_selfCoef, &t30_cc10Coef,
+                                   pmEnergyTerm ? (void *) tree.bodies_ids.as_const<CurrentOrder>()
+                                                : (void *) &s_nullDevPtr,
+                                   pmEnergyTerm ? (void *) &s_gravPMx : &s_nullDevPtr,
+                                   pmEnergyTerm ? (void *) &s_gravPMy : &s_nullDevPtr,
+                                   pmEnergyTerm ? (void *) &s_gravPMz : &s_nullDevPtr,
+                                   &dtGravKickPMG,
                                    energy.p());
+    // "A feature that declines to engage must say so" (T44 item 3): the cadence being on while
+    // this term is off would silently restore the sawtooth this fix removes.
+    // The FIRST energy sample is iter 0, where PM_Ti_begstep == PM_Ti_endstep == 0 because the
+    // first long-range kick has not run yet -- so the term is legitimately off there and reporting
+    // on that call alone says "OFF" about something that engages one step later. Report when it
+    // first engages; complain only if it still has not by the third sample with the cadence on.
+    static int  s_pmEnergyCalls = 0;
+    static bool s_pmEnergyEverOn = false;
+    if (s_pmCadenceActive)
+    {
+      s_pmEnergyCalls++;
+      if (pmEnergyTerm && !s_pmEnergyEverOn)
+      {
+        s_pmEnergyEverOn = true;
+        fprintf(stderr, "[PM-ENERGY] long-range term in the energy diagnostic: ACTIVE "
+                        "(first engaged on energy sample %d)\n", s_pmEnergyCalls);
+      }
+      else if (!pmEnergyTerm && !s_pmEnergyEverOn && s_pmEnergyCalls == 3)
+        fprintf(stderr, "[PM-ENERGY] long-range term OFF after 3 energy samples with the cadence "
+                        "active -- reported Ekin WILL sawtooth with the PM interval\n");
+    }
     computeEnergyPreKick.setWork(-1, 128, blockSize);
     computeEnergyPreKick.execute2(execStream->s());
   }

@@ -47,6 +47,10 @@ slower binary, which has twice been mistaken for a physics regression. `MAC_SPRI
 with `TypeOfOpeningCriterion` in the parameter file; the binary refuses a mismatch rather than
 silently substituting the criterion it was built with.
 
+**MPI is not needed.** The solver contains no MPI references at all; only three legacy utilities
+inherited from Bonsai do, and they are off by default
+(`-DGADGET_HIP_BUILD_BONSAI_TOOLS=ON` builds them, and then MPI is required).
+
 ## Run
 
 ```bash
@@ -178,15 +182,50 @@ Same problem, same machine class — 512³ to z = 0, AMD Strix Halo (gfx1151) ag
 Both runs were 9,200–9,600 steps. The gain is concentrated at late times, where clustering makes
 the mesh assignment expensive; early steps are roughly at parity.
 
-That wall clock was measured on the float-timeline build. The integer timeline has not been timed
-over a full z = 0 run, so rather than extrapolate one, here is what *is* measured: per-step cost at
-matched expansion factor (a = 0.733), where the current build sits at **3.52 s/step** against
-**3.39–3.48 s/step** for the build the table above describes — parity, inside the spread between
-two different seeds of the older build.
+That wall clock was measured on the float-timeline build. Full z = 0 runs on the integer timeline
+have since been timed, with the PM cadence on:
+
+| 512³ to z = 0 | steps | wall clock | per step |
+|---|---|---|---|
+| cadence | 9,538 | 7.9 h | 2.98 s |
+| GADGET-2, 16 CPU cores | 9,557 | 48.3 h | 18.20 s |
+
+The step counts agree to **0.2%**, which is the sharper of the two validations: the timestep
+criterion is built from the same force GADGET builds it from, so the two codes subdivide time nearly
+identically rather than merely arriving at the same place.
 
 A per-phase breakdown of any run is in its `cpu.txt`. On a late step the cost is dominated by the
 tree walk on dense steps (~47%) and by the tree rebuild otherwise (~40%) — the long-range force is
 about 20%.
+
+---
+
+## Invariants the compiler enforces
+
+The hardest bugs in this codebase shared one shape: *a quantity is correct where it is stored, and a
+transformation is applied to it on only one of several paths to where it is used.* The run completes,
+the exit status is zero, and the numbers are plausible. Four such invariants are now types rather
+than comments, so the mistake does not compile.
+
+| header | what it makes impossible |
+|---|---|
+| `include/gadget_units.h` | Using a G-free acceleration as if G had been applied. The tree and the mesh both produce G-free forces and G is applied once downstream; three separate code paths reached a consumer without meeting it, each time silently. |
+| `include/gadget_index_spaces.h` | Indexing a particle buffer with the wrong index. Buffers live in up to three index spaces at once and all are `uint`-shaped, so every wrong pairing was in range and plausible; group arrays are a fourth space, and shorter. |
+| `include/devFunctionDefinitions.h` | A kernel declaration drifting from its definition. These declarations are used only for their address, so a wrong signature compiled and ran silently — 25 of them had diverged, one declaring 12 parameters against 25 real ones. |
+| `include/buffer_registry.h` | Guessing which index space a buffer is in: it is recorded as data, with the evidence for each entry. |
+
+A buffer's index space depends on where in the step you are, so the type is on the **kernel
+parameter** — declared by whoever knows the phase — not on the buffer.
+
+## Testing
+
+`tests/gate64/gate64.sh <binary>` runs five 64³ boxes to z = 0 against a stored CPU GADGET-2
+reference in about four minutes. It checks energy at 20 epochs against GADGET-2 *and* against this
+code's own known-good envelope, structure growth at z = 0, two configurations that **must** differ,
+and that no optional feature silently declined to engage. It finishes by reproducing a known-bad
+configuration and failing if any check accepts it — a gate nobody has seen fail is not a gate. Every
+threshold in it is a measured noise floor, documented with the measurement in
+[`tests/gate64/README.md`](tests/gate64/README.md).
 
 ---
 
@@ -196,10 +235,21 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
 
 - **Dark matter only**, single GPU, single process.
 - **Monopole tree**, matching GADGET-2. Bonsai's quadrupole correction is available but off.
-- **The long-range force is recomputed every step** and folded into the active particles'
-  acceleration. GADGET evaluates PM only on PM steps and applies it as a separate kick over the PM
-  interval to *every* particle. **Open** — a version that merely skipped PM recomputation cost 11%
-  in kinetic energy and was withdrawn.
+- **The long-range force follows GADGET's cadence**, opt-in with `GADGET_HIP_PM_CADENCE=1`. PM is
+  solved only on PM steps, the interval is chosen on the integer timeline the way GADGET chooses it
+  (the largest power-of-two tick count not exceeding `dt_displacement`), and the stored force is
+  applied as a *separate kick over the PM interval, midpoint to midpoint, to every particle exactly
+  once*. Measured at 512³ to z = 0: **439 PM solves against GADGET's 438**, worst kinetic-energy
+  deviation **0.142%**, and about **17% less wall clock** than recomputing every step. Every-step
+  remains the default because the cadence is newer.
+
+  The obvious shortcut — keeping the stored force but folding it into each active particle's own
+  kick — looks equivalent and is not: it cost 11% in kinetic energy and was withdrawn. Two further
+  consumers of the long-range force had to be corrected before the cadence agreed with GADGET: the
+  energy diagnostic, which GADGET drift-corrects back to the current time (`global.c:79-87`;
+  without it the reported energy is a sawtooth of up to 2% that looks exactly like a dynamics bug),
+  and the opening criterion's `OldAcc`, which GADGET builds from tree **and** PM
+  (`gravtree.c:309-311`).
 - **The tree is rebuilt every step.** GADGET rebuilds at `TreeDomainUpdateFrequency` and drifts node
   centres of mass in between. **Open**, and the largest remaining cost.
 - **Integer timeline**, as in GADGET-2. Step boundaries are stored as integer ticks on a 2²⁸
@@ -208,8 +258,16 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   replaced a float32 clock whose rounding produced phantom sub-ULP steps — on a zoom test the step
   count fell from 68,780 to ~2,710 against GADGET-2's 2,690. Restart files carry a version tag and
   a build refuses to read the older float layout rather than reinterpret it.
-- **Not bit-reproducible.** PM mass assignment uses atomics; the floor is ~1e-8 relative. Establish
-  that noise floor by running the same binary twice before attributing any difference to a change.
+- **Not bit-reproducible.** PM mass assignment uses `atomicAdd` on float, so the density grid
+  differs in the last bits between runs and the FFT spreads that across the box. The difference is
+  already present in the **first force evaluation** and is then amplified chaotically.
+
+  Measured over four runs of one binary at 64³: **0.42% in kinetic energy by z = 0, and ±40 in step
+  count.** Attributed to PM by measurement rather than suspicion — excluding the long-range force
+  from the dynamics drops the run-to-run spread to 0.0021%, so PM contributes about **157×**
+  everything else combined. A single run at that resolution is therefore not a measurement: average
+  several, or test a signature noise cannot fake. Any acceptance tolerance must exceed this floor,
+  because one tighter than it fails at random.
 - **I/O**: GADGET-2 format 1 only; one file per snapshot. `energy.txt` and `timings.txt` are not
   written — energies go to stdout instead. `info.txt` and `cpu.txt` *are* written, both in
   GADGET's own format. Checkpointing uses its own format, not GADGET restart files.

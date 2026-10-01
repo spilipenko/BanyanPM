@@ -5,6 +5,12 @@
 #include "vector_math.h"
 #include <cassert>
 
+// Host-side declarations of the kernels defined below. Included deliberately: it makes the compiler
+// compare each declaration against its definition, so a signature that drifts is a build error.
+// Without this, the declarations are used only for their address and a wrong one is silent -- which
+// is how 25 of them came to diverge (see devFunctionDefinitions.h).
+#include "devFunctionDefinitions.h"
+
 #ifdef USE_OPENGL
   #include <GL/glew.h>
   #include <cuda_gl_interop.h>

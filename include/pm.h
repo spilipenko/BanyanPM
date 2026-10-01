@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
+#include "gadget_units.h"   // GFreeAcc: the PM solve is called with G = 1
 
 // Phase 4 (PLAN.md): PM long-range gravity solver building blocks. New code, deliberately NOT
 // routed through Bonsai's legacy my_dev::kernel create()/set_args()/execute() wrapper -- that
@@ -171,12 +172,18 @@ void pm_scale_acc_masked(float4 *d_acc, int n, float scale, const int *d_active,
                          hipStream_t stream);
 // T36: PM force kept in ID space so it survives between PM steps (see pm_cic.cu for why current
 // sort order cannot be used). scatter at PM steps, gather-and-add every step for active particles.
+// The three force components are tagged GFreeAcc at the point of storage: the PM solve runs with
+// gravityConstant = 1.0f, so G is still owed, and every consumer has to say which G it applies.
+// d_outPot is deliberately NOT tagged -- the potential's G travels with the t30 self-potential and
+// comoving-normalisation coefficients in compute_energies(), which is a different and more tangled
+// path than the force's single multiplication; tagging it would need that path converted too.
 void pm_scatter_by_id(const unsigned long long *d_ids, const float *d_fx, const float *d_fy,
                       const float *d_fz, const float *d_pot,
-                      float *d_outX, float *d_outY, float *d_outZ, float *d_outPot,
+                      GFreeAcc *d_outX, GFreeAcc *d_outY, GFreeAcc *d_outZ, float *d_outPot,
                       int n, hipStream_t stream);
 void pm_add_by_id_masked(float4 *d_acc, const unsigned long long *d_ids,
-                         const float *d_byIdX, const float *d_byIdY, const float *d_byIdZ,
+                         const GFreeAcc *d_byIdX, const GFreeAcc *d_byIdY,
+                         const GFreeAcc *d_byIdZ,
                          const float *d_byIdPot, int n, const int *d_active, hipStream_t stream);
 
 void pm_add_force_to_acc_masked(float4 *d_acc, const float *d_fx, const float *d_fy,

@@ -8,6 +8,12 @@ PROF_MODULE(compute_propertiesD);
 
 #include "node_specs.h"
 
+// Host-side declarations of the kernels defined below. Included deliberately: it makes the compiler
+// compare each declaration against its definition, so a signature that drifts is a build error.
+// Without this, the declarations are used only for their address and a wrong one is silent -- which
+// is how 25 of them came to diverge (see devFunctionDefinitions.h).
+#include "devFunctionDefinitions.h"
+
 static __device__ __forceinline__ void sh_MinMax2(int i, int j, float3 *r_min, float3 *r_max, volatile float3 *sh_rmin, volatile  float3 *sh_rmax)
 {
   sh_rmin[i].x  = (*r_min).x = fminf((*r_min).x, sh_rmin[j].x);
@@ -350,7 +356,7 @@ KERNEL_DECLARE(compute_non_leaf)(const int curLevel,         //Level for which w
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-  const int idx = bid * (blockDim.x * blockDim.y) + tid;
+  const uint idx = bid * (blockDim.x * blockDim.y) + tid;
 
   const int endNode   = node_level_list[curLevel];
   const int startNode = node_level_list[curLevel-1];
@@ -500,7 +506,7 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-  const int idx = bid * (blockDim.x * blockDim.y) + tid;
+  const uint idx = bid * (blockDim.x * blockDim.y) + tid;
 
   if(idx >= node_count)     return;
 
@@ -936,7 +942,7 @@ KERNEL_DECLARE(gpu_setPHGroupDataGetKey2)(const int n_groups,
   CUXTIMER("setPHGroupDataGetKey2");
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  const int idx = bid * (blockDim.x * blockDim.y) + tid;
+  const uint idx = bid * (blockDim.x * blockDim.y) + tid;
 
   if(idx >= n_groups)     return;
 

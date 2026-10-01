@@ -1,4 +1,5 @@
 #include "hip/hip_runtime.h"
+#include "gadget_index_spaces.h"   // CurrentOrder / OriginalOrder (T44 item 1)
 #include "octree.h"
 
 
@@ -47,7 +48,13 @@ void octree::compute_properties(tree_structure &tree) {
   //Set valid list to zero to reset the active particles
   tree.activeGrpList.zeroMemGPUAsync(execStream->s());
 
-  setActiveGrps.set_args(0, &tree.n, &Ti_current, tree.bodies_time.p(), tree.body2group_list.p(), tree.activeGrpList.p(), &tree.n_groups, tree.oriParticleOrder.p());
+  // bodies_time is never resorted (OriginalOrder); body2group_list is rebuilt after the sort
+  // (CurrentOrder). Naming both is what makes C-D-03b unwriteable inside the kernel.
+  setActiveGrps.set_args(0, &tree.n, &Ti_current,
+                         (void *) tree.bodies_time.as<OriginalOrder>(),
+                         (void *) tree.body2group_list.as_const<CurrentOrder>(),
+                         (void *) tree.activeGrpList.as<GroupOrder>(), &tree.n_groups,
+                         (void *) tree.oriParticleOrder.as_const<CurrentOrder>());
   setActiveGrps.setWork(tree.n, 128);
   setActiveGrps.execute2(execStream->s());
 
