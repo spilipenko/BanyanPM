@@ -177,14 +177,23 @@ agrees: 31 GB against 512's 47 GB.
 
 Both meshes now follow the cadence together, as GADGET does — `accel.c` wraps the whole of
 `long_range_force()`, which solves both. Before that the fine mesh was solved every step regardless
-(measured: coarse 1 solve in 10 steps, fine 10 of 10), which cost 1.59 s/step at `PMGRID=512` and
-was the whole of why 512 looked slower. With it fixed all three mesh sizes cost the **same** between
-PM steps — 2.194 / 2.198 / 2.214 s for 512 / 256 / 128, within 0.9% — and on the periodic steps
-where the timestep ladder brings a large fraction of particles up at once, the cheaper tree walk at
-small `Rcut` makes **512 the fastest overall** (2.615 s against 256's 2.708 and 128's 2.846).
+(measured: the coarse mesh solved 3 times in a 46-step run, the fine mesh 46), which cost 1.59 s per
+step at `PMGRID=512`.
 
-So with the cadence on, pick 512 for the finest mesh; memory is the only argument against it (47 GB
-against 256's 31 GB). Without the cadence, pick 256.
+The cadence interval is GADGET's own choice, not a fixed number of steps: the largest power-of-two
+tick count on the integer timeline not exceeding `dt_displacement`, which on this run is 16 steps.
+Amortised over whole PM intervals — the only honest per-step figure, since one step in 16 does all
+the mesh work and the rest do none:
+
+| PMGRID=512 | non-PM step | PM step | amortised |
+|---|---|---|---|
+| before | 3.925 s | 8.010 s | **4.110 s** |
+| after | 2.316 s | 8.118 s | **2.580 s** |
+
+−37% per step. The PM step itself barely moves, because it was already solving the fine mesh; the
+saving is the other 15 steps in 16. Across mesh size the amortised means are 2.580 / 2.595 / 2.728 s
+for 512 / 256 / 128, so with the cadence on **512 is both the fastest and the finest** and memory is
+the only argument against it (47 GB against 256's 31 GB). Without the cadence, pick 256.
 
 Validated, because deferring the fine force changes the dynamics: on the 113k zoom against the CPU
 reference, worst kinetic-energy deviation is **+0.411%** against every-step's +0.435%, and the
