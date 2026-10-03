@@ -121,6 +121,27 @@ if(UNEQUAL_SOFTENINGS)
   add_definitions(-DUNEQUALSOFTENINGS)
 endif()
 
+# T46: a bit-reproducible CIC scatter, for DIAGNOSIS ONLY.
+#
+# PM mass assignment uses atomicAdd on float. Float addition is not associative and the launch order
+# varies, so the density grid differs in its last bits between two runs of the same binary, the FFT
+# spreads that across the box, and the trajectory diverges chaotically: 0.42% in kinetic energy by
+# z=0 at 64^3, +-40 in step count. That makes byte-comparison useless as a verification instrument on
+# the one code path that matters most (tickets T3, T16, T46).
+#
+# ON: the scatter accumulates into fixed-point unsigned 64-bit integers instead. Integer addition IS
+# associative, so the result is independent of order and the run becomes bit-reproducible.
+#
+# This is NOT the production path and is not meant to become one -- it costs an extra grid-sized
+# 64-bit buffer (about 1.1 GB at PMGRID=512) and 64-bit atomics are slower than 32-bit. Its purpose
+# is to make a REPRODUCIBLE PROBE: build two binaries with this option, change one thing between
+# them, and any difference in the output is that change rather than the noise floor. Without it a
+# sub-0.5% effect at 64^3 cannot be distinguished from run-to-run scatter at all.
+option(GADGET_HIP_DETERMINISTIC_CIC "Bit-reproducible fixed-point CIC scatter (diagnostic; slower, +1 grid of uint64)" OFF)
+if(GADGET_HIP_DETERMINISTIC_CIC)
+  add_definitions(-DGADGET_HIP_DETERMINISTIC_CIC)
+endif()
+
 # Phase 3 NCRIT=32-vs-64 experiment: group size (i-particle group / GOTHIC pseudo-particle size),
 # same CMake-option convention as MAC_SPRINGEL above -- node_specs.h defaults to 64 if NCRIT isn't
 # defined on the command line.

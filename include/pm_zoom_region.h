@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <cstddef>
 
 // Phase 5 ticket 06 (PLAN.md): pure host region-sizing logic, deliberately kept free of any
 // HIP/CUDA dependency (unlike pm_zoom.h, which declares the device-kernel-launching counterparts
@@ -20,8 +21,14 @@ struct ZoomRegion
   float corner[3]     = {0, 0, 0}; // global coords of the fine grid's local (0,0,0)
   float totalMeshSize = 0.0f;      // "science" box side length (post-ENLARGEREGION, pre-doubling)
   float meshSize      = 0.0f;      // = 2*totalMeshSize, the doubled grid's physical size
-  float asmth1        = 0.0f;      // ASMTH * totalMeshSize / (2*gridSize) -- ALWAYS doubled, see below
+  float asmth1        = 0.0f;      // ASMTH * cellSize, i.e. ASMTH*meshSize/fftGridSize (T50 3D)
   float rcut1         = 0.0f;      // RCUT  * asmth1
+  // T50 item 3F: `corner` is inset below the data span by this much (2 fine cells, Gadget-2's own
+  // pm_nonperiodic.c:119 `- 2.0005*TotalMeshSize/GRID`), so the 4-point finite-difference stencil
+  // never has to reach outside the grid for a cell any particle gathers from. The DATA therefore
+  // occupies [corner + cornerInset, corner + cornerInset + totalMeshSize]; keep that in mind
+  // whenever `corner` is used as if it were the start of the data.
+  float cornerInset   = 0.0f;
   bool  valid         = false;
 };
 
@@ -51,6 +58,38 @@ bool pm_zoom_compute_region(const std::vector<Vec3f> &h_pos, const std::vector<i
 // "High-res zone may not cross a periodic box boundary" (Makefile/main.c's own documented
 // modeling requirement -- Gadget-2 itself has no runtime assertion for this). Pass boxSize<=0 to
 // skip (non-periodic zoom has no box to cross).
+// T51: the periodic centre of the high-res species, and the shift that moves it to the box centre.
+//
+// Why this is not a centre of mass. In a periodic box the mean of the coordinates is meaningless for
+// a clump straddling a boundary: particles at x=0.1 and x=L-0.1 are neighbours, but their mean is
+// L/2, the far side of the box. The circular mean (mean of the unit vectors at angle 2*pi*x/L) fixes
+// that but is biased for broad distributions and gives no bounding box.
+//
+// What this does instead is exact for the case that actually matters, and tells you when it is not
+// applicable. Pick any one high-res particle as a reference; express every other high-res particle's
+// coordinate as its MINIMUM-IMAGE offset from that reference; take min and max of those offsets. If
+// the true occupied interval is shorter than L/2 then every member lies within L/2 of the reference
+// along the shortest path, so each minimum-image offset IS the true signed offset, and min/max give
+// the true interval -- wrap and all. The centre is then the midpoint of that interval, wrapped.
+//
+// The precondition is self-checking: if the resulting extent comes back >= L/2 on any axis, the
+// method cannot be trusted (the species is spread over half the box or more, or the mask is wrong),
+// and that is reported rather than papered over. A zoom region is by construction a small part of
+// the box, so a failure here means the setup is not a zoom.
+//
+// `pos` is read with a stride so it can run straight over the float4 position array with no copy --
+// the whole point of avoiding an N-element temporary (T50 item 3A). Returns false and sets `*errOut`
+// to a static string on no-match or precondition failure.
+bool pm_zoom_periodic_center(const float *pos, size_t posStride, const int *types, size_t n,
+                             unsigned int highResMask, double boxSize,
+                             double centerOut[3], double extentOut[3], const char **errOut);
+
+// Translate every particle (not just the high-res ones -- a periodic box is translation invariant
+// only if it all moves together) by `shift`, wrapping into [0, boxSize). Used both to apply the
+// recentring at IC load and, with the negated shift, to undo it when writing a snapshot.
+void pm_zoom_shift_positions(float *pos, size_t posStride, size_t n,
+                             const double shift[3], double boxSize);
+
 bool pm_zoom_region_fits_in_box(const ZoomRegion &region, float boxSize);
 
 // True if any high-res-typed particle lies outside `region`'s own science box -- the reactive-

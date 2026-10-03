@@ -14,6 +14,49 @@ PROF_MODULE(compute_propertiesD);
 // is how 25 of them came to diverge (see devFunctionDefinitions.h).
 #include "devFunctionDefinitions.h"
 
+// C-A-07 / T20 / Phase 4: GADGET-2's force_update_len semantics.
+//
+// On a step that does NOT rebuild the tree, this port refits every node's AABB exactly from the
+// current bodies_Ppos over the STALE node_bodies index ranges. An exact refit is the tightest box
+// for that particle set, which sounds strictly better than GADGET and is strictly more dangerous:
+// the set is stale, so a node can now bound particles it no longer owns, and the box can SHRINK.
+// GADGET's maintenance only ever grows a node (forcetree.c:940-960):
+//
+//     if(distmax + distmax > Nodes[no].len)
+//       Nodes[no].len = distmax + distmax;
+//
+// and that monotonicity is what keeps the opening criterion conservative. Measured with
+// GADGET_HIP_CA07=1 before this kernel existed: 8.5% of nodes shrank on the first stale step, the
+// worst to 8% of its rebuild extent -- the same pathologically-small-node mechanism as the T24
+// blowup, where a too-small box lets the walk approximate where it must split.
+//
+// This enforces the floor: the extent used is the per-axis max of the refit and everything seen
+// since the last rebuild. The floor accumulates, so it is max over all stale steps, exactly as
+// GADGET's repeated application of the test above accumulates.
+//
+// boxSizeInfo.w is NOT an extent -- it packs n_children (and, for leaves, pfirst) as an int
+// bit-cast to float. Touching it would corrupt the tree topology, so only xyz are compared.
+extern "C" __global__ void gadget_node_len_monotone(const int n_nodes,
+                                                    float4 *boxSizeInfo,
+                                                    float4 *lenFloor)
+{
+  const uint idx = blockIdx.y * gridDim.x + blockIdx.x;
+  const uint tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const uint i   = idx * (blockDim.x * blockDim.y) + tid;
+  if (i >= (unsigned int) n_nodes) return;
+
+  const float4 cur = boxSizeInfo[i];
+  const float4 flo = lenFloor[i];
+  float4 out;
+  out.x = fmaxf(cur.x, flo.x);
+  out.y = fmaxf(cur.y, flo.y);
+  out.z = fmaxf(cur.z, flo.z);
+  out.w = cur.w;                 // n_children / pfirst -- topology, never an extent
+  boxSizeInfo[i] = out;
+  lenFloor[i]    = out;          // accumulate, so the floor is the max over all stale steps
+}
+
+
 static __device__ __forceinline__ void sh_MinMax2(int i, int j, float3 *r_min, float3 *r_max, volatile float3 *sh_rmin, volatile  float3 *sh_rmax)
 {
   sh_rmin[i].x  = (*r_min).x = fminf((*r_min).x, sh_rmin[j].x);

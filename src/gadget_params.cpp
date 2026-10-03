@@ -6,6 +6,8 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <algorithm>
+#include <cmath>
 
 // Phase 5 ticket 01 (PLAN.md) -- see gadget_params.h for the design rationale. This file's
 // structure deliberately mirrors read_parameter_file()'s own tag[]/addr[]/id[] table
@@ -253,5 +255,92 @@ bool gadget_params_parse(const std::string &filename, bool builtWithPeriodic, Ga
     return false;
 
   out.deriveUnits();
+  return true;
+}
+
+// T56: Gadget-2's output list. OutputListOn/OutputListFilename were parsed (the tag table above)
+// and READ NOWHERE -- the same defect shape as C-B-03's TypeOfOpeningCriterion. A parameter file
+// with `OutputListOn 1` therefore got this port's TimeBetSnapshot cadence instead of the times it
+// asked for, silently, which makes a snapshot-by-snapshot comparison against a Gadget reference
+// compare different epochs.
+bool gadget_load_output_list(GadgetParams &out, std::vector<std::string> &errors)
+{
+  out.OutputListTimes.clear();
+
+  if (out.OutputListOn == 0)
+    return true;                       // nothing to do; the cadence path stays in charge
+
+  if (out.OutputListFilename.empty())
+  {
+    errors.push_back("OutputListOn=1 but OutputListFilename is empty");
+    return false;
+  }
+
+  FILE *fd = fopen(out.OutputListFilename.c_str(), "r");
+  if (!fd)
+  {
+    errors.push_back("OutputListOn=1 but the output list '" + out.OutputListFilename +
+                      "' cannot be read");
+    return false;
+  }
+
+  // Gadget reads with `fscanf(fd, " %lg ", ...)` in a loop, so the file is just whitespace-
+  // separated numbers -- one per line in practice, but the format imposes nothing. Matched here
+  // exactly, including that a malformed entry ENDS the list rather than being skipped.
+  std::vector<double> raw;
+  double t = 0.0;
+  while (fscanf(fd, " %lg ", &t) == 1)
+    raw.push_back(t);
+  const bool hitEof = feof(fd) != 0;
+  fclose(fd);
+
+  if (raw.empty())
+  {
+    errors.push_back("output list '" + out.OutputListFilename + "' contains no readable times");
+    return false;
+  }
+  if (!hitEof)
+    fprintf(stderr, "[T56] WARNING: output list '%s' stopped parsing after %zu entries -- the rest "
+                    "of the file is not whitespace-separated numbers. Gadget would stop here too.\n",
+            out.OutputListFilename.c_str(), raw.size());
+  if (raw.size() > 500)
+    fprintf(stderr, "[T56] WARNING: output list has %zu entries; stock Gadget-2 reads at most "
+                    "MAXLEN_OUTPUTLIST=500 and silently ignores the rest (allvars.h:481), so a "
+                    "Gadget run on this same file would NOT produce the same set of snapshots.\n",
+            raw.size());
+
+  // find_next_outputtime() (run.c:253-258) only ever considers entries with
+  // TimeBegin <= time <= TimeMax, so out-of-range entries are normal, not an error: an output list
+  // is usually written once for a whole suite and reused for runs that stop early.
+  size_t dropped = 0;
+  for (size_t i = 0; i < raw.size(); ++i)
+  {
+    const double q = raw[i];
+    if (q >= out.TimeBegin && q <= out.TimeMax) out.OutputListTimes.push_back(q);
+    else                                        dropped++;
+  }
+  std::sort(out.OutputListTimes.begin(), out.OutputListTimes.end());
+  // Gadget takes the smallest tick >= ti_curr each time, so duplicates are harmless there. Here
+  // they would fire two snapshots at one epoch, which this port cannot distinguish (no partial
+  // drift), so collapse them.
+  out.OutputListTimes.erase(std::unique(out.OutputListTimes.begin(), out.OutputListTimes.end()),
+                             out.OutputListTimes.end());
+
+  if (out.OutputListTimes.empty())
+  {
+    errors.push_back("output list '" + out.OutputListFilename + "' has " +
+                      std::to_string(raw.size()) + " times but none inside this run's "
+                      "[TimeBegin, TimeMax] = [" + std::to_string(out.TimeBegin) + ", " +
+                      std::to_string(out.TimeMax) + "]");
+    return false;
+  }
+
+  std::string note;
+  if (dropped)
+    note = " (" + std::to_string(dropped) + " outside the run, ignored as Gadget does)";
+  fprintf(stderr, "[T56] output list '%s': %zu times, %zu in [%g, %g]%s -- first %g, last %g\n",
+          out.OutputListFilename.c_str(), raw.size(), out.OutputListTimes.size(),
+          out.TimeBegin, out.TimeMax, note.c_str(),
+          out.OutputListTimes.front(), out.OutputListTimes.back());
   return true;
 }

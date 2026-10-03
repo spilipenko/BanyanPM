@@ -121,6 +121,7 @@ extern void displayTimers()
 #include <cmath>
 #ifdef GADGET_HIP_HIGHRES
 #include "pm_zoom.h"
+#include "pm_zoom_region.h"
 #endif
 #ifdef PERIODIC
 #include "ewald_ref.h"
@@ -234,10 +235,42 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   unsigned int zoomMask    = 0;
   // Gadget-2's ENLARGEREGION is a Makefile -D that's commented out (Makefile:24, with 1.2 given only
   // as an example value) by default -- pm_nonperiodic.c:93-94 only multiplies TotalMeshSize when
-  // ENLARGEREGION is actually #define'd, so the true stock default is "no enlargement" (1.0), not
-  // 1.2. Verified directly against Gadget-2.0.7/Gadget2/{Makefile,pm_nonperiodic.c} rather than
-  // assumed from prose.
-  float        zoomEnlarge = 1.0f;
+  // ENLARGEREGION is actually #define'd, so the *stock* default is "no enlargement" (1.0), not 1.2.
+  // Verified directly against Gadget-2.0.7/Gadget2/{Makefile,pm_nonperiodic.c} rather than assumed
+  // from prose, and this port defaulted to 1.0 on that basis.
+  //
+  // It now defaults to 1.2 anyway, which is a deliberate departure from stock, for two reasons.
+  //
+  // First: 1.0 is not actually the configuration stock Gadget RUNS a zoom in. A zoom needs
+  // PLACEHIGHRESREGION, which has to be enabled in the Makefile by hand, and the ENLARGEREGION line
+  // sits three lines below it with 1.2 already filled in -- so the realistic stock zoom user turns
+  // on both. The reference run this port is validated against
+  // (gadget-runs/gadget2-zoom, PMGRID=128 PLACEHIGHRESREGION=2 ENLARGEREGION=1.2) is built exactly
+  // that way, and a default of 1.0 meant the port's out-of-the-box geometry did not match the only
+  // Gadget configuration there is a reference for.
+  //
+  // Second: 1.0 means the region is the high-res particles' bounding box to the last digit, so the
+  // outermost high-res particle is ON the boundary and the very first step that moves it outward
+  // triggers a full region recompute (the [ZOOM] "left the current region" path above). 1.2 buys
+  // 10% of the box extent of margin in each direction. Gadget needs that margin more than this port
+  // does -- its recovery is pmforce_nonperiodic() returning 1, re-initialising and retrying, and
+  // endrun(68686) if the retry also fails -- whereas this port rescans and recomputes on the
+  // rebuild cadence without ever failing the step. But the recompute is not free here either, and
+  // matching the reference is worth more than matching a default that no zoom run uses.
+  //
+  // The cost is real and worth stating: the fine grid covers 1.2x the extent in each axis at fixed
+  // GADGET_HIP_PMGRID, so the fine cell, Asmth[1] and Rcut[1] are all 20% larger and the fine mesh
+  // resolves 20% less. Gadget's own documentation warns against enlarging the region for exactly
+  // this reason. Anyone who wants the tightest possible fine grid and is willing to pay for the
+  // recomputes should pass --zoom-enlarge 1.0.
+  float        zoomEnlarge = 1.2f;
+  // T51: recentre the high-res region on the box centre at IC load, so the fine grid cannot cross a
+  // periodic boundary. Default ON when a zoom mask is given, because the alternative is the run
+  // refusing to start (pm_zoom_region_fits_in_box) and the user having to pre-shift the ICs by hand
+  // and un-shift every snapshot during analysis.
+  int          zoomRecenter = 1;
+  double       zoomShiftApplied[3] = {0.0, 0.0, 0.0};
+  bool         haveZoomShift = false;
   string logFileName       = "gpuLog.log";
   string snapshotFile      = "snapshot_";
   std::string bonsaiFileName;
@@ -297,12 +330,17 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   float boxSize = -1.0f;
 #endif
 
-#if defined(PMGRID) && !defined(PERIODIC)
+#if defined(PMGRID)
   // Isolated (non-periodic) TreePM counterpart to boxSize above (LOG.md §34) -- physical size of
-  // the doubled FFT grid the isolated PM solver + tree-side short-range table both need. Required
+  // the doubled FFT grid the isolated PM solver + tree-side short-range table both need. REQUIRED
   // whenever PMGRID is compiled in without PERIODIC, matching how boxSize is required for
   // PERIODIC. Particles must lie within [0, meshSize/2) in each axis (the "occupied first half",
   // pm.h's PMIsolatedSolver doc comment) for correct isolated-boundary behavior.
+  //
+  // Declared for PERIODIC builds too (but not required there): --zoom-treepm-force-test builds a
+  // synthetic coarse ISOLATED grid of this side to put its zoom inside, and that test now runs in
+  // the periodic build -- the one actually shipped for a zoom. In a periodic run it is otherwise
+  // unused and stays at -1.
   float meshSize = -1.0f;
 #endif
 
@@ -415,6 +453,11 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		         "disables zoom [requires a GADGET_HIP_HIGHRES build]");
 		ADDUSAGE("     --zoom-enlarge #   Phase 5 ticket 06: ENLARGEREGION multiplier for the "
 		         "high-res region's auto-sized bounding box [" << zoomEnlarge << "]");
+		ADDUSAGE("     --zoom-recenter #  T51: 1 = translate ALL particles at IC load so "
+		         "the high-res region sits at the box centre, so the fine grid cannot cross a "
+		         "periodic boundary; the shift is undone when snapshots are written, so output "
+		         "stays in the IC's frame. 0 = leave coordinates alone (and refuse to run if "
+		         "the region crosses a boundary) [" << zoomRecenter << "]");
 		ADDUSAGE("     --zoom-kernel-test # Phase 5 ticket 06: one-shot fine-grid differential "
 		         "Green's-function-kernel self-test (value unused, just needs to be nonzero); "
 		         "exits after printing PASS/FAIL per case [requires a GADGET_HIP_HIGHRES build]");
@@ -511,6 +554,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		opt.setOption( "driftfac-test");
 		opt.setOption( "zoom-mask");
 		opt.setOption( "zoom-enlarge");
+		opt.setOption( "zoom-recenter");
 		opt.setOption( "zoom-kernel-test");
 		opt.setOption( "bonsaifile",  'f');
 		opt.setFlag  ( "restart");
@@ -558,7 +602,11 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 #ifdef PERIODIC
     opt.setOption("boxsize");
 #endif
-#if defined(PMGRID) && !defined(PERIODIC)
+#if defined(PMGRID)
+    // Registered for PERIODIC builds too: --zoom-treepm-force-test sizes its own synthetic coarse
+    // ISOLATED grid from this, and that test now runs in the periodic build -- which is the build
+    // actually shipped for a zoom, so it is the one whose fine grid most needs checking. The
+    // "--meshsize is required" check further down stays non-periodic-only, where it really is.
     opt.setOption("meshsize");
 #endif
     opt.setOption("pm-test-cic");
@@ -579,9 +627,13 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 #endif
 #if !defined(PERIODIC)
     opt.setOption("pm-test-isolated-treepm-force");
-#ifdef GADGET_HIP_HIGHRES
-    opt.setOption("zoom-treepm-force-test");
 #endif
+#ifdef GADGET_HIP_HIGHRES
+    // NOT gated on !PERIODIC: the fine grid is ALWAYS an isolated solve whatever the coarse grid
+    // does, the isolated solver is compiled whenever PMGRID is, and the periodic build is the one
+    // shipped for real zooms -- so that is the build this test most needs to run in. It sets up the
+    // coarse grid's own Rcut/Asmth explicitly below, so it does not inherit periodic constants.
+    opt.setOption("zoom-treepm-force-test");
 #endif
 #endif
 #ifdef USE_OPENGL
@@ -622,6 +674,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     if ((optarg = opt.getValue("driftfac-test"))) driftfacTestSamples = atoi(optarg);
     if ((optarg = opt.getValue("zoom-mask")))    zoomMask    = (unsigned int) strtoul(optarg, NULL, 0); // base 0: accepts "0x..." or decimal
     if ((optarg = opt.getValue("zoom-enlarge"))) zoomEnlarge = (float) atof(optarg);
+    if ((optarg = opt.getValue("zoom-recenter"))) zoomRecenter = atoi(optarg);
     if ((optarg = opt.getValue("zoom-kernel-test"))) zoomKernelTestSamples = atoi(optarg);
     if ((optarg = opt.getValue("bonsaifile")))   bonsaiFileName     = std::string(optarg);
     if ((optarg = opt.getValue("plummer")))      nPlummer           = atoi(optarg);
@@ -634,7 +687,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 #ifdef PERIODIC
     if ((optarg = opt.getValue("boxsize")))         boxSize          = (float) atof(optarg);
 #endif
-#if defined(PMGRID) && !defined(PERIODIC)
+#if defined(PMGRID)
+    // Parsed in PERIODIC builds too -- the fifth and last of the guards that kept
+    // --zoom-treepm-force-test from working there. See the declaration of meshSize.
     if ((optarg = opt.getValue("meshsize")))        meshSize         = (float) atof(optarg);
 #endif
     if ((optarg = opt.getValue("pm-test-cic")))     pmTestCicGrid    = atoi(optarg);
@@ -655,9 +710,14 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 #endif
 #if !defined(PERIODIC)
     if ((optarg = opt.getValue("pm-test-isolated-treepm-force"))) pmTestIsolatedTreePMSamples = atoi(optarg);
-#ifdef GADGET_HIP_HIGHRES
-    if ((optarg = opt.getValue("zoom-treepm-force-test"))) zoomTreePMTestSamples = atoi(optarg);
 #endif
+#ifdef GADGET_HIP_HIGHRES
+    // Parsed in PERIODIC builds too. This was the FOURTH place --zoom-treepm-force-test was fenced
+    // off from periodic builds -- usage text, opt.setOption, this getValue, and the test body each
+    // had their own !defined(PERIODIC) guard, and the option silently did nothing until all of them
+    // were found. Worth remembering: "the option exists" and "the option is parsed" and "the code it
+    // reaches is compiled" are three separate conditions.
+    if ((optarg = opt.getValue("zoom-treepm-force-test"))) zoomTreePMTestSamples = atoi(optarg);
 #endif
 #endif
     if ((optarg = opt.getValue("logfile")))      logFileName        = string(optarg);
@@ -761,6 +821,17 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
         ::exit(1);
       }
       haveGadgetParams = true;
+
+      // T56: the output list, loaded separately because it needs TimeBegin/TimeMax from the parse
+      // that just finished. Fatal on failure, by the same argument as C-B-03's MAC guard: a
+      // configuration that cannot produce the requested OUTPUTS must stop the run, not quietly
+      // fall back to the TimeBetSnapshot cadence and write snapshots at other epochs.
+      if (!gadget_load_output_list(gadgetParams, paramErrors))
+      {
+        fprintf(stderr, "Error(s) in the output list requested by '%s':\n", paramFile.c_str());
+        for (auto &e : paramErrors) fprintf(stderr, "  %s\n", e.c_str());
+        ::exit(1);
+      }
 
       fprintf(stderr, "[PARAM] Parsed '%s': G=%.9g Hubble=%.9g UnitTime_in_s=%.9g "
                        "ComovingIntegrationOn=%d Omega0=%g OmegaLambda=%g BoxSize=%g\n",
@@ -1377,6 +1448,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     // iterate_once() (octree::recomputeZoomRegion(), gpu_iterate.cpp), since it needs the real
     // particle positions/types, not just CLI config.
     tree->setZoomConfig(zoomMask, zoomEnlarge);
+    // NOTE: the recentring shift is NOT set here. This runs before the IC is read, so the shift
+    // does not exist yet -- it is handed over inside the recentring block itself, further down.
+    // Setting it here silently left it at zero and the snapshots came out in the shifted frame.
 #endif
 
 
@@ -1569,6 +1643,56 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     // exists (right after allocateParticleMemory(), further below) -- per-type softening is the
     // first real consumer of snapData.type; tickets 06/07's zoom work will read it too.
     bodyTypes = snapData.type;
+
+#ifdef GADGET_HIP_HIGHRES
+    // T51: recentre the high-res region on the box centre. Done HERE because this is the one point
+    // where positions and types are both on the host and nothing has been uploaded yet, so it costs
+    // one pass over an array the loop above has just walked anyway -- no device work, no temporary.
+    //
+    // Physically inert: a periodic box is translation invariant provided EVERY particle moves by the
+    // same amount, which is why pm_zoom_shift_positions is not restricted to the masked species.
+    // Forces, potentials and velocities are untouched; only the labelling of absolute position
+    // changes, and writeGadgetSnapshot undoes it so even that is invisible downstream.
+    if (zoomMask != 0u && zoomRecenter != 0 && snapHeader.BoxSize > 0.0 && n > 0)
+    {
+      double zc[3], ze[3];
+      const char *zerr = NULL;
+      if (!pm_zoom_periodic_center(&bodyPositions[0].x, 4, bodyTypes.data(), n,
+                                    zoomMask, snapHeader.BoxSize, zc, ze, &zerr))
+      {
+        fprintf(stderr, "\n[ZOOM] ERROR: --zoom-recenter could not locate the high-res region: %s\n"
+                        "Either fix --zoom-mask, or pass --zoom-recenter 0 to leave coordinates "
+                        "alone.\n\n", zerr ? zerr : "unknown");
+        ::exit(1);
+      }
+      double sh[3];
+      bool needed = false;
+      for (int a = 0; a < 3; ++a)
+      {
+        sh[a] = 0.5 * snapHeader.BoxSize - zc[a];
+        while (sh[a] >= snapHeader.BoxSize) sh[a] -= snapHeader.BoxSize;
+        while (sh[a] < 0.0)                 sh[a] += snapHeader.BoxSize;
+        if (sh[a] != 0.0) needed = true;
+      }
+      fprintf(stderr, "[ZOOM] high-res region centre (%.6g, %.6g, %.6g), extent "
+                      "(%.6g, %.6g, %.6g) of box %.6g\n",
+              zc[0], zc[1], zc[2], ze[0], ze[1], ze[2], snapHeader.BoxSize);
+      if (needed)
+      {
+        pm_zoom_shift_positions(&bodyPositions[0].x, 4, n, sh, snapHeader.BoxSize);
+        fprintf(stderr, "[ZOOM] recentred: shifted ALL %zu particles by (%.6g, %.6g, %.6g); "
+                        "snapshots are written back in the IC's frame\n",
+                n, sh[0], sh[1], sh[2]);
+      }
+      else
+        fprintf(stderr, "[ZOOM] already centred; no shift applied\n");
+      zoomShiftApplied[0] = sh[0]; zoomShiftApplied[1] = sh[1]; zoomShiftApplied[2] = sh[2];
+      haveZoomShift = needed;
+      // Hand it to the octree HERE, where it finally exists: writeGadgetSnapshot() needs it to
+      // undo the translation, and setZoomConfig() above already ran long before the IC was read.
+      if (haveZoomShift) tree->setZoomShift(zoomShiftApplied);
+    }
+#endif
 
     // The IC header's epoch WINS over the parameter file's TimeBegin -- deliberately. But in a
     // COMOVING run a disagreement between the two is almost always a mistake with expensive
@@ -2561,6 +2685,8 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
             sumRelErr / std::max(1, nCounted), maxRelErr);
     ::exit(0); // diagnostic report, not a strict pass/fail gate -- see comment above
   }
+#endif // !defined(PERIODIC) ends here: the zoom test below is compiled in PERIODIC builds too,
+       // because the fine grid is always an isolated solve and the periodic build is the shipped one
 #ifdef GADGET_HIP_HIGHRES
   // Phase 5 ticket 07 (PLAN.md): the zoom-aware counterpart to --pm-test-isolated-treepm-force
   // above -- ground truth is again plain Newtonian G*m/r^2, but the TARGET is given a high-res
@@ -2574,81 +2700,130 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   {
     const int nSamples = zoomTreePMTestSamples;
     const int gridSize = PMGRID;
+    if (!(meshSize > 0.0f))
+    {
+      fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] --meshsize # is required: it sets the side of the "
+                      "synthetic coarse ISOLATED grid this test builds its zoom inside. It is "
+                      "unrelated to the simulation box. Try --meshsize 10.\n");
+      ::exit(1);
+    }
     const float base   = meshSize * 0.25f; // SAME center the coarse test above uses
 
-    // A genuinely "zoomed in" fine grid: a fraction of the coarse grid's own meshSize, not a copy
-    // of it (ticket 06's own end-to-end test, LOG.md §41, found and fixed a bug where an earlier
-    // formula could never produce a fine grid smaller than the coarse one).
+    // T52: the geometry now comes from pm_zoom_compute_region(), the function that computes it in a
+    // real run. The previous version hand-built the ZoomRegion and re-derived asmth1 with its own
+    // copy of the formula, so it could not catch a bug in either -- and did not: it reproduced T50
+    // item 3D's factor-of-two in asmth1 rather than detecting it, and its `tree` column was
+    // identically zero at every separation because the halved rcut1 put every sample outside the
+    // tree's range. A test that reimplements the thing it is testing is the same defect as T44's
+    // "a check whose enforcement does not exist in the shipped build".
     //
-    // regionFrac=0.9 (a modest zoom, not an aggressive one) is a deliberate choice, not an
-    // arbitrary one -- investigated directly (LOG.md, Ticket 07) via a parameter sweep from 0.6 to
-    // 0.99: meanRelErr against exact Newtonian falls monotonically from ~18% (regionFrac=0.6) to
-    // ~1.8% (0.99, matching the single-grid --pm-test-isolated-treepm-force baseline's own
-    // ~1.6%/5.2% exactly). This is a REAL, understood, and BOUNDED numerical characteristic of
-    // combining two INDEPENDENTLY CIC/FFT-discretized grids at different physical scales, not a
-    // code defect: confirmed by hand-deriving the exact continuum formula
-    // (tree_frac(u1)+coarse_frac(u0)+fine_frac(u0,u1) == 1 identically, verified numerically to
-    // machine precision for every sample here) and finding it holds exactly, while the GPU's own
-    // CIC/finite-difference realization of pmCoarseFx and pmFineFx each carry their own
-    // near-field/mid-range discretization bias tied to their OWN grid's resolution. In the
-    // single-grid case (the baseline test above), tree and PM share the SAME Asmth, so tree's
-    // exact real-space contribution happens to compensate PM's grid bias in the region where PM is
-    // least accurate; here, tree instead hands off at the FINER Asmth[1] scale while pmCoarseFx
-    // still carries Asmth[0]-grid-resolution bias, so that same compensation is imperfect
-    // specifically in the gap between Rcut[1] and Rcut[0] -- exactly where the fine grid's own
-    // differential correction must supply the difference, each numerically imperfect grid's bias no
-    // longer canceling as neatly as the single-grid case's does. A more aggressive zoom (smaller
-    // regionFrac) makes this gap wider (relative to either grid's own cell size), and the residual
-    // error correspondingly larger -- an aggressive zoom-ratio in a real particle-driven zoom sim
-    // (Ticket 06's own pm_zoom_compute_region()) inherits this same characteristic, worth
-    // remembering when interpreting any future zoom-sim energy/force diagnostics.
-    const float  regionFrac = 0.9f;
-    const float  regionMeshSize = meshSize * regionFrac;
-    const double asmth0 = 1.25 * meshSize       / (2.0 * gridSize);
-    const double asmth1 = 1.25 * regionMeshSize / (2.0 * gridSize);
-    const double rcut1  = 4.5 * asmth1;
-    const float  asmthRatio = (float)(asmth1 / asmth0);
+    // It also mixed two conventions. The coarse solver's `meshSize` is its FULL DOUBLED grid, so its
+    // data half is meshSize/2; the fine solver's own data extent is region.totalMeshSize and its
+    // full grid is 2x that. The old test set regionMeshSize = 0.9*meshSize and treated it as a fine
+    // DATA extent, making the fine grid's full span 1.8x the coarse grid's -- the "fine" grid was
+    // almost twice as COARSE, and asmthRatio only looked sane (0.9) because the halved asmth1
+    // cancelled the error. For the fine grid to be genuinely finer we need
+    //     totalMeshSize < meshSize/2,
+    // and the ratio below is expressed against meshSize/2 so "0.5" means half, as it reads.
+    const double coarseDataHalf = 0.5 * meshSize;
+    const double zoomFrac       = 0.5;                       // fine data extent / coarse data half
+    const double wantExtent     = zoomFrac * coarseDataHalf;
+
+    // The coarse grid's own split, set EXPLICITLY rather than inherited: in a PERIODIC build the
+    // constants on the device belong to the periodic solver and are derived from BoxSize, not from
+    // this test's meshSize. pm_zoom_compute_region needs the same asmth0/rcut0 the tree will use.
+    const double asmth0 = 1.25 * meshSize / (2.0 * gridSize);
+    const double rcut0  = 4.5 * asmth0;
+#if defined(PERIODIC)
+    // The periodic build has no pm_isolated_setup_gravity_kernel (its definition in pm_isolated.cu
+    // is !PERIODIC-guarded, the sixth and last place this test was fenced off from periodic builds).
+    // pm_periodic_setup_gravity_kernel uploads the same Rcut/Asmth/table constants and additionally
+    // a box size for minimum-image wrapping -- inert here, since every probe separation is far below
+    // boxSize/2, so pm_nearest() is the identity.
+    pm_periodic_setup_gravity_kernel(boxSize, (float) rcut0, (float) asmth0);
+#else
+    pm_isolated_setup_gravity_kernel((float) rcut0, (float) asmth0);
+#endif
+
+    // A synthetic high-res cloud for the region to be derived FROM -- a cube of side wantExtent
+    // centred on `base`, typed high-res. Only the bounding box matters to
+    // pm_zoom_compute_region(), so 8 corners plus the centre are enough and keep this cheap.
+    const unsigned int zoomMask = (1u << 2); // type 2 marked high-res for this test
+    const int targetType = 2;
+    std::vector<Vec3f> cloudPos;
+    std::vector<int>   cloudType;
+    for (int cx = -1; cx <= 1; cx += 2)
+      for (int cy = -1; cy <= 1; cy += 2)
+        for (int cz = -1; cz <= 1; cz += 2)
+        {
+          cloudPos.push_back(Vec3f{ (float)(base + 0.5 * wantExtent * cx),
+                                    (float)(base + 0.5 * wantExtent * cy),
+                                    (float)(base + 0.5 * wantExtent * cz) });
+          cloudType.push_back(targetType);
+        }
+    cloudPos.push_back(Vec3f{ base, base, base });
+    cloudType.push_back(targetType);
 
     ZoomRegion region;
-    region.corner[0] = region.corner[1] = region.corner[2] = base - 0.5f * regionMeshSize;
-    region.totalMeshSize = regionMeshSize;
-    region.meshSize       = 2.0f * regionMeshSize;
-    region.asmth1         = (float) asmth1;
-    region.rcut1          = (float) rcut1;
-    region.valid          = true;
+    if (!pm_zoom_compute_region(cloudPos, cloudType, zoomMask, /*enlargeRegion=*/1.0,
+                                 gridSize, asmth0, rcut0, region))
+    {
+      fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] FATAL: pm_zoom_compute_region() refused the "
+                      "synthetic cloud -- the test cannot proceed.\n");
+      ::exit(1);
+    }
+    // Everything downstream reads the region, so a change to that function moves this test.
+    const double asmth1 = region.asmth1;
+    const double rcut1  = region.rcut1;
+    const float  asmthRatio = (float)(asmth1 / asmth0);
+    // The data span starts at corner + cornerInset (T50 item 3F), NOT at corner.
+    const double dataLo = region.corner[0] + region.cornerInset;
+    const double dataHi = dataLo + region.totalMeshSize;
 
-    const unsigned int zoomMask = (1u << 2); // type 2 (Disk) marked high-res for this test
-    const int targetType = 2;
+    if (!(region.totalMeshSize < coarseDataHalf))
+      fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] WARNING: totalMeshSize=%g is not below the coarse "
+                      "grid's data half %g -- the \"fine\" grid is not finer, so this is not "
+                      "testing a zoom.\n", (double) region.totalMeshSize, coarseDataHalf);
 
-    // rMin must respect the COARSER of the two grids' own actual physical cell sizes (real cell
-    // size = grid's own meshSize / fftGridSize; solver0's meshSize=meshSize, fftGridSize=2*gridSize
-    // -- coarseCellSize = meshSize/(2*gridSize); solver1's meshSize=region.meshSize=2*regionMeshSize,
-    // fftGridSize=2*gridSize too -- fineCellSize = 2*regionMeshSize/(2*gridSize) =
-    // regionMeshSize/gridSize, NOT regionMeshSize/(2*gridSize) -- an earlier version of this test
-    // computed fineCellSize as half its true value, silently under-flooring rMin whenever the true
-    // fine cell size was the larger (binding) constraint, i.e. whenever regionFrac > 0.5). Using
-    // the fine grid's own (smaller-at-low-ratio) cell size alone would let rMin fall below the
-    // coarse grid's valid CIC resolution, aliasing pmCoarseFx (found via this test's own first run
-    // before the invCellSize fix below: relErr ~50-80%). rMax stays a fraction of the fine grid's
-    // own occupied half-region, same convention as the coarse test above.
-    const float  coarseCellSize = meshSize       / (2.0f * gridSize);
-    const float  fineCellSize   = regionMeshSize / (1.0f * gridSize);
+    // rMin must respect the COARSER of the two grids' real cell sizes, or the coarse PM's own CIC
+    // aliases and the sum rule fails for a reason that has nothing to do with the zoom.
+    const double coarseCellSize = meshSize / (2.0 * gridSize);
+    const double fineCellSize   = region.meshSize / (2.0 * gridSize);
     const double rMin = 3.0 * std::max(coarseCellSize, fineCellSize);
-    const double rMax = 0.4 * (regionMeshSize / 2.0);
+    const double rMax = 0.4 * (0.5 * region.totalMeshSize);
 
     pm_fft_init();
     PMIsolatedSolver solver0 = pm_solver_create_isolated(gridSize, meshSize);
     PMIsolatedSolver solver1 = pm_solver_create_finegrid(gridSize, region.meshSize, asmthRatio);
     pm_zoom_upload_rcut_asmth((float)rcut1, (float)asmth1, zoomMask);
 
-    fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] meshSize=%g regionMeshSize=%g PMGRID=%d "
-                     "asmth0=%.6g asmth1=%.6g asmthRatio=%.6g nSamples=%d\n",
-            meshSize, regionMeshSize, gridSize, asmth0, asmth1, asmthRatio, nSamples);
+    fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] meshSize=%g (coarse data half %g)  "
+                     "region totalMeshSize=%g  PMGRID=%d\n"
+                     "[ZOOM_TREEPM_FORCE_TEST] asmth0=%.6g rcut0=%.6g | asmth1=%.6g rcut1=%.6g "
+                     "ratio=%.6g | cells: coarse %.6g fine %.6g\n"
+                     "[ZOOM_TREEPM_FORCE_TEST] sampling r in [%.6g, %.6g], %d points; data span "
+                     "[%.6g, %.6g]\n",
+            meshSize, coarseDataHalf, (double) region.totalMeshSize, gridSize,
+            asmth0, rcut0, asmth1, rcut1, asmthRatio, coarseCellSize, fineCellSize,
+            rMin, rMax, nSamples, dataLo, dataHi);
+    // The old test's `tree` column was zero everywhere and said nothing about it. Whether the band
+    // inside Rcut[1] is reachable at all is a property of the configuration, not a result, so state
+    // it up front instead of leaving a column of zeros to be interpreted.
+    if (rcut1 <= rMin)
+      fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] NOTE: rcut1=%.6g is below rMin=%.6g, so NO sample "
+                      "lies inside the tree's high-res range and the tree column will be ~0. That "
+                      "is a limit of one shared PMGRID (the coarse grid's CIC sets rMin), not a "
+                      "failure: what is still tested is that tree + coarse PM + fine PM sums to "
+                      "Newtonian across the sampled range.\n", rcut1, rMin);
+    else
+      fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] rcut1=%.6g > rMin=%.6g: samples below rcut1 DO "
+                      "exercise the tree's high-res short-range range.\n", rcut1, rMin);
     fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] %12s %14s %14s %14s %14s %14s %10s\n",
             "sep", "treeFx", "pmCoarseFx", "pmFineFx", "totalFx", "newtonFx", "relErr");
 
     double sumRelErr = 0, maxRelErr = 0;
     int nCounted = 0;
+    bool h_posCheckDone = false;
 
     for (int s = 0; s < nSamples; s++)
     {
@@ -2673,8 +2848,18 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
       hipFree(d_sep); hipFree(d_srcMass); hipFree(d_type); hipFree(d_treeAcc);
 
       // --- Coarse + fine PM: SAME 2-particle positions fed to both solvers (target mass=0,
-      // source mass=1), both already inside the fine grid's own [corner, corner+totalMeshSize)
-      // box by construction (base +/- rMax stays well inside it, rMax < 0.5*regionMeshSize). ---
+      // source mass=1). Both must lie inside the fine grid's DATA span [dataLo, dataHi] -- which
+      // starts at corner + cornerInset, not at corner (T50 item 3F) -- or the clipped CIC drops
+      // them and the fine term silently reads zero. rMax = 0.4*(totalMeshSize/2) keeps base+sep
+      // inside it; checked rather than asserted in a comment. ---
+      if (h_posCheckDone == false)
+      {
+        h_posCheckDone = true;
+        if (base < dataLo || base + rMax > dataHi)
+          fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] FATAL: probe range [%.6g, %.6g] is not inside "
+                          "the fine grid's data span [%.6g, %.6g]; the fine PM term would be "
+                          "silently zero.\n", (double) base, base + rMax, dataLo, dataHi);
+      }
       float4 h_pos[2];
       h_pos[0] = make_float4(base, base, base, 0.0f);
       h_pos[1] = make_float4(base + (float)sep, base, base, 1.0f);
@@ -2767,15 +2952,98 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
             unmaskedOk ? "PASS (type 1 correctly used Asmth[0]/Rcut[0], unaffected by the zoom mask)"
                        : "FAIL");
 
+    // ------------------------------------------------------------------ T50 item G
+    // Does mass in the fine grid's PADDING half change the force inside the data half?
+    //
+    // Gadget bounds its fine-grid deposit to the INNER half of the doubled grid
+    // (pm_nonperiodic.c:120 UpperCorner = Corner + (GRID/2 - 1)*cell; :579-583 skips everything
+    // else), and that is what keeps the outer half genuine zero padding -- the property that makes
+    // the doubled-grid FFT an ISOLATED convolution instead of a periodic one. This port's
+    // pm_cic_assign_mass_clipped tests against the ARRAY bound (fftGridSize) instead, so mass
+    // anywhere in the doubled grid deposits.
+    //
+    // So: the CORRECT answer here is a change of exactly zero. Anything else measures the defect.
+    //
+    // The probe has to sit near the data half's FACE, not at its centre. The fine kernel is the
+    // DIFFERENTIAL Green's function erfc(u*ratio) - erfc(u), which decays over a few Asmth[0]; mass
+    // in the padding is therefore invisible to a particle in the middle of the region and only
+    // reaches one within ~a few Asmth[0] of the boundary. Measuring at the centre would report ~0
+    // and be mistaken for the defect being absent.
+    {
+      // The exclusion face is the DEPOSIT WINDOW's, not the data region's. Before T53 item H those
+      // two coincided, because the port grew the data extent to swallow the Rcut[0] buffer; Gadget
+      // instead keeps the data extent small and leaves the buffer as depositable space between the
+      // data face and UpperCorner. Gadget DEPOSITS that buffer deliberately -- it is nearby real
+      // mass -- so filler placed merely outside the data region is NOT a leak, and testing against
+      // the data face reported a false positive the moment item H widened the gap to ~10 cells.
+      const double fineCell    = (double) region.meshSize / (double) (2 * gridSize);
+      const int    depositCell = gridSize - 1;            // == fftGridSize/2 - 1
+      const double faceX  = (double) region.corner[0] + depositCell * fineCell;  // UpperCorner
+      const double tgtX   = faceX - 3.0 * asmth0;         // just inside the WINDOW, within reach
+      const double fillLo = faceX + 0.25 * asmth0;        // a slab just OUTSIDE the window...
+      const double fillHi = faceX + 6.0  * asmth0;        // ...still inside the doubled array
+      const int    nSide  = 8;
+      const int    nFill  = nSide * nSide * nSide;
+
+      std::vector<float4> probe;
+      probe.push_back(make_float4((float)tgtX, base, base, 0.0f));   // target, massless
+      for (int ix = 0; ix < nSide; ix++)
+        for (int iy = 0; iy < nSide; iy++)
+          for (int iz = 0; iz < nSide; iz++)
+          {
+            const double fx = fillLo + (fillHi - fillLo) * (ix + 0.5) / nSide;
+            const double fy = base + 3.0 * asmth0 * (-1.0 + 2.0 * (iy + 0.5) / nSide);
+            const double fz = base + 3.0 * asmth0 * (-1.0 + 2.0 * (iz + 0.5) / nSide);
+            // Total filler mass 1, matching the source mass in the main sweep above, so the
+            // spurious force below is directly comparable to that sweep's pmFineFx column.
+            probe.push_back(make_float4((float)fx, (float)fy, (float)fz, 1.0f / nFill));
+          }
+      const double fillMass = 1.0;
+
+      float4 *d_p = nullptr; float *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
+      CU_SAFE_CALL(hipMalloc((void**)&d_p, probe.size()*sizeof(float4)));
+      CU_SAFE_CALL(hipMalloc((void**)&d_a, probe.size()*sizeof(float)));
+      CU_SAFE_CALL(hipMalloc((void**)&d_b, probe.size()*sizeof(float)));
+      CU_SAFE_CALL(hipMalloc((void**)&d_c, probe.size()*sizeof(float)));
+      CU_SAFE_CALL(hipMemcpy(d_p, probe.data(), probe.size()*sizeof(float4), hipMemcpyHostToDevice));
+
+      // n=1: target alone, so the padding is genuinely empty.
+      pm_compute_forces_finegrid(solver1, region, d_p, 1, d_a, d_b, d_c, 0);
+      CU_SAFE_CALL(hipDeviceSynchronize());
+      float fxClean = 0.0f;
+      CU_SAFE_CALL(hipMemcpy(&fxClean, d_a, sizeof(float), hipMemcpyDeviceToHost));
+
+      // n=1+nFill: the filler is outside the data half, so Gadget would deposit none of it.
+      pm_compute_forces_finegrid(solver1, region, d_p, (int) probe.size(), d_a, d_b, d_c, 0);
+      CU_SAFE_CALL(hipDeviceSynchronize());
+      float fxLeak = 0.0f;
+      CU_SAFE_CALL(hipMemcpy(&fxLeak, d_a, sizeof(float), hipMemcpyDeviceToHost));
+      hipFree(d_p); hipFree(d_a); hipFree(d_b); hipFree(d_c);
+
+      const double dAbs = (double) fxLeak - (double) fxClean;
+      fprintf(stderr,
+        "[ZOOM_TREEPM_FORCE_TEST] --- item G: padding-leak probe ---\n"
+        "  deposit window (UpperCorner) x face at %.6g; target at %.6g (3*asmth0 inside)\n"
+        "  filler: %d particles, total mass %.6g, x in [%.6g, %.6g] -- OUTSIDE the window\n"
+        "  fine Fx, padding empty  = %.8g\n"
+        "  fine Fx, filler present = %.8g\n"
+        "  change                  = %.8g   (Gadget deposits none of it, so the correct change is 0)\n"
+        "  %s\n",
+        faceX, tgtX, nFill, fillMass, fillLo, fillHi,
+        (double) fxClean, (double) fxLeak, dAbs,
+        (fabs(dAbs) > 1e-6 * std::max(1.0, fabs((double) fxClean)))
+          ? "item G CONFIRMED: padding mass changes the force inside the data half"
+          : "no measurable leak at this geometry");
+    }
+
     pm_solver_destroy_isolated(solver0);
     pm_solver_destroy_isolated(solver1);
     fprintf(stderr, "[ZOOM_TREEPM_FORCE_TEST] meanRelErr=%.3e maxRelErr=%.3e\n",
             sumRelErr / std::max(1, nCounted), maxRelErr);
     ::exit(0); // diagnostic report, not a strict pass/fail gate -- see comment above
   }
-#endif
-#endif
-#endif
+#endif // GADGET_HIP_HIGHRES
+#endif // PMGRID
 
   #ifdef USE_MPI
     omp_set_num_threads(4); //Startup the OMP threads to be used during LET phase

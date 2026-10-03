@@ -88,3 +88,13 @@ Several of these select between a legacy behaviour and a corrected one and are *
 `GADGET_HIP_CD04_LADDER`, `GADGET_HIP_T6_DRIFT_TP`). The startup banner prints the active setting
 for each, so the log records which physics the run actually used — check that banner before
 comparing two runs.
+
+## Zoom and short-range-cutoff diagnostics
+
+| variable | effect |
+|---|---|
+| `GADGET_HIP_T55_RCUT_MODE` | Geometry of the `Rcut` node prune. `0` = Euclidean gap vs `Rcut` (a sphere; the pre-fix behaviour, kept so the change can be A/B'd in one binary), `1` = per-axis gap vs `Rcut` (GADGET's geometry, **the default**), `2` = per-axis gap vs `6*Asmth`, the erfc table's own reach. Mode 2 is a guaranteed superset of everything that can contribute and buys nothing measurable over mode 1 — the residual there is the opening criterion's own error, not truncation — while costing 8.9% on the walk against mode 1's 3.2%. |
+| `GADGET_HIP_T50_NO_PURE_PRUNE` | Forces every group back onto `max(Rcut[0], Rcut[1])`, undoing the per-group refinement that lets a group of purely high-res targets prune at its own smaller `Rcut[1]`. A/B only. |
+| `GADGET_HIP_DUMP_SPLIT` | Path for a per-particle force dump with the three components **separate** — tree, coarse mesh, fine (zoom) mesh — captured at the last point in the step where all three still exist independently. Written at iteration `GADGET_HIP_DUMP_ACC_ITER` (default 0). Values are pre-`G`, with `G` and the zoom region's geometry in the header. The point of the split is attribution: `GADGET_HIP_DUMP_ACC` writes the already-summed acceleration, so a disagreement with GADGET can be seen there but not pinned on a mesh. The fine column records the force the code *applies*, i.e. after the type mask. |
+| `GADGET_HIP_CELL_WATER` | Report the tree walk's per-step cell-list high-water mark against its capacity, plus forced-descent counts, big-stack retries, and the pure/mixed/coarse group split. Printed unconditionally whenever a retry occurs; this variable makes it print every step. The frontier is what decides whether the walk's fixed-size buffer is close to overflowing. |
+| `GADGET_HIP_PM_STALENESS` | On a PM-cadence run, report `rms|da|/|a|` between the freshly-solved long-range force and the one the run has been using since the previous PM step — measured at the one instant both exist, rather than inferred from two runs. |

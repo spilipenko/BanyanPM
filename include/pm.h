@@ -74,6 +74,22 @@ void t31_set_force_geo(int on);   // T31 diagnostic
 // received NO force. Must be zero; nonzero means the step's forces are silently incomplete.
 void walk_reset_bailouts();
 unsigned int walk_read_bailouts();
+// T49 item A: group-levels that trip the corrected cell-list guard where the old one did not.
+void walk_reset_guard_window();
+unsigned int walk_read_guard_window();
+// Phase 5: cell-list frontier high-water and the big-stack retry counters (ported from the
+// phase4-node-maintenance branch, where T48 built them).
+void walk_reset_high_water();
+void walk_read_high_water(unsigned int *now, unsigned int *oldExpr);
+unsigned int walk_cell_list_capacity();
+void walk_reset_retries();
+void walk_read_retries(unsigned int *retries, unsigned int *failed);
+// T50 section 2: group-walks that pruned at Rcut[1] (all targets high-res) vs. fell back to
+// max(Rcut[0],Rcut[1]). Only meaningful in a GADGET_HIP_HIGHRES build with a nonzero zoom mask.
+void walk_reset_zoom_groups();
+void walk_read_zoom_groups(unsigned int *pure, unsigned int *mixed, unsigned int *coarse);
+void t50_set_no_pure_prune(int on);   // A/B: revert to max(Rcut[0],Rcut[1]) for every group
+void t55_set_rcut_mode(int mode);     // T55: 0 = Euclidean/sphere (pre-T55), 1 = per-axis/box at Rcut (Gadget's geometry, default), 2 = per-axis at 6*Asmth
 // T28/C-B-15: mixed-softening forced-descent counters.
 void t28_set_disable(int on);   // A/B: turn the mixed-softening rules off at runtime
 void cb15_reset_counters();

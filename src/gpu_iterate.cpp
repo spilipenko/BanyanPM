@@ -16,6 +16,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <limits>
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -708,6 +709,42 @@ double *gadget_cpu_snapshot_acc() { return &s_cpuAcc.snapshot; }
 // G travels with the t30 coefficients in compute_energies(), a different path.
 static GFreeAcc *s_gravPMx = nullptr, *s_gravPMy = nullptr, *s_gravPMz = nullptr;
 static float    *s_gravPMpot = nullptr;
+
+// C-A-07 / Phase 4: the per-node extent floor that makes a non-rebuild step safe. Allocated lazily
+// and ONLY when a step actually skips the rebuild, so a run at the default (rebuild every step) pays
+// nothing for it -- one float4 per node is roughly 600 MB at 512^3.
+static float4 *s_nodeLenFloor      = nullptr;
+// OPT-IN (GADGET_HIP_CA07_MONOTONE=1), and the reasoning is worth keeping because the first version
+// of this had it on by default, described as a bug fix. It is not one.
+//
+// GADGET grows node extents monotonically (force_update_len) BECAUSE IT NEVER RECOMPUTES THEM. It
+// keeps Nodes[].center fixed at build time and has only Father[i] plus a per-particle distance check
+// to work with, so enlarging is the one cheap conservative option available to it; its boxes are
+// supersets of the true extent.
+//
+// This port recomputes instead: compute_properties() rebuilds every node's box exactly from the
+// current positions, bottom-up, with each parent's box the UNION of its children's
+// (compute_non_leaf -> compute_bounds_node). On a non-rebuild step the port skips sort_bodies and
+// build, so node membership is unchanged and that box is the exact extent of the node's own
+// particles -- and parent-contains-children, the invariant GADGET maintains by propagating growth up
+// the ancestor chain, holds here by construction. A box that is the true extent of its particles is
+// not a "pathologically small" box, so T20's identification of the refit with the T24 blowup
+// mechanism does not survive inspection.
+//
+// Measured, 64^3, --rebuild 4, three runs each: floor ON 22.3 +- 0.1 s, OFF 22.1 +- 0.1 s, and the
+// tree walk identical at 13.9 s either way -- so the 0.9% is this kernel and its memcpy, not a looser
+// MAC. The reason it changes so little: 42.7% of nodes do shrink, but total node size moves by
+// 0.007% (sum_ratio 1.000066), i.e. the nodes that shrink carry almost no weight.
+//
+// Kept, opt-in, for the case where someone wants the port's stale-step geometry to be provably no
+// less conservative than GADGET's -- e.g. before changing the opening criterion.
+static bool ca07MonotoneWanted()
+{
+  static const bool on = (getenv("GADGET_HIP_CA07_MONOTONE") != NULL) &&
+                         (atoi(getenv("GADGET_HIP_CA07_MONOTONE")) != 0);
+  return on;
+}
+static int     s_nodeLenFloorNodes = 0;
 static bool   s_pmCadenceActive = false;   // the mode actually in effect, not what was requested
 static gadget_tick_t s_PM_Ti_begstep = 0, s_PM_Ti_endstep = 0;
 static GadgetDriftTables s_gadgetTables;
@@ -719,6 +756,22 @@ static int    s_pmKickNoPerm = 0;   // write-target A/B, see gadget_pm_kick     
 
 void pmstale_reset(void);
 void pmstale_read(double *num, double *den);
+
+// T56: see octree.h. Deliberately a lookup over the sorted list rather than an index the caller
+// has to keep in step: the snapshot block below can cross several output times in one system step,
+// and an index would then need the same catch-up loop the cadence path has.
+double octree::nextOutputTimeAfter(double t) const
+{
+  if (outputListActive())
+  {
+    for (size_t i = 0; i < gadgetParams.OutputListTimes.size(); ++i)
+      if (gadgetParams.OutputListTimes[i] > t) return gadgetParams.OutputListTimes[i];
+    return std::numeric_limits<double>::infinity();
+  }
+  if (haveGadgetParams && gadgetParams.ComovingIntegrationOn)
+    return nextGadgetSnapTime * gadgetParams.TimeBetSnapshot;
+  return nextGadgetSnapTime + gadgetParams.TimeBetSnapshot;
+}
 
 bool octree::iterate_once(IterationData &idata) {
   static const bool phaseTimePrint = (getenv("GADGET_HIP_PHASE_TIME") != NULL);
@@ -954,12 +1007,31 @@ bool octree::iterate_once(IterationData &idata) {
         static bool s_ca07Warned = false;
         if (!s_ca07Warned)
         {
+          // Both of this warning's original claims are now false, and the history is worth keeping
+          // because the measurement that produced them was sound and still mis-generalised.
+          //
+          // It said node geometry is unmaintained: that was true and is now fixed -- the extent
+          // floor below gives GADGET's force_update_len semantics, and the C-A-07 probe reports
+          // shrunk=0.00% on every stale step where it previously reported 42.7%.
+          //
+          // It said the setting is "slower, not faster", from T20's measurement at 2M Plummer
+          // (0.3553 -> 0.9776 s/iter from rebuild 1 to 16). That measurement is reproducible and its
+          // conclusion does not transfer: Plummer runs a SHARED timestep, so every step is a dense
+          // step where the walk dominates and skipping a build loses. A cosmological run with
+          // individual timesteps spends most steps with few active particles -- at 512^3, 75% of
+          // steps have a walk cheaper than the rebuild, and the rebuild is flat at 1.077 s +- 0.045
+          // regardless of the active set, because it processes all N particles either way.
+          // Re-measured at 64^3 cosmological with the floor active, three runs each:
+          // rebuild 1 = 26.6 +- 0.1 s, rebuild 4 = 22.3 +- 0.3 s, a 16.2% saving at 19.7 sd.
           fprintf(stderr,
-            "\n[C-A-07] WARNING: rebuild_tree_rate=%d (>1). On non-rebuild steps this port does "
-            "NOT maintain node geometry the way Gadget-2 does; the AABB refit can SHRINK a node, "
-            "which can make the MAC wrongly accept it. Diagnostic use is fine, but this is not a "
-            "validated production configuration -- and it is slower, not faster. See "
-            "contracts/CONTRACTS-A-treebuild.md C-A-07 and tickets/T20.\n\n", rebuild_tree_rate);
+            "\n[C-A-07] rebuild_tree_rate=%d (>1). Node geometry IS maintained between rebuilds "
+            "(monotone extent floor, GADGET force_update_len semantics; GADGET_HIP_CA07_MONOTONE=0 "
+            "disables it and restores the shrinking behaviour). Measured FASTER than every-step on "
+            "cosmological ICs with individual timesteps -- 16.2%% at 64^3 with rebuild 4 -- and "
+            "slower on a shared-timestep Plummer run, which is what tickets/T20 measured. It "
+            "changes trajectories, so validate against your own reference before using it for "
+            "science. See contracts/CONTRACTS-A-treebuild.md C-A-07 and tickets/T20.\n\n",
+            rebuild_tree_rate);
           s_ca07Warned = true;
         }
       }
@@ -1060,6 +1132,9 @@ bool octree::iterate_once(IterationData &idata) {
 #endif
             const double rcut0 = 4.5 * asmth0;
 
+            // Dedicated timer, NOT PHASE_BEGIN: see the zoomFineGridPM pair below for why.
+            double zrsT = 0.0;
+            if (phaseTimeOn) { execStream->sync(); gravStream->sync(); zrsT = get_time(); }
             if (!gadgetZoomSolverReady)
             {
               this->recomputeZoomRegion(this->localTree, asmth0, rcut0, pmGridSize,
@@ -1067,17 +1142,36 @@ bool octree::iterate_once(IterationData &idata) {
             }
             else
             {
-              this->localTree.bodies_Ppos.d2h();
-              const int n = (int) this->localTree.bodies_type.size();
-              std::vector<Vec3f> h_pos(n);
-              for (int i = 0; i < n; ++i)
-              { const real4 p = this->localTree.bodies_Ppos[i]; h_pos[i] = Vec3f{p.x, p.y, p.z}; }
-              if (pm_zoom_region_out_of_range(gadgetZoomRegion, h_pos, this->localTree.bodies_type, gadgetZoomMask))
+              // T50 section 3A: on the DEVICE. This used to d2h every position (1.84 GB at 115M),
+              // build a 1.38 GB std::vector<Vec3f>, and scan it single-threaded, every rebuild step
+              // -- 0.58 s/step steady, 3.74 s on the first -- to answer a masked bounds reduction.
+              // recomputeZoomRegion() below still does the host copy, but it needs the actual
+              // min/max to size the new region and it only runs when the answer is yes.
+              // T50 item 3F: `corner` is inset BELOW the data span, so the containment window
+              // starts at corner + cornerInset. Passing `corner` here would shift the test by two
+              // fine cells and no longer match pm_zoom_region_out_of_range()'s host version.
+              const float3 zCorner = make_float3(
+                  gadgetZoomRegion.corner[0] + gadgetZoomRegion.cornerInset,
+                  gadgetZoomRegion.corner[1] + gadgetZoomRegion.cornerInset,
+                  gadgetZoomRegion.corner[2] + gadgetZoomRegion.cornerInset);
+              if (pm_zoom_any_out_of_range(this->localTree.bodies_Ppos.raw_p(),
+                                            this->localTree.bodies_typeDevice.raw_p(),
+                                            gadgetZoomMask, zCorner,
+                                            gadgetZoomRegion.totalMeshSize,
+                                            this->localTree.n, gravStream->s()))
               {
                 fprintf(stderr, "[ZOOM] high-res particle left the current region -- recomputing.\n");
                 this->recomputeZoomRegion(this->localTree, asmth0, rcut0, pmGridSize,
                                            boxSizeForBoundsCheck);
               }
+            }
+            if (phaseTimeOn)
+            {
+              execStream->sync(); gravStream->sync();
+              const double dt_ = get_time() - zrsT;
+              s_cpuAcc.timeline += dt_;
+              if (phaseTimePrint)
+                fprintf(stderr, "[PHASE] iter=%d %-22s %8.4f s\n", iter, "zoomRegionScan", dt_);
             }
           }
         }
@@ -1098,6 +1192,40 @@ bool octree::iterate_once(IterationData &idata) {
 
         idata.lastBuildTime   = get_time() - t1;
         idata.totalBuildTime += idata.lastBuildTime;
+        // C-A-07: seed the extent floor from the freshly built geometry. Monotonicity is enforced
+        // only BETWEEN rebuilds -- a rebuild is entitled to shrink a node, because its index ranges
+        // are no longer stale.
+        //
+        // POSITION MATTERS TWICE OVER. It must be at the rebuild rather than lazily on the first
+        // stale step, and it must be AFTER compute_properties(), which is what actually writes
+        // boxSizeInfo. Seeded before that call it captures the PREVIOUS iteration's geometry and
+        // enforces nothing: measured, 42.73% of nodes still shrank on the first stale step with
+        // worst_shrink identical to the unmaintained run. Seeded on the first stale step instead,
+        // one full unconstrained refit is baked in -- the same 42.73% -- and the floor locks it in. Seeding on the first
+        // stale step bakes in one full step of unconstrained refit, and that is the step that
+        // matters: measured at 64^3, 42.7% of nodes shrink in it, the worst to 0.09% of its rebuild
+        // extent, and the floor then locks that in. Monotonicity has to start from the geometry a
+        // rebuild produced -- the only geometry whose index ranges are not stale.
+        //
+        // Allocated only when some step will actually skip a rebuild, so the default configuration
+        // (rebuild every step) never pays the ~600 MB this costs at 512^3.
+        if (ca07MonotoneWanted() && rebuild_tree_rate > 1)
+        {
+          const size_t cap = this->localTree.boxSizeInfo.get_size();
+          if (s_nodeLenFloorNodes < (int) cap)
+          {
+            if (s_nodeLenFloor) hipFree(s_nodeLenFloor);
+            CU_SAFE_CALL(hipMalloc((void **) &s_nodeLenFloor, cap * sizeof(float4)));
+            s_nodeLenFloorNodes = (int) cap;
+            fprintf(stderr, "[C-A-07] node-extent floor ACTIVE (GADGET force_update_len "
+                            "semantics): %.1f MB for %d nodes\n",
+                    cap * sizeof(float4) / (1024.0*1024.0), s_nodeLenFloorNodes);
+          }
+          CU_SAFE_CALL(hipMemcpyAsync(s_nodeLenFloor, this->localTree.boxSizeInfo.raw_p(),
+                                      (size_t) this->localTree.n_nodes * sizeof(float4),
+                                      hipMemcpyDeviceToDevice, execStream->s()));
+        }
+
         ca07_probe(this->localTree, true, iter);
         invariant_probe(this->localTree, iter);
       }
@@ -1111,6 +1239,39 @@ bool octree::iterate_once(IterationData &idata) {
         #endif
         //Don't rebuild only update the current boxes
         this->compute_properties(this->localTree);
+
+        // C-A-07 / T20 / Phase 4. compute_properties has just refitted every node's AABB EXACTLY
+        // from the current positions over the STALE node_bodies ranges, which can shrink a node --
+        // 8.5% of them on the first stale step, the worst to 8% of its rebuild extent. GADGET-2
+        // never shrinks a node between rebuilds (force_update_len, forcetree.c:940-960), and that
+        // monotonicity is what keeps the opening criterion conservative; a too-small box lets the
+        // walk approximate where it must split, which is the T24 blowup mechanism.
+        //
+        // GADGET_HIP_CA07_MONOTONE=0 restores the unmaintained behaviour, for A/B only. Same idiom
+        // as GADGET_HIP_T4_FIX_G / T45_KEEP_ACC0_D2H / T47_NO_G.
+        {
+          const int nn = this->localTree.n_nodes;
+          if (ca07MonotoneWanted() && s_nodeLenFloor && nn > 0 && s_nodeLenFloorNodes >= nn)
+          {
+            gadgetNodeLenMonotone.set_args(0, &this->localTree.n_nodes,
+                                          this->localTree.boxSizeInfo.p(),
+                                          (void *) &s_nodeLenFloor);
+            gadgetNodeLenMonotone.setWork(nn, 128);
+            gadgetNodeLenMonotone.execute2(execStream->s());
+          }
+          else if (!ca07MonotoneWanted())
+          {
+            static bool noted = false;
+            if (!noted)
+            {
+              noted = true;
+              fprintf(stderr, "[C-A-07] node boxes are recomputed exactly on non-rebuild steps "
+                              "(parent = union of children). GADGET instead grows them "
+                              "monotonically; GADGET_HIP_CA07_MONOTONE=1 matches that, at about "
+                              "+0.9%% wall clock and no measured accuracy change.\n");
+            }
+          }
+        }
         ca07_probe(this->localTree, false, iter);
 
       }//end rebuild tree
@@ -1484,6 +1645,127 @@ bool octree::iterate_once(IterationData &idata) {
             pm_compute_forces_periodic(s_pmSolver, localTree.bodies_Ppos.raw_p(), localTree.n,
                                         s_d_pmfx, s_d_pmfy, s_d_pmfz, gravStream->s(),
                                         /*gravityConstant=*/1.0f, s_d_pmpot);
+#ifdef GADGET_HIP_HIGHRES
+            // T58: the zoom (PLACEHIGHRESREGION) fine mesh, solved on the SAME cadence as the
+            // coarse one and accumulated into the SAME arrays -- Gadget's long_range_force()
+            // structure (longrange.c:54-82): zero GravPM, `+=` the periodic mesh, `+=` the
+            // isolated high-res mesh, and let every consumer read the sum.
+            //
+            // The fine mesh's kernel is the DIFFERENTIAL Green's function
+            // (erfc(u*asmthRatio) - erfc(u), pm_zoom.cu), not a second copy of the full potential,
+            // so this is pure superposition rather than double counting. The accumulate is masked
+            // by particle type because the force READOUT is type-filtered in Gadget too
+            // (pm_nonperiodic.c:930-932) -- the DEPOSIT is not, in either code.
+            if (haveGadgetZoom && gadgetZoomSolverReady)
+            {
+              double zpmT = 0.0;
+              if (phaseTimeOn) { execStream->sync(); gravStream->sync(); zpmT = get_time(); }
+              static float *s_d_zoomfx = nullptr, *s_d_zoomfy = nullptr, *s_d_zoomfz = nullptr,
+                           *s_d_zoompot = nullptr;
+              static int    s_zoomSolverN = 0;
+              if (s_zoomSolverN != localTree.n)
+              {
+                if (s_d_zoomfx) { hipFree(s_d_zoomfx); hipFree(s_d_zoomfy); hipFree(s_d_zoomfz);
+                                  hipFree(s_d_zoompot); }
+                CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfx,  localTree.n * sizeof(float)));
+                CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfy,  localTree.n * sizeof(float)));
+                CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfz,  localTree.n * sizeof(float)));
+                CU_SAFE_CALL(hipMalloc((void**)&s_d_zoompot, localTree.n * sizeof(float)));
+                s_zoomSolverN = localTree.n;
+              }
+              // Same bodies_Ppos the coarse solve just used -- the walk's own predicted positions.
+              pm_compute_forces_finegrid(gadgetZoomSolver, gadgetZoomRegion,
+                                          localTree.bodies_Ppos.raw_p(), localTree.n,
+                                          s_d_zoomfx, s_d_zoomfy, s_d_zoomfz, gravStream->s(),
+                                          /*gravityConstant=*/1.0f, s_d_zoompot);
+              // T54's per-component dump (GADGET_HIP_DUMP_SPLIT), rewritten by T58 as one
+              // self-contained block. It has to sit HERE, before the accumulate below: this is the
+              // only point in the step where all three components exist separately --
+              // bodies_acc1 is tree-only (the walk wrote it, no PM has been added yet),
+              // s_d_pmf{x,y,z} is coarse-only, and s_d_zoomf{x,y,z} is the fine mesh. One line
+              // later the accumulate makes the last two indistinguishable, which is the whole point
+              // of T58 and is exactly what the dump must be read before.
+              //
+              // It used to be two halves -- a capture in the coarse block and a writer in the
+              // old standalone zoom block -- bridged by file-scope statics. Moving the fine mesh
+              // in here deleted the writer and left the capture running, so the dump would have
+              // silently produced no file at all. A diagnostic that quietly stops working is worse
+              // than one that was never written.
+              {
+                const char *dumpSplit = getenv("GADGET_HIP_DUMP_SPLIT");
+                const int   splitIter = getenv("GADGET_HIP_DUMP_ACC_ITER")
+                                      ? atoi(getenv("GADGET_HIP_DUMP_ACC_ITER")) : 0;
+                if (dumpSplit && iter == splitIter)
+                {
+                  gravStream->sync(); execStream->sync();
+                  const int n = localTree.n;
+                  std::vector<float> cx(n), cy(n), cz(n), fx(n), fy(n), fz(n);
+                  CU_SAFE_CALL(hipMemcpy(cx.data(), s_d_pmfx,   (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  CU_SAFE_CALL(hipMemcpy(cy.data(), s_d_pmfy,   (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  CU_SAFE_CALL(hipMemcpy(cz.data(), s_d_pmfz,   (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  CU_SAFE_CALL(hipMemcpy(fx.data(), s_d_zoomfx, (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  CU_SAFE_CALL(hipMemcpy(fy.data(), s_d_zoomfy, (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  CU_SAFE_CALL(hipMemcpy(fz.data(), s_d_zoomfz, (size_t)n*sizeof(float), hipMemcpyDeviceToHost));
+                  localTree.bodies_acc1.d2h();
+                  localTree.bodies_Ppos.d2h();
+                  localTree.bodies_ids.d2h();
+                  FILE *f = fopen(dumpSplit, "w");
+                  if (f)
+                  {
+                    const double Gv = (haveGadgetParams && gadgetParams.G > 0.0) ? gadgetParams.G : 1.0;
+                    fprintf(f, "# gadget-hip force split  iter=%d  G=%.17g  zoomMask=0x%x  "
+                               "asmth1=%.17g rcut1=%.17g corner=%.17g,%.17g,%.17g inset=%.17g "
+                               "totalMeshSize=%.17g meshSize=%.17g  haveCoarse=1\n",
+                            iter, Gv, gadgetZoomMask,
+                            (double) gadgetZoomRegion.asmth1, (double) gadgetZoomRegion.rcut1,
+                            (double) gadgetZoomRegion.corner[0], (double) gadgetZoomRegion.corner[1],
+                            (double) gadgetZoomRegion.corner[2], (double) gadgetZoomRegion.cornerInset,
+                            (double) gadgetZoomRegion.totalMeshSize, (double) gadgetZoomRegion.meshSize);
+                    fprintf(f, "# id type x y z mass treeX treeY treeZ coarseX coarseY coarseZ "
+                               "fineX fineY fineZ\n");
+                    for (int i = 0; i < n; ++i)
+                    {
+                      const float4 pp = localTree.bodies_Ppos[i];
+                      const real4  a  = localTree.bodies_acc1[i];
+                      const int    ty = (i < (int) localTree.bodies_type.size())
+                                      ? (int) localTree.bodies_type[i] : -1;
+                      // Record the fine force the code ACTUALLY APPLIES, i.e. after the zoom mask
+                      // -- the accumulate below is masked, and Gadget skips the readout for
+                      // non-PLACEHIGHRESREGION types too (pm_nonperiodic.c:930-932). Dumping the
+                      // unmasked value once made type 2 read as 38% wrong against Gadget when
+                      // neither code uses it.
+                      const bool  ap = (ty >= 0) && (((1u << ty) & gadgetZoomMask) != 0u);
+                      fprintf(f, "%llu %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g "
+                                 "%.9g %.9g %.9g\n",
+                              (unsigned long long) localTree.bodies_ids[i], ty,
+                              pp.x, pp.y, pp.z, pp.w,
+                              a.x, a.y, a.z,
+                              cx[i], cy[i], cz[i],
+                              ap ? fx[i] : 0.0f, ap ? fy[i] : 0.0f, ap ? fz[i] : 0.0f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "[T54] force split dumped: %d particles -> %s\n", n, dumpSplit);
+                  }
+                }
+              }
+              pm_accumulate_masked_longrange(s_d_pmfx, s_d_pmfy, s_d_pmfz, s_d_pmpot,
+                                              s_d_zoomfx, s_d_zoomfy, s_d_zoomfz, s_d_zoompot,
+                                              localTree.bodies_typeDevice.raw_p(),
+                                              gadgetZoomMask, localTree.n, gravStream->s());
+              gravStream->sync();
+              // T54's per-component dump needs the fine force on its own, before the accumulate
+              // folds it in; it reads these through the pointers it captured, so nothing to do here
+              // beyond keeping the arrays alive, which the statics above do.
+              if (phaseTimeOn)
+              {
+                execStream->sync(); gravStream->sync();
+                const double dt_ = get_time() - zpmT;
+                s_cpuAcc.pm += dt_;
+                if (phaseTimePrint)
+                  fprintf(stderr, "[PHASE] iter=%d %-22s %8.4f s\n", iter, "zoomFineGridPM", dt_);
+              }
+            }
+#endif
             // Phase 3 validation rung 2. Right here -- and only here -- the fresh long-range force
             // and the one the run has been using since the last PM step both exist, so the drift
             // across the interval can be measured without keeping a second copy of GravPM.
@@ -1532,8 +1814,18 @@ bool octree::iterate_once(IterationData &idata) {
                 // banner is the only runtime evidence of the mode, so it must not imply the
                 // opposite of what is happening.
                 if (pmEveryStep)
-                  fprintf(stderr, "[T36] PM recomputed EVERY STEP (cadence disabled -- the default; "
-                                  "it cost 11%% in Ekin, see tickets/T35). The cadence this run "
+                  // T58: this message used to read "it cost 11% in Ekin, see tickets/T35", which
+                  // blamed the SHIPPING cadence for its RETRACTED predecessor's cost. The 11%
+                  // belonged to T36's withdrawn operator -- folding the stored long-range force
+                  // into each active particle's own kick (T36:125, T35:317 "RETRACTED") -- not to
+                  // the T42/T45 cadence that replaced it, whose worst Ekin deviation at 512^3 is
+                  // 0.133% once the energy diagnostic and the Springel aold were given the
+                  // long-range force too (T45). Leaving the old number in the runtime log made the
+                  // cadence look 80x worse than it is, and it is the first thing anyone reads.
+                  fprintf(stderr, "[T42] PM recomputed EVERY STEP (cadence off by default; enable "
+                                  "with GADGET_HIP_PM_CADENCE=1 -- worst Ekin deviation 0.133%% at "
+                                  "512^3, see tickets/T45. The 11%% in tickets/T35/T36 was the "
+                                  "RETRACTED predecessor, not this cadence). The cadence this run "
                                   "WOULD have used: dt_displacement=%.6g -> PM step %.6g (%s).\n",
                           gadgetDtDisplacement, q, comoving ? "dloga" : "dt");
                 else
@@ -1716,47 +2008,20 @@ bool octree::iterate_once(IterationData &idata) {
     }
 #endif
 
-#ifdef GADGET_HIP_HIGHRES
-    // Phase 5 ticket 06 (PLAN.md): the zoom (PLACEHIGHRESREGION) fine grid's own per-step PM
-    // force + potential, added ON TOP of whatever the coarse-grid PM block above already put into
-    // bodies_acc1 -- pure superposition (PHASE5_ZOOM_COMOVING_SPEC.md Sec 1.2), not double-counting,
-    // because the fine grid's own kernel is the DIFFERENTIAL Green's function (erfc(u*asmthRatio) -
-    // erfc(u)), not a second copy of the full potential -- see pm_zoom.cu's
-    // pm_build_finegrid_kernel_kernel. Masked accumulation via bodies_typeDevice means only the
-    // high-res-typed particles the region was built around (PLACEHIGHRESREGION's bitmask) ever
-    // receive it; every other particle's acc/pot is untouched by this block. Computed every
-    // iteration (like the coarse PM blocks above), independent of whether this iteration also
-    // happens to rebuild the tree -- only the REGION/solver itself is tied to rebuild cadence
-    // (recomputeZoomRegion(), called from the rebuild_tree branch below).
-    if (!useDirectGravity && haveGadgetZoom && gadgetZoomSolverReady)
-    {
-      static float *s_d_zoomfx = nullptr, *s_d_zoomfy = nullptr, *s_d_zoomfz = nullptr, *s_d_zoompot = nullptr;
-      static int    s_zoomSolverN = 0;
-
-      if (s_zoomSolverN != localTree.n)
-      {
-        if (s_d_zoomfx) { hipFree(s_d_zoomfx); hipFree(s_d_zoomfy); hipFree(s_d_zoomfz); hipFree(s_d_zoompot); }
-        CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfx, localTree.n * sizeof(float)));
-        CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfy, localTree.n * sizeof(float)));
-        CU_SAFE_CALL(hipMalloc((void**)&s_d_zoomfz, localTree.n * sizeof(float)));
-        CU_SAFE_CALL(hipMalloc((void**)&s_d_zoompot, localTree.n * sizeof(float)));
-        s_zoomSolverN = localTree.n;
-      }
-
-      // Same bodies_Ppos input as the coarse PM blocks -- the tree walk's own predicted positions,
-      // not a second stale copy.
-      pm_compute_forces_finegrid(gadgetZoomSolver, gadgetZoomRegion, localTree.bodies_Ppos.raw_p(),
-                                  localTree.n, s_d_zoomfx, s_d_zoomfy, s_d_zoomfz, gravStream->s(),
-                                  /*gravityConstant=*/1.0f, s_d_zoompot);
-      pm_add_masked_force_to_acc(localTree.bodies_acc1.raw_p(), s_d_zoomfx, s_d_zoomfy, s_d_zoomfz,
-                                  localTree.bodies_typeDevice.raw_p(), gadgetZoomMask, localTree.n,
-                                  gravStream->s());
-      pm_add_masked_potential_to_acc(localTree.bodies_acc1.raw_p(), s_d_zoompot,
-                                      localTree.bodies_typeDevice.raw_p(), gadgetZoomMask,
-                                      localTree.n, gravStream->s());
-      gravStream->sync();
-    }
-#endif
+    // T58: the zoom fine mesh used to be solved HERE, every step, outside the PM cadence that
+    // governs the coarse mesh. That was a divergence from Gadget, which puts both meshes behind the
+    // single `if(All.PM_Ti_endstep == All.Ti_Current)` guard in accel.c:35-40 and solves them
+    // together inside long_range_force() (longrange.c:54-82). Measured at 115M particles with
+    // GADGET_HIP_PM_CADENCE=1: the coarse mesh fired once in ten steps and the fine mesh ten times
+    // out of ten, costing 1.586 s/step at GADGET_HIP_PMGRID=512 -- 39% of the step, and the whole
+    // of why 512 looked 41% slower than 256 in T57.
+    //
+    // It now lives inside the coarse mesh's own `pmDue` branch above, accumulating into the same
+    // s_d_pmf{x,y,z}/s_d_pmpot arrays, which is Gadget's structure exactly: both solves `+=` into
+    // GravPM and every consumer downstream reads the sum. That single move gives the fine mesh the
+    // cadence, the id-space store that survives the re-sort, the once-per-interval kick, the
+    // drift-corrected energy diagnostic and the Springel `aold` -- all of which T42/T45 had already
+    // built for the coarse mesh and none of which the fine mesh was reaching.
 
     // Phase 5 ticket 08 (PLAN.md): a real, serious bug found via this ticket's own end-to-end
     // comparison against stock Gadget-2 -- structure growth was suppressed by orders of magnitude
@@ -2005,7 +2270,11 @@ bool octree::iterate_once(IterationData &idata) {
     // compute_energy_double_prekick (timestep.cu) for the exact mechanism.
     tTempTime = get_time();
     devContext->startTiming(execStream->s());
-    if (haveGadgetParams && gadgetParams.TimeBetSnapshot > 0.0 && t_current >= nextGadgetSnapTime)
+    // T56: an output list drives the snapshots on its own; TimeBetSnapshot is then
+    // irrelevant and need not be set at all (Gadget only validates it on the else
+    // branch of find_next_outputtime, run.c:273-290).
+    if (haveGadgetParams && (outputListActive() || gadgetParams.TimeBetSnapshot > 0.0) &&
+        t_current >= nextGadgetSnapTime)
     {
       const double requestedSnapTime = nextGadgetSnapTime;   // C-D-11
       writeGadgetSnapshot(/*preKick=*/true);
@@ -2020,8 +2289,7 @@ bool octree::iterate_once(IterationData &idata) {
       int nCrossed = 0;
       do
       {
-        if (gadgetParams.ComovingIntegrationOn) nextGadgetSnapTime *= gadgetParams.TimeBetSnapshot;
-        else                                    nextGadgetSnapTime += gadgetParams.TimeBetSnapshot;
+        nextGadgetSnapTime = nextOutputTimeAfter(nextGadgetSnapTime);
         nCrossed++;
       } while (nextGadgetSnapTime <= t_current);
 
@@ -2972,7 +3240,13 @@ void octree::setGadgetParams(const GadgetParams &params)
 {
   gadgetParams        = params;
   haveGadgetParams    = true;
-  nextGadgetSnapTime  = params.TimeOfFirstSnapshot;
+  // T56: with an output list, the first wanted epoch is the list's own first in-range entry, not
+  // TimeOfFirstSnapshot -- Gadget ignores TimeOfFirstSnapshot entirely when OutputListOn is set
+  // (find_next_outputtime(), run.c:250-271, never reads it on that branch). An entry exactly at
+  // TimeBegin therefore fires a snapshot at the IC epoch, which is what Gadget does too.
+  nextGadgetSnapTime  = (params.OutputListOn != 0 && !params.OutputListTimes.empty())
+                      ? params.OutputListTimes.front()
+                      : params.TimeOfFirstSnapshot;
   gadgetSnapshotCount = 0;
 }
 
@@ -3166,6 +3440,19 @@ void octree::writeGadgetSnapshot(bool preKick)
     data.pos[3 * i + 0] = sp.x;
     data.pos[3 * i + 1] = sp.y;
     data.pos[3 * i + 2] = sp.z;
+#ifdef GADGET_HIP_HIGHRES
+    // T51: undo the recentring translation so the snapshot is in the IC's own frame. Without this
+    // the output would be silently offset and every downstream analysis tool would need to know the
+    // shift -- which is exactly the manual bookkeeping this feature exists to remove.
+    if (gadgetZoomShifted && gadgetParams.BoxSize > 0.0)
+      for (int a = 0; a < 3; ++a)
+      {
+        double x = (double) data.pos[3 * i + a] - gadgetZoomShift[a];
+        while (x >= gadgetParams.BoxSize) x -= gadgetParams.BoxSize;
+        while (x < 0.0)                   x += gadgetParams.BoxSize;
+        data.pos[3 * i + a] = (float) x;
+      }
+#endif
     data.vel[3 * i + 0] = sv.x;
     data.vel[3 * i + 1] = sv.y;
     data.vel[3 * i + 2] = sv.z;
@@ -4227,6 +4514,31 @@ void octree::approximate_gravity(tree_structure &tree)
       t31_set_force_geo(e ? atoi(e) : 0); }
   }
   walk_reset_bailouts();
+  walk_reset_guard_window();   // T49 item A: did the old guard's blind window fire this step?
+  walk_reset_high_water();     // Phase 5: per-step frontier margin
+  walk_reset_retries();        // Phase 5 / T49 item B: big-stack retries, and whether any failed
+  walk_reset_zoom_groups();    // T50 section 2: per-group Rcut[1] pruning, pure vs mixed
+  {
+    static bool t50set = false;
+    if (!t50set) { t50set = true;
+      const char *e = getenv("GADGET_HIP_T50_NO_PURE_PRUNE");
+      t50_set_no_pure_prune(e ? atoi(e) : 0); }
+  }
+  {
+    // T55: Rcut pruning geometry. Default 1 (per-axis, Gadget's), not 0 -- the Euclidean sphere
+    // demonstrably loses short-range force Gadget keeps. 0 is retained only so the change can be
+    // A/B'd in one binary.
+    static bool t55set = false;
+    if (!t55set) { t55set = true;
+      const char *e = getenv("GADGET_HIP_T55_RCUT_MODE");
+      const int m = e ? atoi(e) : 1;
+      t55_set_rcut_mode(m);
+      if (e) fprintf(stderr, "[T55] Rcut prune geometry = %d (%s)\n", m,
+                     m == 0 ? "Euclidean sphere at Rcut (pre-T55)"
+                            : (m == 2 ? "per-axis box at 6*Asmth" : "per-axis box at Rcut (Gadget)"));
+    }
+  }
+  cb15_reset_counters();       // per-step forced-descent count, not cumulative
 #ifdef UNEQUALSOFTENINGS
   {
     static const int t28off = (getenv("GADGET_HIP_T28_DISABLE") != NULL)
@@ -4312,6 +4624,55 @@ void octree::approximate_gravity(tree_structure &tree)
       fprintf(stderr, "[T28] iter=%d forced_descents=%u undefined_nodes=%u\n", iter, forced, undef);
     }
 #endif
+    // T49 item A, reported UNCONDITIONALLY: a nonzero count is not a diagnostic, it is the
+    // statement that a pre-fix build would have wrapped the cell-list ring buffer on this step and
+    // walked cell indices belonging to the wrong level. The corrected guard turns that into an
+    // honest overflow, which the bailout handling just below then deals with. First few
+    // occurrences and then every 50th, so a run that trips it constantly stays readable.
+    {
+      static unsigned long long guardWindowSteps = 0, guardWindowTotal = 0;
+      const unsigned int gw = walk_read_guard_window();
+      if (gw > 0)
+      {
+        guardWindowSteps++;
+        guardWindowTotal += gw;
+        if (guardWindowSteps <= 5 || (guardWindowSteps % 50) == 0)
+          fprintf(stderr, "[T49-A] iter=%d: %u group-level(s) exceeded the cell-list ring buffer by "
+                          "an amount only the corrected guard sees (the pre-fix guard omitted "
+                          "nextLevelCellCounter and would have wrapped it silently). Steps affected "
+                          "so far: %llu, total occurrences: %llu\n",
+                  iter, gw, guardWindowSteps, guardWindowTotal);
+      }
+    }
+
+    // Phase 5 (GADGET_HIP_CELL_WATER=1 for every step; otherwise only when something is abnormal).
+    // A big-stack retry is NEVER normal: it serialises that group through a GPU-wide spin lock, so
+    // one retry can cost more wall time than the whole rest of the step. Report it unconditionally.
+    {
+      static const bool cellWater = (getenv("GADGET_HIP_CELL_WATER") != NULL);
+      unsigned int hw = 0, hwOld = 0, forced = 0, undef = 0, retries = 0, retryFail = 0;
+      walk_read_high_water(&hw, &hwOld);
+      cb15_read_counters(&forced, &undef);
+      walk_read_retries(&retries, &retryFail);
+      unsigned int zPure = 0, zMixed = 0, zCoarse = 0;
+      walk_read_zoom_groups(&zPure, &zMixed, &zCoarse);
+      const unsigned int cap = walk_cell_list_capacity();
+      // The percentage is over the groups that CONTAIN a high-res target, because those are the only
+      // ones the Rcut[1] prune could ever apply to. `coarse` groups hold no high-res particle at all
+      // and are already using the right Rcut -- counting them as "not pure" (which the first
+      // two-bucket version did) made the genuinely-mixed boundary shell look ~3x larger than it is.
+      if (cellWater || retries > 0 || retryFail > 0)
+        fprintf(stderr, "[CELL-WATER] iter=%d frontier=%u/%u = %.1f%% (old_expr=%u)  "
+                        "forced_descents=%u undefined_soft=%u  big_stack_retries=%u retry_failed=%u"
+                        "  zoom_groups pure=%u mixed=%u coarse=%u (%.1f%% of high-res-bearing "
+                        "groups pure)%s\n",
+                iter, hw, cap, cap ? 100.0 * hw / cap : 0.0, hwOld,
+                forced, undef, retries, retryFail,
+                zPure, zMixed, zCoarse,
+                (zPure + zMixed) ? 100.0 * zPure / (zPure + zMixed) : 0.0,
+                retries > 0 ? "   <== SERIALISED through the big-stack spin lock" : "");
+    }
+
     const unsigned int nBail = walk_read_bailouts();
     if (nBail > 0)
     {
@@ -6031,6 +6392,26 @@ bool octree::writeRestartFile(const char *path)
   h.ekin1 = this->Ekin1; h.epot1 = this->Epot1; h.etot1 = this->Etot1;
   h.storeEnergyFlag = this->store_energy_flag ? 1 : 0;
 
+  // T51: the recentring shift, as a sidecar rather than a header field -- see the comment on
+  // gadgetZoomShift. Absent sidecar == no shift, which is the right reading of any restart written
+  // before this existed. Guarded: the octree members only exist in a GADGET_HIP_HIGHRES build.
+#ifdef GADGET_HIP_HIGHRES
+  if (gadgetZoomShifted)
+  {
+    const std::string zp = std::string(path) + ".zoomshift";
+    FILE *zf = fopen(zp.c_str(), "w");
+    if (zf)
+    {
+      fprintf(zf, "%.17g %.17g %.17g\n", gadgetZoomShift[0], gadgetZoomShift[1], gadgetZoomShift[2]);
+      fclose(zf);
+    }
+    else
+      fprintf(stderr, "[ZOOM] WARNING: could not write %s -- a resume from this restart will not "
+                      "know the recentring shift, and its snapshots would come out offset.\n",
+              zp.c_str());
+  }
+#endif
+
   bool ok = fwrite(&h, sizeof(h), 1, f) == 1;
   ok = ok && fwrite(pos.data(),               sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fwrite(ids.data(),               sizeof(ullong), n, f) == (size_t) n;
@@ -6052,6 +6433,33 @@ bool octree::readRestartFile(const char *path)
 {
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "FATAL: restart: cannot open %s\n", path); return false; }
+
+#ifdef GADGET_HIP_HIGHRES
+  // T51: recover the recentring shift from the sidecar. Its ABSENCE is meaningful and correct --
+  // a restart written before this existed holds unshifted coordinates -- so this is not an error.
+  // A resume must not recompute the shift from the resumed positions: those are already shifted, so
+  // recomputing would yield ~0 and the snapshot un-shift would be lost.
+  {
+    const std::string zp = std::string(path) + ".zoomshift";
+    FILE *zf = fopen(zp.c_str(), "r");
+    if (zf)
+    {
+      double sx = 0, sy = 0, sz = 0;
+      if (fscanf(zf, "%lg %lg %lg", &sx, &sy, &sz) == 3)
+      {
+        const double sh[3] = { sx, sy, sz };
+        setZoomShift(sh);
+        fprintf(stderr, "[ZOOM] resumed recentring shift (%.6g, %.6g, %.6g) from %s\n",
+                sx, sy, sz, zp.c_str());
+      }
+      else
+        fprintf(stderr, "[ZOOM] WARNING: %s is unreadable; continuing with NO shift, which will "
+                        "offset this run's snapshots if the restart was in fact recentred.\n",
+                zp.c_str());
+      fclose(zf);
+    }
+  }
+#endif
 
   GadgetHipRestartHeader h;
   if (fread(&h, sizeof(h), 1, f) != 1) { fprintf(stderr, "FATAL: restart: %s is truncated\n", path); fclose(f); return false; }

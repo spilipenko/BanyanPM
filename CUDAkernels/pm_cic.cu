@@ -77,6 +77,84 @@ __global__ void pm_cic_assign_mass_kernel(
   atomicAdd(&density[pm_grid_index(ix1, iy1, iz1, gridSize, gridPitch)], mass * dx * dy * dz);
 }
 
+#ifdef GADGET_HIP_DETERMINISTIC_CIC
+// T46, diagnostic build only. See CMakeLists.txt for why this exists and why it is not the default.
+//
+// Fixed-point accumulation: each contribution is scaled by `scale` and truncated to an integer, and
+// integers add associatively, so the total in a cell does not depend on the order the atomics
+// arrived in. That is the whole trick; nothing else here differs from the float path, and the
+// geometry below is a literal copy so the two cannot drift apart.
+//
+// CHOOSING THE SCALE. A contribution is mass*wx*wy*wz with the weights in [0,1], so it is bounded by
+// the particle mass, and a cell total is bounded by (particles in that cell) * mass. The scale is
+// derived once from particle 0's mass with 1e6 of headroom, which assumes the mass spread is within
+// that factor -- true for every IC in this project (single species) and generously true for a
+// two-species zoom. A run that violates it does not corrupt silently: the kernel flags saturation
+// and the host prints it.
+__device__ unsigned long long g_pmFixedSaturated = 0ull;
+
+__global__ void pm_cic_assign_mass_fixed_kernel(
+    const float4 *bodies_pos, int n,
+    unsigned long long *acc, int gridSize, int gridPitch, float invCellSize,
+    double scale, int mode)
+{
+  int i = pm_cic_particle_index(mode);
+  if (i >= n)
+    return;
+
+  const float4 p = bodies_pos[i];
+  const float mass = p.w;
+
+  const float gx = p.x * invCellSize;
+  const float gy = p.y * invCellSize;
+  const float gz = p.z * invCellSize;
+
+  const int ix = (int)floorf(gx);
+  const int iy = (int)floorf(gy);
+  const int iz = (int)floorf(gz);
+
+  const float dx = gx - ix;
+  const float dy = gy - iy;
+  const float dz = gz - iz;
+
+  const int ix0 = ((ix % gridSize) + gridSize) % gridSize;
+  const int iy0 = ((iy % gridSize) + gridSize) % gridSize;
+  const int iz0 = ((iz % gridSize) + gridSize) % gridSize;
+  const int ix1 = (ix0 + 1) % gridSize;
+  const int iy1 = (iy0 + 1) % gridSize;
+  const int iz1 = (iz0 + 1) % gridSize;
+
+  // Rounded, not truncated: truncation biases every contribution downward, and 8N of them would
+  // show up as a systematic mass deficit rather than as rounding noise.
+  const double kMax = 18446744073709551615.0;
+  #define PM_FIXED_DEPOSIT(XX, YY, ZZ, W)                                                     \
+    do {                                                                                      \
+      const double q = (double) mass * (double) (W) * scale;                                  \
+      if (q < 0.0 || q > kMax) { atomicAdd(&g_pmFixedSaturated, 1ull); }                      \
+      else { atomicAdd(&acc[pm_grid_index(XX, YY, ZZ, gridSize, gridPitch)],                  \
+                       (unsigned long long) (q + 0.5)); }                                     \
+    } while (0)
+
+  PM_FIXED_DEPOSIT(ix0, iy0, iz0, (1 - dx) * (1 - dy) * (1 - dz));
+  PM_FIXED_DEPOSIT(ix0, iy0, iz1, (1 - dx) * (1 - dy) * dz);
+  PM_FIXED_DEPOSIT(ix0, iy1, iz0, (1 - dx) * dy * (1 - dz));
+  PM_FIXED_DEPOSIT(ix0, iy1, iz1, (1 - dx) * dy * dz);
+  PM_FIXED_DEPOSIT(ix1, iy0, iz0, dx * (1 - dy) * (1 - dz));
+  PM_FIXED_DEPOSIT(ix1, iy0, iz1, dx * (1 - dy) * dz);
+  PM_FIXED_DEPOSIT(ix1, iy1, iz0, dx * dy * (1 - dz));
+  PM_FIXED_DEPOSIT(ix1, iy1, iz1, dx * dy * dz);
+  #undef PM_FIXED_DEPOSIT
+}
+
+__global__ void pm_fixed_to_float_kernel(const unsigned long long *acc, float *density,
+                                         size_t nElems, double invScale)
+{
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nElems) return;
+  density[i] = (float) ((double) acc[i] * invScale);
+}
+#endif // GADGET_HIP_DETERMINISTIC_CIC
+
 void pm_cic_assign_mass(const float4 *d_bodies_pos, int n, float *d_density,
                          int gridSize, int gridPitch, float boxSize, hipStream_t stream)
 {
@@ -89,8 +167,68 @@ void pm_cic_assign_mass(const float4 *d_bodies_pos, int n, float *d_density,
   // of difference the atomicAdd nondeterminism already introduces (T3).
   static const int cicMode = (getenv("GADGET_HIP_PM_CIC") != NULL)
                                ? atoi(getenv("GADGET_HIP_PM_CIC")) : 1;
+#ifdef GADGET_HIP_DETERMINISTIC_CIC
+  // Diagnostic path (T46). The caller has already zeroed d_density; we accumulate into our own
+  // 64-bit scratch instead and write d_density outright at the end, so the contract is unchanged.
+  const size_t nElems = (size_t)gridSize * gridSize * gridPitch;
+  static unsigned long long *s_acc = NULL;
+  static size_t s_accElems = 0;
+  static double s_scale = 0.0;
+  if (s_accElems != nElems)
+  {
+    if (s_acc) hipFree(s_acc);
+    if (hipMalloc((void**)&s_acc, nElems * sizeof(unsigned long long)) != hipSuccess)
+    {
+      fprintf(stderr, "[T46-FIXED-CIC] FATAL: could not allocate %.2f GB for the fixed-point grid. "
+                      "This is the diagnostic build; configure without "
+                      "-DGADGET_HIP_DETERMINISTIC_CIC=ON for production.\n",
+              nElems * 8.0 / (1024.0*1024.0*1024.0));
+      exit(1);
+    }
+    s_accElems = nElems;
+    s_scale = 0.0;   // force a rescale: a different grid means a different mean occupancy
+  }
+  if (s_scale == 0.0)
+  {
+    // One 16-byte read of particle 0, once. See the kernel's comment on the mass-spread assumption.
+    float4 p0;
+    hipMemcpy(&p0, d_bodies_pos, sizeof(float4), hipMemcpyDeviceToHost);
+    const double mass = (p0.w > 0.0f) ? (double) p0.w : 1.0;
+    const double headroom = 1.0e6;                 // a cell may hold 1e6x one particle's mass
+    s_scale = 4.6e18 / (mass * headroom);          // ~2^62, leaving the top bits unused
+    fprintf(stderr, "[T46-FIXED-CIC] bit-reproducible scatter ACTIVE: grid %zu cells, %.2f GB of "
+                    "uint64, m0=%.6g, scale=%.6g (quantum %.3g = %.2e of m0)\n",
+            nElems, nElems * 8.0 / (1024.0*1024.0*1024.0), mass, s_scale,
+            1.0 / s_scale, 1.0 / (s_scale * mass));
+  }
+  hipMemsetAsync(s_acc, 0, nElems * sizeof(unsigned long long), stream);
+  hipLaunchKernelGGL(pm_cic_assign_mass_fixed_kernel, dim3(blocks), dim3(threads), 0, stream,
+                      d_bodies_pos, n, s_acc, gridSize, gridPitch, invCellSize, s_scale, cicMode);
+  const int cThreads = 256;
+  const size_t cBlocks = (nElems + cThreads - 1) / cThreads;
+  hipLaunchKernelGGL(pm_fixed_to_float_kernel, dim3((unsigned)cBlocks), dim3(cThreads), 0, stream,
+                      s_acc, d_density, nElems, 1.0 / s_scale);
+  // Saturation must be loud, not silent -- the whole point of this project's recent tickets.
+  {
+    static bool s_reported = false;
+    if (!s_reported)
+    {
+      unsigned long long sat = 0ull;
+      hipStreamSynchronize(stream);
+      if (hipMemcpyFromSymbol(&sat, HIP_SYMBOL(g_pmFixedSaturated), sizeof(sat)) == hipSuccess
+          && sat != 0ull)
+      {
+        s_reported = true;
+        fprintf(stderr, "[T46-FIXED-CIC] WARNING: %llu contributions saturated the fixed-point "
+                        "range. The mass spread exceeds this build's 1e6 headroom, so the density "
+                        "grid is WRONG. Do not use these results.\n", sat);
+      }
+    }
+  }
+#else
   hipLaunchKernelGGL(pm_cic_assign_mass_kernel, dim3(blocks), dim3(threads), 0, stream,
                       d_bodies_pos, n, d_density, gridSize, gridPitch, invCellSize, cicMode);
+#endif
 }
 
 // Gather counterpart of pm_cic_assign_mass: trilinearly samples d_grid at each particle's

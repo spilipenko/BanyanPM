@@ -34,6 +34,13 @@ struct GadgetParams
 
   // --- Output-list / cosmology / box (tags 11-18) ---
   int    OutputListOn = 0;
+  // T56: the output times read from OutputListFilename, already filtered to [TimeBegin, TimeMax]
+  // and sorted ascending. Empty unless OutputListOn != 0. Gadget keeps a fixed
+  // double OutputListTimes[MAXLEN_OUTPUTLIST=500] (allvars.h:481) and read_outputlist()
+  // (begrun.c:759-783) simply STOPS at 500 without saying so; this is a vector, and the loader
+  // warns past 500 rather than truncating, because a silent truncation here is a run that writes
+  // the wrong snapshots and only shows it at analysis time.
+  std::vector<double> OutputListTimes;
   double Omega0 = 0.0;
   double OmegaBaryon = 0.0;          // SPH/cooling-only in this source tree; parsed, never consumed
   double OmegaLambda = 0.0;
@@ -146,3 +153,12 @@ struct GadgetParams
 // since this header cannot see the caller's PERIODIC macro state).
 bool gadget_params_parse(const std::string &filename, bool builtWithPeriodic, GadgetParams &out,
                           std::vector<std::string> &errors);
+
+// T56: load OutputListFilename into out.OutputListTimes, mirroring Gadget-2's read_outputlist()
+// (begrun.c:759-783) plus the in-range filter from find_next_outputtime() (run.c:250-271):
+// Gadget keeps only entries with TimeBegin <= t <= TimeMax, so entries outside the run are not an
+// error. Returns false (with a message in `errors`) when OutputListOn is set but the file cannot be
+// read or yields no usable time -- that must stop the run rather than fall back to TimeBetSnapshot,
+// which would silently write snapshots at times the parameter file never asked for. Call AFTER
+// gadget_params_parse(), since it needs TimeBegin/TimeMax.
+bool gadget_load_output_list(GadgetParams &out, std::vector<std::string> &errors);

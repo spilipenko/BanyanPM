@@ -108,6 +108,93 @@ Verified: with the timeout raised, 512³ Springel at `ErrTolForceAcc=0.002` runs
 session active and zero GPU resets. Expect the desktop to be sluggish during dense steps — the GPU
 really is busy.
 
+## Zoom simulations (`PLACEHIGHRESREGION`)
+
+A zoom run resolves one region at high resolution inside a larger, coarser box. GADGET does this
+with a **second, non-periodic particle mesh** over the high-res region, on top of the periodic one;
+this code now does the same.
+
+```bash
+cmake -S . -B build-zoom -DCMAKE_BUILD_TYPE=Release \
+  -DPERIODIC=ON -DMAC_SPRINGEL=ON -DUNEQUAL_SOFTENINGS=ON \
+  -DGADGET_HIP_HIGHRES=ON -DGADGET_HIP_PMGRID=256
+./build-zoom/gadget_hip --param zoom.param --zoom-mask 0x2
+```
+
+`--zoom-mask` is GADGET's `PLACEHIGHRESREGION` bitmask — bit *t* set means particle type *t* is
+high-resolution. `0x2` is the usual choice (type 1 only). `UNEQUAL_SOFTENINGS` is required whenever
+the types do not share a softening, and the binary refuses the parameter file otherwise rather than
+applying one type's softening to the others.
+
+- `--zoom-enlarge` is GADGET's `ENLARGEREGION`, **default 1.2**. Stock GADGET leaves
+  `ENLARGEREGION` undefined, but it sits three lines under `PLACEHIGHRESREGION` in GADGET's own
+  Makefile with 1.2 filled in, so a real zoom user enables both. The cost is explicit: at fixed
+  `GADGET_HIP_PMGRID` the fine cell, `Asmth[1]` and `Rcut[1]` all grow 20% and the fine mesh
+  resolves 20% less. Pass `--zoom-enlarge 1.0` for the tightest fine grid.
+- `--zoom-recenter` (**default on**) translates every particle at load so the high-res region sits
+  at the box centre, and undoes the shift when snapshots are written, so output stays in the
+  initial conditions' frame. This is a deliberate *addition*: GADGET simply refuses to run a dual
+  mesh when the region crosses a periodic boundary, which forces you to pre-shift the ICs by hand
+  and un-shift every snapshot during analysis. Finding the region's centre in a periodic box is not
+  a naive centre of mass — it is computed by minimum image against a reference member, which is
+  exact while the region's extent is under half the box and refuses rather than guesses otherwise.
+
+**Validated against GADGET per particle.** The region geometry is a digit-for-digit match to
+GADGET's own (`Asmth[1]` 0.196520, `Rcut[1]` 0.884339, data extent 14.3414, corner 10.0487), and an
+instrumented GADGET dumping `GravAccel` and `GravPM` — the latter split into its coarse and fine
+parts — gives, on the same 113k-particle zoom at `PMGRID=128`:
+
+| force component | rms difference / \|a_total\| | max |
+|---|---|---|
+| coarse mesh (periodic) | 2.04e-06 | 4.27e-04 |
+| **fine mesh (the zoom grid)** | **1.85e-06** | 1.18e-04 |
+| total, high-res particles | 9.29e-04 | 2.06e-02 |
+
+Both meshes agree to float32 round-off. The total on high-res particles is *closer* to GADGET's
+production criterion than GADGET's own two opening criteria are to each other (6.19e-03), which is
+the right yardstick because it contains none of this code.
+
+Over a full run (`a = 0.02 → 0.5`, 2,709 steps) against a CPU GADGET-2 reference: kinetic and
+potential energy within **±0.42%** at all 24 epochs, type-1 `sigma(delta)` within 1.7%, and the
+target halo — matched by particle ID, since a halo's position is not reproducible across codes but
+its membership is — centred to **0.005–0.007 Mpc/h**, 2–3% of the mean interparticle spacing, with
+enclosed mass within 1% outside 0.1 Mpc/h.
+
+**Mesh size.** Measured at 115M particles, per step over matched 10-step runs:
+
+| PMGRID | every-step PM | with `GADGET_HIP_PM_CADENCE=1` |
+|---|---|---|
+| 128 | 4.325 s | **2.673 s** |
+| 256 | **3.491 s** | **2.677 s** |
+| 512 | 4.565 s | 3.784 s |
+
+Recomputing every step, the cost has a genuine minimum in the middle rather than falling with
+resolution: 128 is bound by the coarse mass assignment (115M particles into 128³ is 55 per cell, so
+the atomic adds collide constantly) and 512 by the fine-mesh FFT, which is **1024³** because the
+zoom mesh is doubled for zero padding. With the cadence on, 128 and 256 become indistinguishable —
+on a non-PM step neither does any coarse-mesh work — so 256 is the finer of two equals. Peak memory
+agrees: 31 GB against 512's 47 GB.
+
+Both meshes now follow the cadence together, as GADGET does — `accel.c` wraps the whole of
+`long_range_force()`, which solves both. Before that the fine mesh was solved every step regardless
+(measured: coarse 1 solve in 10 steps, fine 10 of 10), which cost 1.59 s/step at `PMGRID=512` and
+was the whole of why 512 looked slower. With it fixed all three mesh sizes cost the **same** between
+PM steps — 2.194 / 2.198 / 2.214 s for 512 / 256 / 128, within 0.9% — and on the periodic steps
+where the timestep ladder brings a large fraction of particles up at once, the cheaper tree walk at
+small `Rcut` makes **512 the fastest overall** (2.615 s against 256's 2.708 and 128's 2.846).
+
+So with the cadence on, pick 512 for the finest mesh; memory is the only argument against it (47 GB
+against 256's 31 GB). Without the cadence, pick 256.
+
+Validated, because deferring the fine force changes the dynamics: on the 113k zoom against the CPU
+reference, worst kinetic-energy deviation is **+0.411%** against every-step's +0.435%, and the
+ID-matched halo centre lands 0.0094 Mpc/h from the reference against 0.0066 — both unchanged within
+noise. The *reported potential* energy is a different matter: see the cadence bullet under
+[Differences from GADGET-2](#differences-from-gadget-2).
+
+Only the 113k zoom above is validated against GADGET; the 115M run is exercised for performance and
+stability, not accuracy, as no CPU reference for it exists.
+
 ---
 
 ## Validation
@@ -135,7 +222,10 @@ median position offset **0.0089 Mpc/h** — about 1/22 of the mean interparticle
 agree within 1%; the handful of percent-level outliers are merger-timing differences, which is
 ordinary between two independent codes.
 
-**Force accuracy.** 0.39% rms on the fine-particle force against the same reference.
+**Force accuracy.** 0.39% rms on the fine-particle force against the same reference. A sharper,
+per-component check — against an instrumented GADGET dumping each particle's short-range and
+long-range force separately — is in [Zoom simulations](#zoom-simulations-placehighresregion) above;
+it is what caught the `Rcut` pruning defect described there.
 
 **Halo mass function across redshift.** A second run of the same ICs on the integer-timeline build,
 compared against the CPU reference at all seven epochs where the two output schedules coincide.
@@ -227,6 +317,10 @@ configuration and failing if any check accepts it — a gate nobody has seen fai
 threshold in it is a measured noise floor, documented with the measurement in
 [`tests/gate64/README.md`](tests/gate64/README.md).
 
+`tests/zoom/run.sh` covers the zoom path's host-side geometry — chiefly that the periodic centring
+is exact when it claims to be and refuses when it cannot be, which is the part a wrong answer would
+silently mis-place the whole fine mesh by.
+
 ---
 
 ## Differences from GADGET-2
@@ -240,8 +334,24 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   (the largest power-of-two tick count not exceeding `dt_displacement`), and the stored force is
   applied as a *separate kick over the PM interval, midpoint to midpoint, to every particle exactly
   once*. Measured at 512³ to z = 0: **439 PM solves against GADGET's 438**, worst kinetic-energy
-  deviation **0.142%**, and about **17% less wall clock** than recomputing every step. Every-step
-  remains the default because the cadence is newer.
+  deviation **0.142%**, and about **17% less wall clock** than recomputing every step. Every-step remains
+  the default, but "because it is newer" has stopped being a reason -- the measured cost is 0.133%
+  in worst-case kinetic energy, and on a zoom run the cadence is worth 17-38% of the step depending
+  on mesh size. Turning it on is reasonable; the default has simply not been revisited.
+
+  Both meshes follow the cadence, as in GADGET. (The fine mesh used not to: it was solved every
+  step while the coarse one was not, costing up to 42% of a zoom step. Fixed by accumulating it into
+  the same long-range arrays the coarse mesh writes, which is how GADGET's `long_range_force()` does
+  it and which hands the fine mesh the separate kick, the energy drift correction and the `aold`
+  contribution in one move.)
+
+  **One real caveat with the cadence on: the reported `Epot` is a sawtooth** — worst −2.2% against
+  the CPU reference, where every-step PM is −0.28%. GADGET recomputes the long-range potential fresh
+  at statistics time (`run.c:55` → `compute_potential()` → `pmpotential_periodic()`), independent of
+  the PM cadence; this code reads it from the once-per-interval store. It is **diagnostic only** —
+  `Epot` is reported but never integrated, and the kinetic energy, the halo positions and the halo
+  masses are all unaffected — but it means `Epot` cannot be used to validate a cadence run.
+  **Open.**
 
   The obvious shortcut — keeping the stored force but folding it into each active particle's own
   kick — looks equivalent and is not: it cost 11% in kinetic energy and was withdrawn. Two further
@@ -250,6 +360,15 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   without it the reported energy is a sawtooth of up to 2% that looks exactly like a dynamics bug),
   and the opening criterion's `OldAcc`, which GADGET builds from tree **and** PM
   (`gravtree.c:309-311`).
+- **The short-range cutoff is pruned per axis**, as GADGET prunes it
+  (`forcetree.c:1583-1605`), rather than on a sphere. This was a real defect until recently: a
+  Euclidean test cuts diagonal neighbours at `Rcut` where GADGET's per-axis box reaches
+  `sqrt(3)·Rcut`, and because *neither* code applies a hard per-particle `r > Rcut` cut — both rely
+  on the erfc table running out at `6·Asmth` — the pruning geometry alone decided whether a pair
+  just past `Rcut` was evaluated. The two directions are not symmetric: the mesh independently
+  supplies every pair's long-range complement, so evaluating an extra far pair is wasted work, while
+  *omitting* one loses that force outright. The sphere was omitting them, for about 1% of low-res
+  particles, by 18% of their short-range force. Fixed; the cost was 3.2% on the tree walk.
 - **The tree is rebuilt every step.** GADGET rebuilds at `TreeDomainUpdateFrequency` and drifts node
   centres of mass in between. **Open**, and the largest remaining cost.
 - **Integer timeline**, as in GADGET-2. Step boundaries are stored as integer ticks on a 2²⁸
@@ -272,7 +391,18 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   written — energies go to stdout instead. `info.txt` and `cpu.txt` *are* written, both in
   GADGET's own format. Checkpointing uses its own format, not GADGET restart files.
 - Unsupported parameter keys: `TreeDomainUpdateFrequency`, `TypeOfTimestepCriterion`,
-  `OutputListOn`/`OutputListFilename`, `NumFilesPerSnapshot`, and all SPH keys.
+  `NumFilesPerSnapshot`, and all SPH keys.
+- **`OutputListOn`/`OutputListFilename` are now honoured.** Snapshot times are read from the file,
+  filtered to `[TimeBegin, TimeMax]`, sorted, and de-duplicated, exactly as GADGET does; entries
+  outside the run are normal rather than an error. Two differences, both toward saying something:
+  GADGET silently stops reading at 500 entries, this warns instead; and if the list cannot be read
+  or holds nothing in range the run stops rather than falling back to `TimeBetSnapshot`.
+
+  One caveat for snapshot-by-snapshot comparisons: GADGET drifts to the output time before writing
+  and lands within 1e-8 of it, while this code writes at the step that *crossed* the time,
+  overshooting by one system step — up to 1.6e-3 in `a` on the run it was checked against. The
+  epoch error is reported per snapshot. Reduce `MaxSizeTimestep` if tighter output epochs matter.
+  **Open**, and the fix is a drift-to-output.
 
 ---
 

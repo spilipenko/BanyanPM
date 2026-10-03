@@ -301,10 +301,124 @@ void cb15_read_counters(unsigned int *forced, unsigned int *undefinedNode)
 // the host can refuse rather than integrate a silently incomplete force.
 __device__ unsigned int g_walk_bailouts = 0;
 
+// T49 item A: how many times the walk tripped the cell-list stack guard ONLY because the guard now
+// accounts for nextLevelCellCounter. Nonzero means a pre-fix build was wrapping the ring buffer at
+// those steps and walking cell indices from the wrong level; zero means the defect stayed dormant.
+__device__ unsigned int g_cell_guard_window = 0;
+
+// Phase 5: ported from the phase4-node-maintenance branch, where it was built for T48. The HIGH-WATER
+// MARK of cell-list occupancy -- how close the widest group's frontier came to capacity. The bailout
+// counter says IF a group overflowed; this says how much margin there was when it did not, which is
+// the difference between "the buffer is sized too tightly for this problem" and "this configuration
+// opens pathologically more nodes". `_old` keeps the pre-T49-A expression so the two are comparable.
+__device__ unsigned int g_cell_high_water     = 0;
+__device__ unsigned int g_cell_high_water_old = 0;
+
+// Phase 5 / T49 item B: the big-stack RETRY. A group whose cell list overflows its warp's share is
+// re-walked on the whole second half of MEM_BUF with SHIFT=8 (capacity x256), serialised by a
+// SPIN LOCK -- one group at a time across the entire GPU, with every other block busy-waiting. The
+// path has always been live (SHMODE is undefined project-wide), but its outcome was checked with
+// assert(), which NDEBUG deletes from a Release build, while g_walk_bailouts was incremented BEFORE
+// it ran. These separate "needed a retry" from "the retry also failed" -- only the latter is a lost
+// force, and the former is what makes a step take minutes instead of seconds.
+__device__ unsigned int g_walk_retries    = 0;
+__device__ unsigned int g_walk_retry_fail  = 0;
+
+// T50 section 2: how many group-walks pruned at Rcut[1] because every one of the group's targets is
+// high-res, vs. how many had to fall back to max(Rcut[0],Rcut[1]) because the group is mixed (or the
+// zoom is inactive). The optimisation rests on the claim that a zoom's groups are almost never mixed
+// -- groups are spatially compact and the high-res species occupies a small sub-volume -- so count it
+// instead of believing it.
+__device__ unsigned int g_zoom_pure_groups  = 0;   // every target high-res  -> prunes at Rcut[1]
+__device__ unsigned int g_zoom_mixed_groups = 0;   // some high-res, some not -> max(Rcut[0],Rcut[1])
+// The first version had two buckets, and \"mixed\" then also counted every group holding NO high-res
+// particle at all -- which is not mixed, it is correctly using Rcut[0]. With this IC's ~23.1M
+// low-resolution particles that was ~0.7M of the 1.1M groups reported as mixed, so the
+// genuinely-mixed fraction (the zoom region's boundary shell) read about 3x too high.
+__device__ unsigned int g_zoom_coarse_groups = 0;  // no high-res target at all -> Rcut[0], correct
+
+// A/B switch for the pruning change itself (GADGET_HIP_T50_NO_PURE_PRUNE=1): forces every group back
+// onto max(Rcut[0],Rcut[1]), the pre-T50 behaviour. Without this the claim "the per-group prune is
+// what makes a small PMGRID runnable" would rest on a note about a DIFFERENT configuration rather
+// than on an A/B of the same binary.
+__constant__ int g_t50_no_pure_prune = 0;
+
+void t50_set_no_pure_prune(int on)
+{
+  hipMemcpyToSymbol(HIP_SYMBOL(g_t50_no_pure_prune), &on, sizeof(on));
+}
+
+// T55: which GEOMETRY reject_node_rcut() uses. Default 1 (per-axis at Rcut), see that function.
+//   0 = Euclidean gap vs Rcut            -- the pre-T55 behaviour, kept for A/B
+//   1 = per-axis gap vs Rcut             -- Gadget's geometry (forcetree.c:1583-1605)
+//   2 = per-axis gap vs 6*Asmth          -- the erfc table's own reach, a guaranteed superset
+__constant__ int g_t55_rcut_mode = 1;
+
+void t55_set_rcut_mode(int mode)
+{
+  hipMemcpyToSymbol(HIP_SYMBOL(g_t55_rcut_mode), &mode, sizeof(mode));
+}
+
 void walk_reset_bailouts()
 {
   unsigned int z = 0;
   hipMemcpyToSymbol(HIP_SYMBOL(g_walk_bailouts), &z, sizeof(z));
+}
+
+void walk_reset_guard_window()
+{
+  unsigned int z = 0;
+  hipMemcpyToSymbol(HIP_SYMBOL(g_cell_guard_window), &z, sizeof(z));
+}
+
+unsigned int walk_read_guard_window()
+{
+  unsigned int v = 0;
+  hipMemcpyFromSymbol(&v, HIP_SYMBOL(g_cell_guard_window), sizeof(v));
+  return v;
+}
+
+void walk_reset_high_water()
+{
+  unsigned int z = 0;
+  hipMemcpyToSymbol(HIP_SYMBOL(g_cell_high_water),     &z, sizeof(z));
+  hipMemcpyToSymbol(HIP_SYMBOL(g_cell_high_water_old), &z, sizeof(z));
+}
+
+void walk_read_high_water(unsigned int *now, unsigned int *oldExpr)
+{
+  hipMemcpyFromSymbol(now,     HIP_SYMBOL(g_cell_high_water),     sizeof(*now));
+  hipMemcpyFromSymbol(oldExpr, HIP_SYMBOL(g_cell_high_water_old), sizeof(*oldExpr));
+}
+
+unsigned int walk_cell_list_capacity() { return (unsigned int) CELL_LIST_MEM_PER_WARP; }
+
+void walk_reset_retries()
+{
+  unsigned int z = 0;
+  hipMemcpyToSymbol(HIP_SYMBOL(g_walk_retries),    &z, sizeof(z));
+  hipMemcpyToSymbol(HIP_SYMBOL(g_walk_retry_fail), &z, sizeof(z));
+}
+
+void walk_read_retries(unsigned int *retries, unsigned int *failed)
+{
+  hipMemcpyFromSymbol(retries, HIP_SYMBOL(g_walk_retries),    sizeof(*retries));
+  hipMemcpyFromSymbol(failed,  HIP_SYMBOL(g_walk_retry_fail), sizeof(*failed));
+}
+
+void walk_reset_zoom_groups()
+{
+  unsigned int z = 0;
+  hipMemcpyToSymbol(HIP_SYMBOL(g_zoom_pure_groups),   &z, sizeof(z));
+  hipMemcpyToSymbol(HIP_SYMBOL(g_zoom_mixed_groups),  &z, sizeof(z));
+  hipMemcpyToSymbol(HIP_SYMBOL(g_zoom_coarse_groups), &z, sizeof(z));
+}
+
+void walk_read_zoom_groups(unsigned int *pure, unsigned int *mixed, unsigned int *coarse)
+{
+  hipMemcpyFromSymbol(pure,   HIP_SYMBOL(g_zoom_pure_groups),   sizeof(*pure));
+  hipMemcpyFromSymbol(mixed,  HIP_SYMBOL(g_zoom_mixed_groups),  sizeof(*mixed));
+  hipMemcpyFromSymbol(coarse, HIP_SYMBOL(g_zoom_coarse_groups), sizeof(*coarse));
 }
 
 unsigned int walk_read_bailouts()
@@ -1495,7 +1609,8 @@ static __device__ bool split_node_grav_springel(
 // already exceeds Rcut, every descendant's does too, with no exceptions to check for.
 static __device__ __forceinline__ bool reject_node_rcut(
     const float4 nodeCenter, const float4 nodeSize,
-    const float4 groupCenter, const float4 groupSize)
+    const float4 groupCenter, const float4 groupSize,
+    const float groupRcut2)
 {
   // Same minimum-image treatment as split_node_grav_impbh/springel above (periodic only -- an
   // isolated system has no wraparound), but subtracting BOTH half-extents (group's and node's
@@ -1517,19 +1632,55 @@ static __device__ __forceinline__ bool reject_node_rcut(
   dr.x = fmaxf(dr.x, 0.0f);
   dr.y = fmaxf(dr.y, 0.0f);
   dr.z = fmaxf(dr.z, 0.0f);
-  const float ds2 = dr.x*dr.x + dr.y*dr.y + dr.z*dr.z;
-#ifdef GADGET_HIP_HIGHRES
-  // Phase 5 ticket 07: this is a GROUP-level rejection (a group can contain a mix of coarse- and
-  // fine-grid targets), so it must stay safe for whichever of the two grids' Rcut is LARGER --
-  // using the smaller one here could reject a node that's still in-range for a target using the
-  // other grid's (larger) Rcut. Purely a performance early-out either way (never a correctness
-  // requirement -- add_acc's own per-interaction tabindex>=NTAB guard, using the correct
-  // PER-TARGET asmthfac, already drops any out-of-range contribution exactly), so being
-  // conservative here costs a little pruning opportunity, never correctness.
-  return ds2 > fmaxf(g_pm_rcut2, g_pm_rcut2_1);
-#else
-  return ds2 > g_pm_rcut2;
-#endif
+  // T55. This used to be the EUCLIDEAN gap, `dr.x^2+dr.y^2+dr.z^2 > Rcut^2` -- a sphere. Gadget's
+  // own test is PER AXIS (forcetree.c:1583-1605): it rejects only when some single axis exceeds
+  // `rcut + 0.5*nop->len`, which is a BOX, and a box reaches `sqrt(3)*Rcut` along the diagonal
+  // where the sphere stops at Rcut.
+  //
+  // The difference is not cosmetic, because NEITHER code applies a hard per-particle `r > Rcut`
+  // cut: both rely on `tabindex < NTAB`, which cuts at 6*Asmth = (4/3)*Rcut. So the pruning
+  // geometry alone decides whether a pair in (Rcut, 6*Asmth) is evaluated, and those pairs are not
+  // negligible for sparse heavy particles -- measured at 2.8% of the total force for the low-res
+  // species of the zoom-ics set (T54).
+  //
+  // Measured consequence of the sphere: for ~1% of low-res particles this port DROPPED a
+  // short-range pair Gadget keeps (123 cases against 44 where it kept an extra one), landing 10x
+  // further from a direct pair sum than Gadget (2.6e-2 of the total force against Gadget's
+  // 2.6e-3). The disputed pairs were the 12 FACE DIAGONALS of the low-res lattice at
+  // dmean*sqrt(2) = 2.994, which is exactly the region a sphere cut excludes and a box cut keeps.
+  //
+  // Dropping is not symmetric with keeping, which is what makes this a real defect rather than a
+  // different amount of work. The tree supplies w(u)*m/r^2 and the PM grid independently supplies
+  // (1-w(u))*m/r^2 for EVERY pair at EVERY distance, so evaluating an extra far pair is free -- the
+  // grid already supplied its complement and w(u) makes the term tiny -- while omitting a pair
+  // whose w(u) is still finite loses that force outright, because nothing notices the tree's
+  // omission. So the prune must err permissive, and the per-axis test is the permissive one.
+  //
+  // This port's box is additionally inflated by the GROUP's half-extent (the `groupSize` subtracted
+  // above), because it prunes for a whole warp-group of targets at once rather than per particle.
+  // That makes mode 1 a strict superset of Gadget's own node list, never a subset -- which is the
+  // property that matters.
+  const float dmax = fmaxf(dr.x, fmaxf(dr.y, dr.z));
+  const float ds2  = (g_t55_rcut_mode == 0)
+                   ? (dr.x*dr.x + dr.y*dr.y + dr.z*dr.z)   // sphere (pre-T55)
+                   : (dmax * dmax);                        // box, i.e. Chebyshev
+  // T50 section 2: `groupRcut2` is chosen ONCE PER GROUP by the caller -- Rcut[1]^2 when every one
+  // of the group's targets is high-res, otherwise max(Rcut[0],Rcut[1])^2. The old code used the max
+  // unconditionally because a group *can* in principle mix coarse- and fine-grid targets, and
+  // rejecting at the smaller radius would then drop a node still in range for a coarse target. But
+  // since Rcut[1] << Rcut[0] always, "the max" is just Rcut[0], so a pure high-res group got no
+  // pruning benefit from the zoom at all -- which is what makes a small PMGRID (where Rcut[0] is
+  // large) exhaust the walk's cell list. Pruning a pure group at its own Rcut[1] is exactly what
+  // Gadget-2 does for high-res particles: its own walk is limited to Rcut, and the erfc table
+  // extends to 6*Asmth > Rcut = 4.5*Asmth, so the truncation residual is Gadget's own choice, not a
+  // new approximation introduced here.
+  // Mode 2 widens the bound from Rcut to the erfc table's own reach, 6*Asmth. Rcut = 4.5*Asmth, so
+  // that is exactly (4/3)*Rcut and (16/9)*Rcut^2 -- no new constant has to be uploaded, and it holds
+  // for the fine grid too since Rcut[1]/Asmth[1] is the same ratio. Beyond 6*Asmth the per-particle
+  // `tabindex >= NTAB` test discards the interaction anyway, so mode 2 cannot miss anything that
+  // could contribute; it only costs a wider frontier.
+  const float bound2 = (g_t55_rcut_mode == 2) ? groupRcut2 * (16.0f/9.0f) : groupRcut2;
+  return ds2 > bound2;
 }
 #endif
 
@@ -1588,6 +1739,42 @@ uint2 approximate_gravity(
       cellList[ringAddr<SHIFT>(root_cell - top_cells.x + laneIdx)] = root_cell + laneIdx;
 
   int nCells = top_cells.y - top_cells.x;
+
+#ifdef PMGRID
+  // T50 section 2: the Rcut^2 this group's node rejection will use, decided ONCE here rather than
+  // per cell. A group is "pure" when every target held by every lane of this warp is high-res; then
+  // every target uses Asmth[1]/Rcut[1] in add_acc, so the whole group may prune at Rcut[1].
+  //
+  // The ballot is phrased as "did ANY lane see a non-high-res target", which makes it independent of
+  // the wavefront width -- `__popc(ballot) == WARP_SIZE` would silently break on a wave64 target,
+  // and FULL_MASK here is 64-bit while WARP_SIZE is 32.
+  //
+  // Every lane holds a valid target: body_i[0] = body_addr + laneId % nb_i wraps, so short groups
+  // duplicate members rather than leaving lanes idle. There is no inactive-lane case to mask off.
+#ifdef GADGET_HIP_HIGHRES
+  float groupRcut2;
+  {
+    bool myFine = true;
+    for (int k = 0; k < NI; k++)
+      myFine = myFine && ((1u << type_i[k]) & g_pm_zoom_mask) != 0u;
+    const bool anyCoarse = g_t50_no_pure_prune
+                         || (__ballot_sync(FULL_MASK, !myFine) != 0ull);
+    // Separates \"mixed\" from \"entirely low-res\": the latter is not a missed pruning opportunity.
+    const bool anyFine = (__ballot_sync(FULL_MASK, myFine) != 0ull);
+    // mask == 0 (zoom inactive) makes every lane "coarse", so this lands on g_pm_rcut2 via the max
+    // below -- g_pm_rcut2_1 is zero-initialised __constant__ memory until the zoom uploads it.
+    groupRcut2 = anyCoarse ? fmaxf(g_pm_rcut2, g_pm_rcut2_1) : g_pm_rcut2_1;
+    if (laneIdx == 0)
+    {
+      if (!anyCoarse)   atomicAdd(&g_zoom_pure_groups,   1u);
+      else if (anyFine) atomicAdd(&g_zoom_mixed_groups,  1u);
+      else              atomicAdd(&g_zoom_coarse_groups, 1u);
+    }
+  }
+#else
+  const float groupRcut2 = g_pm_rcut2;
+#endif
+#endif
 
   int cellListBlock        = 0;
   int nextLevelCellCounter = 0;
@@ -1726,7 +1913,7 @@ uint2 approximate_gravity(
 #ifdef GADGET_HIP_CB19_NO_RCUT_REJECT
     const bool rejectCell = false;
 #else
-    const bool rejectCell = reject_node_rcut(cellPos, cellSize, groupPos, groupSize);
+    const bool rejectCell = reject_node_rcut(cellPos, cellSize, groupPos, groupSize, groupRcut2);
 #endif
 #else
     const bool rejectCell = false;
@@ -1739,8 +1926,57 @@ uint2 approximate_gravity(
       const int2 childScatter = warpIntExclusiveScan(nChildren & (-splitNode));
 
       /* make sure we still have available stack space */
-      if (childScatter.y + nCells - cellListBlock > (CELL_LIST_MEM_PER_WARP<<SHIFT))
+      //
+      // T49 item A. `cellList` is a RING buffer of CAP = CELL_LIST_MEM_PER_WARP<<SHIFT entries,
+      // addressed by ringAddr() = absolute & (CAP-1). Four absolute indices bound the data that is
+      // still going to be READ, in increasing order:
+      //
+      //   cellListOffset + cellListBlock                  oldest live entry -- the first cell of
+      //                                                   THIS level no warp iteration has consumed
+      //                                                   yet. cellListBlock was advanced at the
+      //                                                   top of the loop and this iteration's 32
+      //                                                   cells are already in registers, so
+      //                                                   everything below this index is dead.
+      //   cellListOffset + nCells                         end of this level = start of the next
+      //   ... + nextLevelCellCounter                      end of the children ALREADY scattered
+      //   ... + childScatter.y                            end of what this iteration will write
+      //
+      // so the live span that must not be overwritten is
+      //
+      //   (nCells - cellListBlock) + nextLevelCellCounter + childScatter.y
+      //
+      // The original guard omitted `nextLevelCellCounter`: zero at the start of a level, the whole
+      // next level by its end. Whenever
+      //
+      //   CAP - nextLevelCellCounter < (old expression) <= CAP
+      //
+      // it passed while the true span exceeded CAP, and the scatter below wrapped onto the oldest
+      // UNREAD cells of the current level, after which the walk read cell indices from the wrong
+      // level. Every term is warp-uniform (childScatter.y is the warp total of the exclusive scan),
+      // so the early return stays warp-uniform as it was.
+      //
+      // On the severity, because the first write-up of this overstated it: a REPORTED overflow is
+      // harmless (the group is re-walked on the big stack and acc_out is written only after the
+      // early return, so the corrupted attempt is discarded), and with branching that follows the
+      // tree the omission is self-limiting -- the old expression peaks at the START of a level
+      // while the true span peaks at its END, where it equals the next level's width, which the old
+      // guard then checks. Host replays of this index algebra find corrupted reads but no silent
+      // ones under that rule. Let the per-chunk child count be arbitrary, as a garbage-driven
+      // traversal makes it once the first corrupted read lands, and silent corruption is abundant.
+      // See tickets/T49 and analysis/ringsim*.cpp in the audit repo.
+      const int live    = (nCells - cellListBlock) + nextLevelCellCounter + childScatter.y;
+      const int liveOld = (nCells - cellListBlock) + childScatter.y;
+      if (laneIdx == 0 && live    > 0) atomicMax(&g_cell_high_water,     (unsigned int) live);
+      if (laneIdx == 0 && liveOld > 0) atomicMax(&g_cell_high_water_old, (unsigned int) liveOld);
+      if (live > (CELL_LIST_MEM_PER_WARP<<SHIFT))
+      {
+        // Did the defect ever actually fire, or was the frontier always far enough below CAP that
+        // the missing term could not matter? Counts only what the OLD guard would have let through,
+        // kept separate from g_walk_bailouts so "the fix changed an outcome" is a measurement.
+        if (laneIdx == 0 && liveOld <= (CELL_LIST_MEM_PER_WARP<<SHIFT))
+          atomicAdd(&g_cell_guard_window, 1u);
         return make_uint2(0xFFFFFFFF,0xFFFFFFFF);
+      }
 
 #if 1
       /* if so populate next level stack in gmem */
@@ -2335,8 +2571,9 @@ void approximate_gravity_main(
         }
       }
 
+      if (laneId == 0) atomicAdd(&g_walk_retries, 1u);
       int *lmem1 = &MEM_BUF[gridDim.x*(CELL_LIST_MEM_PER_WARP<<nWarps2)];
-      const bool success = treewalk<8,blockDim2,ACCUMULATE>(
+      const bool bigOk = treewalk<8,blockDim2,ACCUMULATE>(
           bid,
           body_forceSoftening,
           body_type,
@@ -2363,7 +2600,10 @@ void approximate_gravity_main(
           nodeSoftInfo,
           groupMaxSofteningInfo,
         cellCenterInfo);
-      assert(success);
+      // assert() is compiled out by NDEBUG in a Release build, so a failed retry used to be
+      // completely silent. Count it instead: this, not g_walk_bailouts, is the condition under
+      // which a particle really did go without a force.
+      if (!bigOk && laneId == 0) atomicAdd(&g_walk_retry_fail, 1u);
 
       if(laneId == 0)
         atomicExch(&active_inout[n_bodies+1], 0); //Release the lock

@@ -443,6 +443,17 @@ protected:
   // additive otherwise) -- initialized from gadgetParams.TimeOfFirstSnapshot in setGadgetParams().
   double nextGadgetSnapTime  = -1.0;
 
+  // T56: the next time at which a snapshot is wanted, strictly after `t`. With OutputListOn this
+  // walks gadgetParams.OutputListTimes; otherwise it applies the TimeBetSnapshot cadence
+  // (multiplicative under comoving integration, additive otherwise) exactly as before. Returns
+  // +infinity when the output list is exhausted -- which is the correct answer, not an error: a
+  // list simply stops asking for snapshots.
+  double nextOutputTimeAfter(double t) const;
+  // True when the run's snapshot times come from an output list rather than the cadence.
+  bool   outputListActive() const
+  { return haveGadgetParams && gadgetParams.OutputListOn != 0 &&
+           !gadgetParams.OutputListTimes.empty(); }
+
   // --------------------------------------------------------------------------------------------
   // Restart (stop/resume). Deliberately NOT Gadget-2's restart-file format -- the user confirmed
   // compatibility is not required, and Gadget's format is a raw dump of its own structs.
@@ -549,6 +560,7 @@ protected:
   my_dev::kernel gadgetBoxWrap;            // T37: Gadget's do_box_wrapping, applied before the tree build
   my_dev::kernel gadgetPMKick;             // Phase 3: GADGET-2's long-range kick over the PM interval
   my_dev::kernel gadgetAoldMag;            // T45: |tree + PM| per particle, the Springel MAC's OldAcc
+  my_dev::kernel gadgetNodeLenMonotone;    // C-A-07/Phase 4: GADGET's force_update_len floor
   my_dev::kernel gadgetPMStaleness;        // Phase 3 rung 2: drift of the long-range force per interval
   my_dev::kernel computeEnergy;
   my_dev::kernel computeEnergyPreKick;  // T19: pre-kick energy sample, matches Gadget-2's timing
@@ -817,6 +829,14 @@ inline bool gadget_hip_stage_trace()
   float        gadgetZoomEnlarge = 1.0f; // Gadget-2's real default: ENLARGEREGION is normally undefined (Makefile:24), so no enlargement
   bool         haveGadgetZoom    = false;
   ZoomRegion       gadgetZoomRegion;
+  // T51: the periodic translation applied to EVERY particle at IC load so the high-res region sits
+  // at the box centre and the fine grid cannot cross a periodic boundary by construction. Physically
+  // inert (a periodic box is translation invariant when it all moves together) and undone when a
+  // snapshot is written, so output coordinates match the IC's frame. Zero when recentring is off.
+  double           gadgetZoomShift[3] = {0.0, 0.0, 0.0};
+  bool             gadgetZoomShifted  = false;
+  void setZoomShift(const double s[3]) { for (int a=0;a<3;a++) gadgetZoomShift[a]=s[a];
+                                         gadgetZoomShifted = (s[0]!=0.0)||(s[1]!=0.0)||(s[2]!=0.0); }
   PMIsolatedSolver gadgetZoomSolver;
   bool             gadgetZoomSolverReady = false;
   void setZoomConfig(unsigned int mask, float enlargeRegion);
