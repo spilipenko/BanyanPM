@@ -675,6 +675,31 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     if ((optarg = opt.getValue("zoom-mask")))    zoomMask    = (unsigned int) strtoul(optarg, NULL, 0); // base 0: accepts "0x..." or decimal
     if ((optarg = opt.getValue("zoom-enlarge"))) zoomEnlarge = (float) atof(optarg);
     if ((optarg = opt.getValue("zoom-recenter"))) zoomRecenter = atoi(optarg);
+#ifndef GADGET_HIP_HIGHRES
+    // These three options are parsed unconditionally -- the option table is not compiled
+    // conditionally -- but they are consumed only inside #ifdef GADGET_HIP_HIGHRES. Without that
+    // option a zoom request used to be accepted and then ignored: the run proceeded as a plain
+    // single-mesh simulation, with the high-res region getting no fine mesh and no warning
+    // anywhere in the log. A zoom IC run that way is not a slower zoom, it is different physics
+    // reported as if nothing were missing. So refuse, naming the option to rebuild with.
+    if (zoomMask != 0u)
+    {
+      fprintf(stderr,
+        "\nFATAL: --zoom-mask 0x%x was given, but this binary was built WITHOUT\n"
+        "GADGET_HIP_HIGHRES, so it has no second (high-resolution) particle mesh and cannot run a\n"
+        "zoom simulation. Every high-res particle would get only the coarse mesh's long-range\n"
+        "force, which is not the simulation you asked for.\n"
+        "  Rebuild with: cmake -S . -B <dir> -DGADGET_HIP_HIGHRES=ON -DGADGET_HIP_PMGRID=<n> ...\n"
+        "  Or drop --zoom-mask to run this as a single-mesh simulation deliberately.\n",
+        zoomMask);
+      ::exit(1);
+    }
+    // --zoom-enlarge and --zoom-recenter are inert without a mask even in a zoom build, so they
+    // are only worth a warning: silently dropping a value the user set is the thing to avoid.
+    if (opt.getValue("zoom-enlarge") || opt.getValue("zoom-recenter"))
+      fprintf(stderr, "[ZOOM] WARNING: --zoom-enlarge / --zoom-recenter ignored -- this binary was "
+                      "built without GADGET_HIP_HIGHRES.\n");
+#endif
     if ((optarg = opt.getValue("zoom-kernel-test"))) zoomKernelTestSamples = atoi(optarg);
     if ((optarg = opt.getValue("bonsaifile")))   bonsaiFileName     = std::string(optarg);
     if ((optarg = opt.getValue("plummer")))      nPlummer           = atoi(optarg);

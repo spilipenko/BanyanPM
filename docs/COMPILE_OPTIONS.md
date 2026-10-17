@@ -44,11 +44,12 @@ Two asymmetries to be aware of, because they are the cases that do **not** stop:
   startup banner prints which one is compiled in — `[INIT] MAC: Springel(2005)` or
   `[INIT] MAC: improved-BH (theta)` (`src/main.cpp:1469-1473`). Check that line before comparing two
   runs.
-- **`GADGET_HIP_HIGHRES` is not checked at all.** `--zoom-mask` is accepted and parsed by every
-  build (`src/main.cpp:555`, `675`) but only consumed inside the `GADGET_HIP_HIGHRES` guard
-  (`src/main.cpp:1444-1450`). Pass `--zoom-mask 0x2` to a binary built without the option and the
-  run proceeds silently as an ordinary single-mesh simulation. Nothing warns. Confirm the zoom is
-  live by looking for the `[ZOOM] high-res region centre …` line in the log, not by the exit status.
+- **`GADGET_HIP_HIGHRES`** is checked against the command line, not the parameter file.
+  `--zoom-mask` is parsed by every build, since the option table is not compiled conditionally, but
+  the zoom mesh only exists with this option. Passing `--zoom-mask` to a binary built without it is
+  **refused at startup**, because the alternative is a run that quietly gives every high-resolution
+  particle nothing but the coarse mesh's long-range force. `--zoom-enlarge` and `--zoom-recenter`
+  are inert without a mask even in a zoom build, so those warn rather than refuse.
 
 `tests/gate64/gate64.sh` checks the configuration of the binary it is given before running any
 physics, by reading the startup banner, which catches a missing `PERIODIC` or `PMGRID`.
@@ -104,6 +105,38 @@ silicon; see its entry below for the cost.
 It can be turned back off at run time with `GADGET_HIP_UNIFIED_MEM=0`, so this build is a superset
 of the one above rather than a different configuration.
 
+### Non-periodic (isolated) runs
+
+`GADGET_HIP_PMGRID` **without** `PERIODIC` compiles the non-periodic long-range solver instead of
+the periodic one — GADGET-2's own `pm_nonperiodic` mode, for an isolated system with vacuum
+boundaries rather than a cosmological box. The tree runs without minimum-image wrapping and the
+mesh FFTs a doubled `2 × PMGRID` grid, zero-padded so the inherently periodic transform cannot wrap
+real structure back onto itself. The Green's function is a cached real-space kernel rather than an
+analytic k-space formula, and `Asmth` and `Rcut` follow from the mesh the same way:
+`Asmth = 1.25 · meshSize / (2·PMGRID)`, `Rcut = 4.5 · Asmth`, echoed as an `[ISOLATED]` line at
+startup.
+
+```bash
+cmake -S . -B build-isolated -DCMAKE_BUILD_TYPE=Release \
+  -DGADGET_HIP_PMGRID=256 -DMAC_SPRINGEL=ON          # note: no PERIODIC
+make -C build-isolated -j12 gadget_hip
+./build-isolated/gadget_hip --param run.param --meshsize 1000.0
+```
+
+Three things this mode requires that the periodic one does not:
+
+- **`--meshsize` is mandatory** and the run refuses to start without it. It is the physical size of
+  the *doubled* grid, so the usable region is `meshSize/2` on a side; the outer half is the padding.
+- **Particles must lie within `[0, meshSize/2)` on every axis.** To guarantee that, every loaded
+  coordinate is shifted by `+meshSize/4` at startup, which centres an origin-centred distribution
+  in the occupied half with equal padding on both sides.
+- **That shift is not undone when snapshots are written.** Output therefore sits `meshSize/4` from
+  the frame of the initial conditions on every axis. Subtract it before comparing positions against
+  the input, or against any other code's output. (The zoom mode's `--zoom-recenter`, by contrast,
+  does restore its own shift on write.)
+- The parameter file's `PeriodicBoundariesOn` must be `0`, since periodicity is matched against the
+  build in both directions.
+
 ### Toolchain and target
 
 | Variable | Default | Notes |
@@ -130,7 +163,7 @@ empty by default.
 | `MAC_SPRINGEL` | **`_MAC_SPRINGEL_`** | `OFF` | Selects Springel (2005)'s relative-acceleration multipole acceptance criterion, driven by `ErrTolForceAcc`, in place of the improved Barnes–Hut opening angle driven by `ErrTolTheta`. GADGET-2's two-phase bootstrap is reproduced: the first force evaluation of a run has no `OldAcc` yet and uses the geometric criterion, switching to the relative one permanently thereafter (`CUDAkernels/dev_approximate_gravity_warp_new.cu:1807-1842`). Required for `TypeOfOpeningCriterion 1`. |
 | `UNEQUAL_SOFTENINGS` | **`UNEQUALSOFTENINGS`** | `OFF` | GADGET-2's mixed-softening machinery: a per-node softening summary (`nodeSoftInfo`, one float per node, encoding the node's maximum `ForceSoftening` in its magnitude and "members differ" in its sign) plus the forced descent that opens a node whose members have different softenings when the target is inside the softening radius (`CUDAkernels/dev_approximate_gravity_warp_new.cu:1848-1880`). A run whose populated types all share one softening pays nothing for leaving it off: the buffer is allocated at one element, the reduction is not compiled, and the walk carries no extra load or branch (`src/build.cpp:386`, `411-416`). Needed by every zoom and every multi-species run. |
 | `GADGET_HIP_PMGRID` | **`PMGRID`** | empty | Particle-mesh cells per side, GADGET-2's `PMGRID`. **Empty means the PM solver is not compiled in at all** — there is deliberately no default mesh size, since a plausible-but-wrong default here would be far more consequential than a tuning default. Setting it pulls in rocFFT and the PM orchestration sources. With `PERIODIC` the mesh is periodic; without it, the non-periodic isolated solver is compiled instead, which FFTs a doubled `2 × PMGRID` grid for zero padding and requires `--meshsize` at startup (`src/main.cpp:959-966`, `1950-1964`). |
-| `GADGET_HIP_HIGHRES` | `GADGET_HIP_HIGHRES` | `OFF` | `PLACEHIGHRESREGION`: a second, non-periodic mesh refining the high-res region, on top of the periodic one, as GADGET-2 does it, with the tree-side per-type `Rcut`/`Asmth` split that goes with it. Requires `GADGET_HIP_PMGRID`; refused together with `GADGET_HIP_QUADRUPOLE` (`CMakeLists.txt:272-280`). Works with or without `PERIODIC` — both are real GADGET-2 modes. The fine mesh is a doubled FFT like any isolated solve, so `GADGET_HIP_PMGRID=512` means a 1024³ fine transform. Note the silent-omission caveat above: without this option `--zoom-mask` is ignored rather than refused. |
+| `GADGET_HIP_HIGHRES` | `GADGET_HIP_HIGHRES` | `OFF` | `PLACEHIGHRESREGION`: a second, non-periodic mesh refining the high-res region, on top of the periodic one, as GADGET-2 does it, with the tree-side per-type `Rcut`/`Asmth` split that goes with it. Requires `GADGET_HIP_PMGRID`; refused together with `GADGET_HIP_QUADRUPOLE` (`CMakeLists.txt:272-280`). Works with or without `PERIODIC` — both are real GADGET-2 modes. The fine mesh is a doubled FFT like any isolated solve, so `GADGET_HIP_PMGRID=512` means a 1024³ fine transform. Without this option `--zoom-mask` is refused at startup rather than ignored. |
 | `GADGET_HIP_QUADRUPOLE` | `GADGET_HIP_QUADRUPOLE` → `_QUADRUPOLE_` | `OFF` | Adds quadrupole moment corrections to the tree force. Off by default to match GADGET-2, which is monopole-only by deliberate design. **Unusable in any TreePM build:** combined with `PMGRID` it is a hard `#error`, because there is no reference for how the short-range `erfc` suppression should apply to a quadrupole term and minimum-image wrapping was never added to the quadrupole accumulator (`CUDAkernels/dev_approximate_gravity_warp_new.cu:149-156`). Since `PERIODIC` implies `PMGRID`, this leaves non-periodic pure-tree runs as the only configuration that can use it. |
 
 ### Capability and limits

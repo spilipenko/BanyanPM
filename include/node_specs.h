@@ -297,8 +297,12 @@ inline int getTreeWalkBlocksPerSM(int devMajor, int devMinor)
 #define NTHREAD2 6
 
 #elif NTHREAD == 96
-
-#define NTHREAD2 7
+// REFUSED, deliberately. NTHREAD2 must be exactly log2(NTHREAD): the tree walk sizes its shared
+// memory as (1 << BLOCKDIM2) and derives its warp count as BLOCKDIM2 - WARP_SIZE2
+// (dev_approximate_gravity_warp_new.cu). 96 is not a power of two, so no NTHREAD2 is correct for
+// it -- the value that used to sit here, 7, is log2(128), which makes the walk reduce over four
+// warps when the block has three. That is a wrong answer, not a slow one.
+#error "NTHREAD=96 is not supported: NTHREAD must be a power of two (8, 16, 32, 64, 128, 256)."
 
 #elif NTHREAD == 128
 

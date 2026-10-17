@@ -30,6 +30,18 @@ mesh.
 Dark matter only. **There is no SPH, no gas, no cooling and no star formation**, and no MPI — one
 GPU, one process. Gas-related parameter keys are parsed and ignored.
 
+Three long-range configurations, all of them GADGET-2 modes, selected at build time:
+
+| | build | long-range force |
+|---|---|---|
+| **periodic box** | `PERIODIC` + `GADGET_HIP_PMGRID` | TreePM: minimum-image tree, periodic mesh |
+| **zoom** | the above + `GADGET_HIP_HIGHRES` | a second, non-periodic mesh refining the high-resolution region |
+| **isolated** | `GADGET_HIP_PMGRID` alone | non-periodic mesh on a zero-padded doubled grid, vacuum boundaries |
+
+`PERIODIC` without a mesh is refused at configure time — it would drop the long-range force with
+nothing computing it. The isolated mode needs `--meshsize` and places particles in the first half of
+the grid; see [`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md#non-periodic-isolated-runs).
+
 ## Build
 
 ```bash
