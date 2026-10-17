@@ -4,6 +4,13 @@ Compile-time options are in [`COMPILE_OPTIONS.md`](COMPILE_OPTIONS.md); paramete
 [`../examples/annotated.param`](../examples/annotated.param). This page covers the variables read
 from the environment at run time.
 
+**Every run prints its own configuration at startup**, on `stderr`, before the parameter file is
+read: a `[BUILD]` block listing every compile-time option with its state and what an `OFF` setting
+will refuse, and an `[ENV]` block listing every `GADGET_HIP_*` variable present in the environment
+with its value. Read that block rather than inferring the configuration from which features
+announce themselves. The `[ENV]` list is enumerated from the environment itself, so a **misspelled**
+variable appears in it too — which is how a typo becomes visible instead of silently doing nothing.
+
 Three things to know before the tables:
 
 - **How a value is read is not uniform.** Some variables are *presence-gated*: they take effect as

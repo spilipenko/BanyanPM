@@ -64,6 +64,157 @@ http://github.com/treecode/Bonsai
 #include "anyoption.h"
 #include "gadget_params.h"
 #include "gadget_snapshot.h"
+#include <unistd.h>
+#include <algorithm>
+#include <string>
+#include <vector>
+#include "node_specs.h"   // NLEAF/NCRIT/NTHREAD/LMEM_* for the build report below
+extern char **environ;
+
+// ---------------------------------------------------------------------------------------------
+// Startup configuration report: every compile-time option, and every GADGET_HIP_* variable
+// actually present in the environment.
+//
+// This exists because the two worst configuration mistakes in this project's history were both
+// invisible in a run's own log. A 28-run production suite silently used every-step PM because the
+// environment variable that selects the cadence was never set by the launching script, and a zoom
+// initial-conditions file was once run on a binary built without the zoom mesh. In both cases the
+// run completed, exited 0 and looked healthy. A log that states the configuration makes that class
+// of mistake visible at a glance instead of inferable from a feature's absence.
+//
+// Two deliberate design choices:
+//
+//  * The build block is a fixed list of #ifdefs, so it is compiled and cannot drift from reality.
+//  * The environment block is enumerated from `environ` rather than from a table of known names.
+//    A table would drift the way documentation does; scanning the environment is self-maintaining,
+//    reports exactly what was set, and shows a MISSPELLED variable too -- which a table keyed on
+//    correct names could never do.
+//
+// Everything goes to stderr, where the rest of the startup banner already goes, so one redirect
+// captures the whole configuration.
+// ---------------------------------------------------------------------------------------------
+static void gadget_hip_report_configuration()
+{
+  fprintf(stderr, "[BUILD] ---- compile-time configuration ----------------------------------\n");
+
+#ifdef NDEBUG
+  fprintf(stderr, "[BUILD] optimisation      : NDEBUG set (Release-style build)\n");
+#else
+  fprintf(stderr, "[BUILD] optimisation      : NDEBUG NOT set -- this is a debug build and is far "
+                  "slower; CMAKE_BUILD_TYPE=Release is expected for any real run\n");
+#endif
+
+#ifdef PERIODIC
+  fprintf(stderr, "[BUILD] PERIODIC          : ON  (minimum-image tree, TreePM split; the "
+                  "parameter file must set PeriodicBoundariesOn 1)\n");
+#else
+  fprintf(stderr, "[BUILD] PERIODIC          : OFF (the parameter file must set "
+                  "PeriodicBoundariesOn 0)\n");
+#endif
+
+#ifdef PMGRID
+  fprintf(stderr, "[BUILD] PMGRID            : %d\n", (int) PMGRID);
+#else
+  fprintf(stderr, "[BUILD] PMGRID            : not compiled in -- NO long-range force\n");
+#endif
+
+#ifdef _MAC_SPRINGEL_
+  fprintf(stderr, "[BUILD] MAC_SPRINGEL      : ON  (relative/Springel opening criterion; note the "
+                  "criterion is compile-time, so TypeOfOpeningCriterion 0 does NOT select "
+                  "geometric)\n");
+#else
+  fprintf(stderr, "[BUILD] MAC_SPRINGEL      : OFF (geometric/Barnes-Hut opening; "
+                  "TypeOfOpeningCriterion 1 is refused)\n");
+#endif
+
+#ifdef UNEQUALSOFTENINGS
+  fprintf(stderr, "[BUILD] UNEQUAL_SOFTENINGS: ON  (per-type softenings allowed)\n");
+#else
+  fprintf(stderr, "[BUILD] UNEQUAL_SOFTENINGS: OFF (more than one distinct non-zero Softening* is "
+                  "refused)\n");
+#endif
+
+#ifdef GADGET_HIP_HIGHRES
+  fprintf(stderr, "[BUILD] GADGET_HIP_HIGHRES: ON  (zoom: second, non-periodic fine mesh)\n");
+#else
+  fprintf(stderr, "[BUILD] GADGET_HIP_HIGHRES: OFF (no zoom mesh; --zoom-mask is refused)\n");
+#endif
+
+#ifdef GADGET_HIP_LONGIDS
+  fprintf(stderr, "[BUILD] GADGET_HIP_LONGIDS: ON  (on-disk particle IDs are 8 bytes)\n");
+#else
+  fprintf(stderr, "[BUILD] GADGET_HIP_LONGIDS: OFF (on-disk particle IDs are 4 bytes; an IC whose "
+                  "ID block is 8 bytes per particle is refused)\n");
+#endif
+
+#ifdef GADGET_HIP_UNIFIED_MEM
+  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: compiled in (host-buffer aliasing available; "
+                  "GADGET_HIP_UNIFIED_MEM=0 disables it at run time)\n");
+#else
+  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: not compiled in (every device buffer has a "
+                  "separate host copy)\n");
+#endif
+
+#ifdef GADGET_HIP_DETERMINISTIC_CIC
+  fprintf(stderr, "[BUILD] GADGET_HIP_DETERMINISTIC_CIC: ON  (fixed-point PM scatter: "
+                  "bit-reproducible, slower, one extra uint64 grid)\n");
+#else
+  fprintf(stderr, "[BUILD] GADGET_HIP_DETERMINISTIC_CIC: OFF (float atomics in the PM scatter -- "
+                  "runs are NOT bit-reproducible)\n");
+#endif
+
+#ifdef _QUADRUPOLE_
+  fprintf(stderr, "[BUILD] GADGET_HIP_QUADRUPOLE: ON  (quadrupole tree corrections; GADGET-2 is "
+                  "monopole-only)\n");
+#endif
+#ifdef GADGET_HIP_T20_DOUBLE_FORCE_ACCUM
+  fprintf(stderr, "[BUILD] GADGET_HIP_T20_DOUBLE_FORCE_ACCUM: ON (double-precision force "
+                  "accumulator)\n");
+#endif
+#ifdef GADGET_HIP_CB19_NO_RCUT_REJECT
+  fprintf(stderr, "[BUILD] GADGET_HIP_CB19_NO_RCUT_REJECT: ON (short-range Rcut node rejection "
+                  "DISABLED)\n");
+#endif
+#ifdef USE_MPI
+  fprintf(stderr, "[BUILD] MPI               : ON\n");
+#else
+  fprintf(stderr, "[BUILD] MPI               : OFF (single process)\n");
+#endif
+
+  // Sizing constants. These are header #defines rather than CMake options, and they set real
+  // limits -- the addressable particle count follows from NLEAF.
+  fprintf(stderr, "[BUILD] tree sizing       : NLEAF=%d NCRIT=%d NTHREAD=%d MAXLEVELS=%d\n",
+          (int) NLEAF, (int) NCRIT, (int) NTHREAD, (int) MAXLEVELS);
+  fprintf(stderr, "[BUILD] walk stack        : LMEM_STACK_SIZE=%d LMEM_EXTRA_SIZE=%d\n",
+          (int) LMEM_STACK_SIZE, (int) LMEM_EXTRA_SIZE);
+  {
+    // LEAFBIT = 32 - log2(NLEAF); the leaf indirection packs the count above the index.
+    int leafbit = 32; for (int v = (int) NLEAF; v > 1; v >>= 1) leafbit--;
+    fprintf(stderr, "[BUILD] particle ceiling  : 2^%d = %llu (set by NLEAF; a larger run is "
+                    "refused at allocation)\n",
+            leafbit, (unsigned long long) 1ull << leafbit);
+  }
+
+  // ---- the environment ----------------------------------------------------------------------
+  std::vector<std::string> set;
+  for (char **e = environ; e && *e; ++e)
+    if (strncmp(*e, "GADGET_HIP_", 11) == 0)
+      set.push_back(std::string(*e));
+  std::sort(set.begin(), set.end());
+  if (set.empty())
+    fprintf(stderr, "[ENV]   no GADGET_HIP_* variables set -- every runtime switch is at its "
+                    "default\n");
+  else
+  {
+    fprintf(stderr, "[ENV]   %zu GADGET_HIP_* variable(s) set:\n", set.size());
+    for (size_t i = 0; i < set.size(); ++i)
+      fprintf(stderr, "[ENV]     %s\n", set[i].c_str());
+    fprintf(stderr, "[ENV]   (listed as found in the environment; a name that is not a switch this "
+                    "build reads will appear here too, which is how a misspelling shows up)\n");
+  }
+  fprintf(stderr, "[BUILD] ----------------------------------------------------------------\n");
+}
+
 
 #include <array>
 
@@ -825,6 +976,10 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
       fprintf(stderr, "%s", report.c_str());
       ::exit(ok ? 0 : 1);
     }
+
+    // Record the configuration BEFORE the parameter file is read, so a run that is then refused
+    // still leaves behind what it was built as -- which is usually the thing you need to know.
+    gadget_hip_report_configuration();
 
     // Phase 5 ticket 01 (PLAN.md): --param is additive, parsed here (after every CLI value above
     // is already extracted, before anything downstream consumes theta/errTolForceAcc/boxSize/

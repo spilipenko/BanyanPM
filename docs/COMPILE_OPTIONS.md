@@ -11,6 +11,16 @@ there is no confusion about which is which.
 
 ---
 
+## The binary tells you how it was built
+
+Every run prints a `[BUILD]` block on `stderr` before it reads the parameter file, listing every
+option below with its state — and, for the ones that are `OFF`, what the binary will therefore
+refuse. An `[ENV]` block follows with every `GADGET_HIP_*` variable set in the environment. If you
+are unsure what a build is, run it with a nonexistent parameter file and read the block; it prints
+before anything can fail.
+
+A debug build says so there too, which is worth checking before reporting a performance problem.
+
 ## Read this first: four options whose omission is not a build error
 
 Every option in this document defaults to **OFF**, and the two most important of them —
