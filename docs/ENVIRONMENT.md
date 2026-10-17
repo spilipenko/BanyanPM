@@ -1,100 +1,100 @@
 # Runtime environment variables
 
-The port carries ~90 environment switches. They fall into two groups, and the distinction is the
-important part:
+Compile-time options are in [`COMPILE_OPTIONS.md`](COMPILE_OPTIONS.md); parameter-file keys are in
+[`../examples/annotated.param`](../examples/annotated.param). This page covers the variables read
+from the environment at run time.
 
-- **Behaviour switches** — documented below. Each has a default that is the intended production
-  behaviour; the variable exists so the *other* setting can be measured against it on the same
-  binary. That is how every performance and physics claim in this project was established: same
-  binary, same state, one variable changed.
-- **Audit probes** — named after the ticket or contract that introduced them (`GADGET_HIP_T<nn>_*`,
-  `GADGET_HIP_C<A-D><nn>_*`). Off by default, usually printing statistics or enabling a one-off
-  trace. They are development instruments. The authoritative description of each is the ticket it
-  is named for.
+Three things to know before the tables:
 
-Unless stated otherwise, a variable is enabled by being set to any value (`=1` by convention) and
-disabled by being unset.
+- **How a value is read is not uniform.** Some variables are *presence-gated*: they take effect as
+  soon as they exist in the environment, whatever their value — `VAR=0` enables them just like
+  `VAR=1`. Others are parsed with `atoi`/`atof`, so `VAR=0` genuinely means off. The *How it is
+  read* column says which, for every variable. Do not assume `=0` disables something.
+- **Diagnostic vs. result-changing.** Variables marked **diagnostic** do not alter the trajectory.
+  They cost wall-clock time — some add device synchronisations and so perturb kernel overlap, some
+  copy buffers back to the host every step — but the physics is unchanged. Variables marked
+  **changes results** alter what the run computes.
+- Everything is read once, on first use, and cached. Changing a variable mid-run is not possible,
+  and these are read from the environment only — there is no parameter-file equivalent.
 
----
-
-## Behaviour switches
-
-### Logging and profiling
-
-| Variable | Default | Effect |
-|---|---|---|
-| `GADGET_HIP_DEBUG` | off | Per-step developer probes: device pointer ranges, buffer sizes, group-max traces, windowed buffer dumps. Same as `--debug`. In a 512³ run these were ~60% of all log lines. |
-| `GADGET_HIP_PHASE_TIME` | off | Per-step phase timers (`predict`, `sort_bodies`, `build_tree`, `approximate_gravity`, `PM + long-range`, `correct`, `STEP TOTAL`) plus sub-phase timers inside the PM solve. Both sides device-synced, so they time work rather than kernel-launch latency — which also means enabling them perturbs overlap. |
-| `GADGET_HIP_PROPS_TIME` | off | Timers for the tree-properties stage. |
-| `GADGET_HIP_MEMREPORT` | off | Per-buffer device memory report. |
-| `GADGET_HIP_NO_CPU_LOG` | off | Disable `cpu.txt` and, with it, the per-phase device syncs that produce it. Also the A/B control for measuring what those syncs cost. |
-| `GADGET_HIP_INVARIANTS` | off | Runtime invariant checks, including full-precision `t_current` printing (`%.9g`). Useful when a step looks like it is not advancing: the `iter=` line's six significant figures can hide a step that is genuinely tiny. |
-
-### Physics and performance
-
-| Variable | Default | Effect |
-|---|---|---|
-| `GADGET_HIP_PM_CIC` | `1` | `1` = transposed thread→particle mapping in the PM mass assignment. `0` = the legacy mapping, in which Peano-Hilbert-sorted particles put a whole wavefront on the same eight grid addresses and the atomics serialise. The default is **34× faster** at z=0 and sums the same contributions. |
-| `GADGET_HIP_NO_BOX_WRAP` | off | Disables mapping particles back into the periodic box each step. Set it only to reproduce the pre-fix behaviour: with it set, coordinates accumulate their unwrapped trajectory and any downstream tool that assumes periodic coordinates gets wrong answers. |
-| `GADGET_HIP_ENERGY_EVERY_STEP` | off with `--param` | Compute global energies every step instead of at `TimeBetStatistics` cadence. Gadget uses the cadence; every-step evaluation cost 9.5 s of a 14.9 s step at 512³. Runs without `--param` use every-step, since there is no cadence to follow. |
-| `GADGET_HIP_PM_CADENCE` | off | Recompute the PM mesh on its own cadence instead of every step. **Leave off.** As implemented, the long-range force is folded into the active particles' acceleration, so with a cadence inactive particles never receive the long-range impulse; this cost 11% in kinetic energy by z=0. |
-| `GADGET_HIP_PM_EVERY_STEP` | on | Forces PM every step (the default when the cadence is off). |
-| `GADGET_HIP_PM_NO_IDSPACE` | off | Disables the id-space fast path for storing PM forces across steps. |
-| `GADGET_HIP_T35_NO_DEVICE_SOFT` | off | Recompute per-particle softening on the host instead of the device. The device path was verified bit-exact over 60 steps; the host path costs 1.78 s/step against 0.012 s at 512³. |
-| `GADGET_HIP_T35_NO_DEVICE_DT` | off | Reduce timestep globals on the host instead of the device. The host path adds a 4.8 GB device→host copy every step. |
-| `GADGET_HIP_T35_DT_CROSSCHECK` | off | Run both timestep reductions and compare. |
-| `GADGET_HIP_CD13` | on | The bin-growth synchronisation rule: a particle may lengthen its timestep only when its end tick is divisible by the new step. Disabling it is the A/B control for that rule. |
-| `GADGET_HIP_CD04_LADDER` | on | Anchor the timestep ladder to the run's timeline span. |
-| `GADGET_HIP_TREE_ALLOC_FACTOR` | — | Override the tree allocation factor. |
-| `GADGET_HIP_LAUNCH_BLOCKS`, `GADGET_HIP_LAUNCH_THREADS` | — | Override kernel launch geometry. |
+The code also contains internal bisection and instrumentation switches, named after the
+investigation that introduced them. They are not part of the supported interface, are off (or
+already at their intended setting) by default, and are not documented here.
 
 ---
 
-## Audit probes
+## Long-range force cadence
 
-Off by default. Each is tied to the ticket or contract in its name; that ticket is the accurate
-description of what it does and what it was used to establish.
+These exist only in a build configured with `PERIODIC` and `GADGET_HIP_PMGRID` — without the
+particle-mesh solver there is no long-range force to schedule.
 
-```
-GADGET_HIP_CA01_AUDIT            GADGET_HIP_CA01_CC_SKIP        GADGET_HIP_CA01_CELL_CENTER
-GADGET_HIP_CA07                  GADGET_HIP_CB19_NO_RCUT_REJECT GADGET_HIP_CD01_STATS
-GADGET_HIP_CD01_TRACE            GADGET_HIP_CD02_KICK_TEND      GADGET_HIP_CD03B_FIX_INDEX
-GADGET_HIP_CD03_STRICT_ACTIVE    GADGET_HIP_CD08_STATS          GADGET_HIP_CD13_STATS
-GADGET_HIP_COMOVING_DE_CHECK     GADGET_HIP_COMPACT_GROUPS      GADGET_HIP_DUMP_ACC
-GADGET_HIP_DUMP_ACC_ITER         GADGET_HIP_DUMP_ACC_WARM       GADGET_HIP_ENERGY_EXTRAP
-GADGET_HIP_EPOT_EXTRAP_CHECK     GADGET_HIP_EPOT_TOPN           GADGET_HIP_GROUP_CORNER_DUMP
-GADGET_HIP_GROUP_CORNER_STATS    GADGET_HIP_KICK_EXTRAP_CHECK   GADGET_HIP_NACTIVE_DUMP
-GADGET_HIP_NTAB                  GADGET_HIP_POISON              GADGET_HIP_SPIKE
-GADGET_HIP_STAGE_TRACE           GADGET_HIP_T10_GROUP_SHIFT     GADGET_HIP_T11_PROX_CENTER
-GADGET_HIP_T1_AOLD_REDUCE        GADGET_HIP_T24_ACC1_TOPN       GADGET_HIP_T24_NODE_SCAN
-GADGET_HIP_T24_NODE_WINDOW       GADGET_HIP_T24_WINDOW          GADGET_HIP_T26_BJ_DIST
-GADGET_HIP_T26_BJ_DIST_BOXSIZE   GADGET_HIP_T26_BJ_DIST_EVERY   GADGET_HIP_T27_DISABLE_BOX_FLOOR
-GADGET_HIP_T27_SOFT_COEF         GADGET_HIP_T28_BOXSIZE         GADGET_HIP_T28_DISABLE
-GADGET_HIP_T28_NODESOFT          GADGET_HIP_T28_STATS           GADGET_HIP_T28_TRACE
-GADGET_HIP_T31_BISECT            GADGET_HIP_T31_FORCE_GEO       GADGET_HIP_T31_SKIP_GMA
-GADGET_HIP_T31_STATS             GADGET_HIP_T31_TIME_WALK       GADGET_HIP_T4_COUNT
-GADGET_HIP_T4_FIX_G              GADGET_HIP_T6_DRIFT_TP         GADGET_HIP_T7_INJECT
-GADGET_HIP_T9_CELLSIZE_BJ        GADGET_HIP_T9_CELLSIZE_GEO     GADGET_HIP_T9_NO_S
-GADGET_HIP_TRACE_DUP             GADGET_HIP_TRACE_Y             GADGET_HIP_TRACE_Y_DUMP
-GADGET_HIP_TRACE_Y_GROUP         GADGET_HIP_TRACE_Y_VERBOSE     GADGET_HIP_TRAJ_DUMP
-GADGET_HIP_TRAJ_IDS              GADGET_HIP_TRAJ_UNSORTED_DUMP  GADGET_HIP_RESTART_MAGIC
-GADGET_HIP_RESTART_VERSION
-```
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_PM_CADENCE` | **on** | `atoi() != 0` | **Changes results.** Solve the particle mesh on GADGET's own PM cadence — the largest power-of-two tick count on the integer timeline not exceeding `dt_displacement` — rather than every step. The stored long-range force is then applied as a separate kick spanning the PM interval, midpoint to midpoint, to every particle exactly once per interval, which is how GADGET-2 applies it (`advance_and_find_timesteps`). Set `GADGET_HIP_PM_CADENCE=0` to recompute the mesh every step instead; that is the more accurate mode and costs roughly 14% of wall clock in PM. |
+| `GADGET_HIP_PM_EVERY_STEP` | unset | **presence** | **Changes results.** Force the mesh to be recomputed every step. Equivalent to `GADGET_HIP_PM_CADENCE=0`. Presence-gated: `GADGET_HIP_PM_EVERY_STEP=0` still selects every-step. |
+| `GADGET_HIP_PM_INTERVAL_SHIFT` | `0` | `atoi()` | **Changes results.** Shorten the PM interval by a factor `2^k`. Only meaningful while the cadence is active. The long-range kick is a midpoint rule, so its deviation from an every-step run falls roughly fourfold per halving of the interval; this is the knob for checking that convergence, and for buying accuracy back at a known cost. |
 
-Several of these select between a legacy behaviour and a corrected one and are **on** by default
-(`GADGET_HIP_T9_CELLSIZE_GEO`, `GADGET_HIP_T9_CELLSIZE_BJ`, `GADGET_HIP_T9_NO_S`,
-`GADGET_HIP_T11_PROX_CENTER`, `GADGET_HIP_CA01_CELL_CENTER`, `GADGET_HIP_CD02_KICK_TEND`,
-`GADGET_HIP_CD03_STRICT_ACTIVE`, `GADGET_HIP_CD03B_FIX_INDEX`, `GADGET_HIP_ENERGY_EXTRAP`,
-`GADGET_HIP_CD04_LADDER`, `GADGET_HIP_T6_DRIFT_TP`). The startup banner prints the active setting
-for each, so the log records which physics the run actually used — check that banner before
-comparing two runs.
+The cadence engages only when the run can support it: comoving integration must be on (the kick
+needs the drift and kick factor tables) and particle IDs must be dense over `0 .. N-1` (the stored
+force is kept in ID space so that it survives the per-step spatial re-sort). If either condition
+fails, the run falls back to recomputing the mesh every step regardless of these variables. Which
+mode is actually in effect is printed once, at the first PM step, on `stderr`.
 
-## Zoom and short-range-cutoff diagnostics
+## Short-range cutoff geometry
 
-| variable | effect |
-|---|---|
-| `GADGET_HIP_T55_RCUT_MODE` | Geometry of the `Rcut` node prune. `0` = Euclidean gap vs `Rcut` (a sphere; the pre-fix behaviour, kept so the change can be A/B'd in one binary), `1` = per-axis gap vs `Rcut` (GADGET's geometry, **the default**), `2` = per-axis gap vs `6*Asmth`, the erfc table's own reach. Mode 2 is a guaranteed superset of everything that can contribute and buys nothing measurable over mode 1 — the residual there is the opening criterion's own error, not truncation — while costing 8.9% on the walk against mode 1's 3.2%. |
-| `GADGET_HIP_T50_NO_PURE_PRUNE` | Forces every group back onto `max(Rcut[0], Rcut[1])`, undoing the per-group refinement that lets a group of purely high-res targets prune at its own smaller `Rcut[1]`. A/B only. |
-| `GADGET_HIP_DUMP_SPLIT` | Path for a per-particle force dump with the three components **separate** — tree, coarse mesh, fine (zoom) mesh — captured at the last point in the step where all three still exist independently. Written at iteration `GADGET_HIP_DUMP_ACC_ITER` (default 0). Values are pre-`G`, with `G` and the zoom region's geometry in the header. The point of the split is attribution: `GADGET_HIP_DUMP_ACC` writes the already-summed acceleration, so a disagreement with GADGET can be seen there but not pinned on a mesh. The fine column records the force the code *applies*, i.e. after the type mask. |
-| `GADGET_HIP_CELL_WATER` | Report the tree walk's per-step cell-list high-water mark against its capacity, plus forced-descent counts, big-stack retries, and the pure/mixed/coarse group split. Printed unconditionally whenever a retry occurs; this variable makes it print every step. The frontier is what decides whether the walk's fixed-size buffer is close to overflowing. |
-| `GADGET_HIP_PM_STALENESS` | On a PM-cadence run, report `rms|da|/|a|` between the freshly-solved long-range force and the one the run has been using since the previous PM step — measured at the one instant both exist, rather than inferred from two runs. |
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_T55_RCUT_MODE` | `1` | `atoi()` | **Changes results.** Geometry used to reject tree nodes beyond the short-range cutoff `Rcut`. `1` — per-axis gap against `Rcut`, which is GADGET's own test, and the default. `2` — per-axis gap against `6*Asmth`, the reach of the short-range force table itself; a guaranteed superset of everything that can contribute, and correspondingly more expensive in the walk. `0` — Euclidean gap against `Rcut`, a sphere inscribed in GADGET's box, which discards short-range contributions GADGET keeps. When set, the selected mode is echoed on `stderr`. |
+
+## Memory and problem size
+
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_UNIFIED_MEM` | `1` | `atoi() != 0` | Alias pinned host buffers as device memory instead of allocating a separate device copy, roughly halving the per-particle footprint. Read **only** in a binary configured with `-DGADGET_HIP_UNIFIED_MEM=ON`; in any other build it is ignored and the separate device copy is always made. Set `0` to turn the aliasing off at run time, without a rebuild. Correctness is unaffected either way; aliased buffers run at about 0.94–0.99 of device-memory bandwidth depending on the access pattern, so write-heavy kernels pay a few percent. |
+| `GADGET_HIP_UNIFIED_ARRAYS` | all bits set | `strtoll()`, base-prefixed | Bitmask selecting which of the aliasable buffers actually alias, when `GADGET_HIP_UNIFIED_MEM` is on. The default enables every one. Its use is to narrow the aliasing to a subset — either to recover a run if one buffer behaves badly on unfamiliar hardware, or to attribute a cost or a result difference to a specific buffer. The bit assignments are the `AliasId` enum in `include/my_cuda_rt.h`. |
+| `GADGET_HIP_TREE_ALLOC_FACTOR` | unset | `atof()`, used if `> 0` | Override the tree allocation factor — the headroom multiplier on the node arrays. When unset, the parameter file's `TreeAllocFactor` is used if positive, otherwise the built-in default of `0.8`. Any effective value below `0.05` is clamped up to `0.05`. This is the only way to set the factor for runs started without a parameter file (`--plummer`, `--direct` and the other built-in generators). |
+
+## Tree-walk launch tuning
+
+Neither chunking nor the launch overrides changes the set of interactions evaluated. Chunking
+changes only the order in which groups are dispatched, so results move by the same floating-point
+summation order that the walk's atomics already introduce.
+
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_WALK_CHUNKS` | unset (adaptive) | `atoi()` | Number of dispatches the tree walk is split into. Unset or negative sizes the split adaptively from the previous step's measured walk time; `0` issues the walk as a single dispatch; a positive value forces exactly that many chunks. Splitting the walk bounds how long any one kernel launch occupies the GPU, which matters where a long-running kernel can trip a device watchdog. The first walk of a run has no measurement to work from and starts at 16 chunks. |
+| `GADGET_HIP_WALK_CHUNK_MS` | `300.0` | `atof()` | Target wall time per chunk, in milliseconds, for the adaptive sizing above. Ignored when `GADGET_HIP_WALK_CHUNKS` forces a count. |
+| `GADGET_HIP_LAUNCH_THREADS` | `0` | `atoi()`, used if `> 0` | Override the thread-block size of the tree-walk kernel. `0` keeps the compiled-in geometry. **The kernel's warp-cooperative reductions assume a full 32-lane warp and are not templated on lane count**, so values that do not provide one are not safe. |
+| `GADGET_HIP_LAUNCH_BLOCKS` | `0` | `atoi()`, used if `> 0` | Override the grid size of the tree-walk kernel. `0` keeps the compiled-in value. |
+
+Setting either launch override prints the resulting geometry, alongside the defaults it replaced,
+on `stderr`.
+
+## Fallbacks and compatibility
+
+Not needed in normal use. Each exists because the behaviour it selects is occasionally the one you
+want — either to work around a device-side problem, or to reproduce output that another tool
+expects.
+
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_PM_CIC` | `1` | `atoi()` | Thread-to-particle mapping in the particle-mesh mass assignment. `1`, the default, is transposed so that Peano-Hilbert-sorted neighbours do not all target the same few grid cells; `0` is the direct mapping, where a whole wavefront collides on eight addresses and the atomics serialise. Both sum the same set of contributions, but in a different order, so results differ in the last bits — not bit-identical. There is no reason to set `0` except to reproduce output from a run that did. |
+| `GADGET_HIP_NO_BOX_WRAP` | unset | **presence** | **Changes results, and breaks downstream tools.** Stops mapping particle coordinates back into the periodic box each step, so positions accumulate their unwrapped trajectory. Snapshots then carry coordinates outside `[0, BoxSize)`, and any analysis assuming periodic coordinates — halo finders included — gives wrong answers without complaining. Read only in a `PERIODIC` build. |
+| `GADGET_HIP_T35_NO_DEVICE_DT`, `GADGET_HIP_T35_NO_DEVICE_SOFT` | unset | **presence** | Route the per-particle timestep-globals reduction, and the softening lookup, through the host instead of the device kernel. Both are substantially slower — the first copies the particle arrays to the host every step. They exist as a fallback should the device path stall on a particular driver or device, and as a cross-check that the two paths agree. |
+
+## Logging, timing and diagnostics
+
+All **diagnostic**: none of these changes the trajectory. Several add device synchronisations or
+host copies and so cost wall-clock time; where that cost is large it is noted.
+
+| Variable | Default | How it is read | Effect |
+|---|---|---|---|
+| `GADGET_HIP_DEBUG` | unset | **presence** | Verbose developer logging: device pointer ranges, buffer sizes, group-max traces, windowed buffer dumps. Identical to the `--debug` flag. Voluminous — at large particle counts this is the majority of all log output. |
+| `GADGET_HIP_PHASE_TIME` | unset | **presence** | Per-step phase timers on `stderr` (`predict`, `sort_bodies`, `build_tree`, `approximate_gravity`, `PM + long-range`, `correct`, `STEP TOTAL`), plus sub-phase timers inside the PM solve. Both ends of every phase are device-synced, so the numbers measure work rather than launch latency — which also means enabling them removes the overlap between phases and lengthens the step. |
+| `GADGET_HIP_PROPS_TIME` | unset | **presence** | Wall time of the tree-properties stage, per step, with the stream synced on both sides. |
+| `GADGET_HIP_MEMREPORT` | `0` | `atoi() != 0` | Per-buffer device memory report at each allocation stage. Each row states whether the host side is pinned and whether the buffer has a separate device copy at all, so the total reflects the real footprint rather than counting a shared allocation twice. |
+| `GADGET_HIP_NO_CPU_LOG` | unset | **presence** | Stop writing `cpu.txt`, and with it the per-phase device synchronisations needed to produce it. `cpu.txt` is written by default, but only for runs started with `--param`, since it needs an `OutputDir`. Use this to recover the overlap those synchronisations cost. |
+| `GADGET_HIP_INVARIANTS` | unset | **presence** | Runtime invariant checks, one line per check on `stderr`: the tree's leaves exactly tile `[0, N)`, `t_current` is exactly the minimum over every particle's next-step time, per-particle force softening is strictly positive, and buffers expected to be duplicates of one another are. Also prints `t_current` at full precision (`%.9g`), which the ordinary step line's six significant figures can hide — useful when a step looks as though it is not advancing. Costs several device-to-host copies per step. |
+| `GADGET_HIP_ENERGY_EVERY_STEP` | off with `--param`, on without | `atoi() != 0` | Evaluate the global energies every step instead of at the parameter file's `TimeBetStatistics` cadence. GADGET uses the cadence, and every-step evaluation is expensive at large `N`: it forces a fresh long-range potential solve on every step. Runs started without `--param` have no cadence to follow and so evaluate every step by default. |
+| `GADGET_HIP_CELL_WATER` | unset | **presence** | Report the tree walk's per-step cell-list high-water mark against its capacity, plus forced-descent counts, big-stack retries, and the pure/mixed/coarse split of zoom groups. The frontier figure is what says how close the walk's fixed-size buffer is to overflowing. A big-stack retry serialises a group through a GPU-wide spin lock and is never normal, so retries are reported whether or not this is set; the variable makes the line print every step. |
+| `GADGET_HIP_NACTIVE_DUMP` | unset | **presence** | Print the genuine active-particle count per step, read back from the tree walk's own output mask rather than from a host-side counter. Costs one device-to-host copy and an `O(N)` host pass per step. |

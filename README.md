@@ -50,13 +50,23 @@ make -C build -j12 gadget_hip
 | `UNEQUAL_SOFTENINGS` | Required whenever particle types do not share a softening. |
 | `GADGET_HIP_HIGHRES` | The second, non-periodic mesh for zoom runs. |
 | `GADGET_HIP_UNIFIED_MEM` | Host-buffer aliasing for large runs — see [Memory](#memory-and-problem-size). |
-| `GADGET_HIP_LONGIDS` | 64-bit particle IDs. |
+| `GADGET_HIP_LONGIDS` | 64-bit particle IDs. Matched against the IC's `ID` block width, not sniffed. |
 
-`PERIODIC` and `MAC_SPRINGEL` both default to **OFF**, and neither is namespaced. Omitting either
-produces a binary that builds and then **refuses the parameter file at startup** — without
-`PERIODIC` it rejects `PeriodicBoundariesOn 1`, without `MAC_SPRINGEL` it rejects
-`TypeOfOpeningCriterion 1`. The binary refuses a criterion mismatch rather than silently
-substituting the one it was built with.
+Fifteen options and four sizing constants exist in total; the table above is the set that matters
+for a first build. **[`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md)** documents every one,
+including the header constants that set the tree and group sizes, and which combinations are
+refused at configure time.
+
+**Four options build cleanly and then refuse at startup if they are missing** — `PERIODIC`,
+`MAC_SPRINGEL`, `UNEQUAL_SOFTENINGS` and `GADGET_HIP_LONGIDS`. `PERIODIC` and the ID width are
+matched in *both* directions, so a build also refuses inputs that need the option left off. Full
+table, with the exact messages, in
+[`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md#read-this-first-four-options-whose-omission-is-not-a-build-error).
+
+One asymmetry to know: `TypeOfOpeningCriterion 1` on a binary built without `MAC_SPRINGEL` is
+refused, but `TypeOfOpeningCriterion 0` on a binary built *with* it is **not** — the criterion is
+compile-time, so the relative MAC runs whatever the parameter file asks for. The `[INIT] MAC:` line
+in the log records which criterion is actually in force; check it before comparing runs.
 
 **MPI is not needed.** The solver contains no MPI references at all; only three legacy utilities
 inherited from Bonsai do, and they are off by default (`-DGADGET_HIP_BUILD_BONSAI_TOOLS=ON` builds
@@ -77,8 +87,10 @@ Output: `snapshot_NNN` (GADGET-2 format 1 or 2), `info.txt` (GADGET's per-step l
 (cumulative per-phase timings in GADGET-2's own 18-column format, so it diffs directly against a
 GADGET-2 run's file). Energies go to stdout; **no `energy.txt` is written**.
 
-Runtime switches are documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md). The two worth
-knowing before a first run:
+Build options are documented in [`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md), runtime
+switches in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md), and every parameter-file key in
+[`examples/annotated.param`](examples/annotated.param). The two switches worth knowing before a
+first run:
 
 | variable | default | effect |
 |---|---|---|
@@ -114,11 +126,12 @@ timestep sequence.
 
 ### The particle ceiling is 2²⁸ = 268,435,456, and the build enforces it
 
-The tree's leaf indirection packs a leaf's particle count into the top 4 bits of a 32-bit word and
-the index of its first body into the remaining 28, so 2²⁸ particles is the addressable limit at the
-shipping `NLEAF`. A run above it **refuses at allocation time**, naming the field and the limit,
-rather than truncating the index and walking the wrong particles. Smaller `NLEAF` buys index bits
-(`LEAFBIT = 32 − log2(NLEAF)`) at an accuracy and performance cost.
+The tree's leaf indirection packs a leaf's particle count and the index of its first body into one
+32-bit word, giving `LEAFBIT = 32 − log2(NLEAF)` bits of index — 28 at the shipping `NLEAF = 16`,
+hence 2²⁸ particles. A run above `2^LEAFBIT` **refuses at allocation time**, naming the field and
+the limit, rather than truncating the index and walking the wrong particles. The guard follows the
+formula, so changing `NLEAF` moves it: a smaller `NLEAF` buys index bits at an accuracy and
+performance cost.
 
 Three index structures are watched on every tree rebuild under `GADGET_HIP_INVARIANTS=1`: that
 leaves partition `[0, N)` exactly, that groups tile it contiguously in group order, and that the
@@ -364,8 +377,9 @@ configuration and failing if any check accepts it — a gate nobody has seen fai
 Every threshold is a measured noise floor, documented with the measurement in
 [`tests/gate64/README.md`](tests/gate64/README.md).
 
-It also verifies that the binary under test is the configuration the gate describes, which catches
-a missing `PERIODIC` or `MAC_SPRINGEL` before any physics runs.
+It also verifies that the binary under test is the configuration the gate describes: the
+`PMGRID=64` banner is asserted directly, and a missing `MAC_SPRINGEL` is caught indirectly, because
+the gate's parameter file asks for `TypeOfOpeningCriterion 1` and the binary then refuses it.
 
 `tests/zoom/run.sh` covers the zoom path's host-side geometry — chiefly that the periodic centring
 is exact when it claims to be and refuses when it cannot be, since a wrong answer there mis-places
@@ -457,8 +471,18 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   overshooting by up to one system step — 1.6e-3 in `a` on the run it was checked against. The
   epoch error is reported per snapshot. Reduce `MaxSizeTimestep` if tighter output epochs matter.
   **Open**, and the fix is a drift-to-output.
-- Unsupported parameter keys: `TreeDomainUpdateFrequency`, `TypeOfTimestepCriterion`,
-  `PartAllocFactor`, and all SPH keys.
+- **Parameter keys that are accepted and then ignored**, which is worth checking against your own
+  file: the five output-filename keys `EnergyFile`, `CpuFile`, `InfoFile`, `TimingsFile` and
+  `RestartFile` (these names are fixed — `cpu.txt` and `info.txt` — and the checkpoint path comes
+  from `--restart-file`), `ResubmitOn`, `ResubmitCommand`, `TreeDomainUpdateFrequency`,
+  `BufferSize`, `PartAllocFactor`, and the seven SPH keys. `PartAllocFactor` and `BufferSize` look
+  like memory controls and are not: allocation is sized from the actual particle count.
+- Two keys are **validated rather than ignored**: `TypeOfTimestepCriterion` must be `0` and
+  `NumFilesWrittenInParallel` must be `1`; any other value is refused at startup.
+- **Every one of GADGET-2's 65 parameter keys is required, and any key outside that set is a fatal
+  error** — there is no ignore-unknown mode, so a file carrying keys from GADGET-3, AREPO or an
+  optional GADGET-2 module will not start. A stock GADGET-2 gravity-only file is accepted verbatim.
+  `examples/annotated.param` is a complete working file with every key annotated.
 
 ---
 

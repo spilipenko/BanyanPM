@@ -153,8 +153,8 @@ if(GADGET_HIP_DETERMINISTIC_CIC)
 endif()
 
 # Phase 3 NCRIT=32-vs-64 experiment: group size (i-particle group / GOTHIC pseudo-particle size),
-# same CMake-option convention as MAC_SPRINGEL above -- node_specs.h defaults to 64 if NCRIT isn't
-# defined on the command line.
+# same CMake-option convention as MAC_SPRINGEL above -- node_specs.h defaults to 32 if NCRIT isn't
+# defined on the command line (the cache docstring below says 32; this comment used to say 64).
 set(GADGET_HIP_NCRIT "" CACHE STRING "Override NCRIT (group size); empty = node_specs.h default (32)")
 if(GADGET_HIP_NCRIT)
   add_definitions(-DNCRIT=${GADGET_HIP_NCRIT})

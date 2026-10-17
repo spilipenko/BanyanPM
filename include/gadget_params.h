@@ -42,7 +42,13 @@ struct GadgetParams
   // the wrong snapshots and only shows it at analysis time.
   std::vector<double> OutputListTimes;
   double Omega0 = 0.0;
-  double OmegaBaryon = 0.0;          // SPH/cooling-only in this source tree; parsed, never consumed
+  double OmegaBaryon = 0.0;          // CONSUMED, despite there being no gas: the displacement
+                                     // limit takes each type's own Omega share, and for every
+                                     // type except 0 that share is (Omega0 - OmegaBaryon)
+                                     // (gadget_cosmology.cpp, timestep.c:606-618). So a DM-only
+                                     // run copied from a hydro parameter file gets a mean
+                                     // interparticle spacing, and hence a dt_displacement, set
+                                     // from Omega0 minus the baryons it does not have.
   double OmegaLambda = 0.0;
   double HubbleParam = 0.0;          // "little h" -- header/output bookkeeping only, not used to
                                       // rescale internal G/Hubble (spec Sec 1.5, tag 15)

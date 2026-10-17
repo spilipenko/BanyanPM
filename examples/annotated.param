@@ -1,0 +1,423 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  ANNOTATED PARAMETER FILE
+%
+%  A complete, runnable GADGET-2 parameter file for a periodic, dark-matter-only cosmological
+%  run, with every key annotated. Run it with:
+%
+%      ./build/gadget_hip --param examples/annotated.param
+%
+%  The binary must have been configured with PERIODIC=ON (which also requires a PM mesh,
+%  GADGET_HIP_PMGRID) for this file to be accepted -- see "PeriodicBoundariesOn" below.
+%
+%  ------------------------------------------------------------------------------------------
+%  HOW TO READ THIS FILE
+%
+%  Each key carries a status word first, so the file can be skimmed:
+%
+%    [HONOURED]     read and acted on.
+%    [REQUIRED]     must be present, and a particular value is enforced or refused.
+%    [CONDITIONAL]  only takes effect when another key, or a build option, is active.
+%    [IGNORED]      accepted so that a stock GADGET-2 parameter file is portable unchanged,
+%                   but the value is never read. Setting it has no effect of any kind.
+%
+%  Every one of the 65 keys below is MANDATORY regardless of its status: a missing key is a
+%  fatal error, there are no defaults, and the keys with status [IGNORED] still have to be
+%  present. That matches stock GADGET-2, whose parameter files also list all 65
+%  unconditionally.
+%
+%  ------------------------------------------------------------------------------------------
+%  SYNTAX
+%
+%    * One "Key Value" pair per line, separated by whitespace. Values cannot contain spaces.
+%    * '%' is the ONLY comment character, and only when it is the first non-blank character
+%      on the line. '#' and ';' are NOT comment characters: a line beginning "# note" is read
+%      as a key named "#" and aborts the run.
+%    * Anything after the value on a key line is discarded, so an end-of-line remark works:
+%          Omega0   0.3    % matter density
+%    * A line with fewer than two whitespace-separated tokens is skipped, so fully blank
+%      lines are fine.
+%    * An unrecognised key is a FATAL ERROR, not a warning and not silently skipped. So is a
+%      key given twice, and so is a key left out. All problems found are reported together.
+%    * Keys may appear in any order.
+%
+%  ------------------------------------------------------------------------------------------
+%  SEE ALSO
+%
+%    docs/ENVIRONMENT.md       runtime switches (environment variables)
+%    docs/COMPILE_OPTIONS.md   build-time options (CMake), several of which decide whether a
+%                              key below is honoured or refused
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% FILES AND I/O
+%
+% Of the ten file-name keys GADGET-2 defines, only three are read: InitCondFile, OutputDir and
+% SnapshotFileBase. The diagnostic logs are written into OutputDir under fixed names, and the
+% restart state is configured on the command line, so the remaining names are ignored.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] The initial conditions, in the format named by ICFormat. For a multi-file IC give
+% the base name without the ".0" suffix; files named "<base>.0", "<base>.1", ... are detected
+% and interleaved into type-ascending order. An empty value means "validate this file and
+% exit" -- the run parses, prints its derived constants, and stops without simulating.
+InitCondFile        ./ICs/ics
+
+% [HONOURED] Directory for snapshots and logs. It must already EXIST; it is never created. A
+% file named "stop" placed in here ends the run cleanly at the next step boundary (the file is
+% then removed). Logs go in here under fixed names: info.txt (one block per step, with
+% Systemstep and Dloga) and cpu.txt (GADGET-2's timing table, column for column).
+OutputDir           ./output
+
+% [HONOURED] Snapshot base name. Files are written as "<OutputDir>/<base>_000", "_001", ...
+SnapshotFileBase    snapshot
+
+% [IGNORED] The energy statistics are printed to stderr as "[ENERGY-EXACT]" lines on the
+% TimeBetStatistics cadence; no energy.txt is written and this name is never used.
+EnergyFile          energy.txt
+
+% [IGNORED] The CPU timing table is written to "<OutputDir>/cpu.txt" under that fixed name,
+% not this one. (It can be switched off entirely with a runtime environment variable; see
+% docs/ENVIRONMENT.md.)
+CpuFile             cpu.txt
+
+% [IGNORED] The per-step info log is written to "<OutputDir>/info.txt" under that fixed name,
+% not this one.
+InfoFile            info.txt
+
+% [IGNORED] No timings file is produced; the per-phase timings live in cpu.txt instead.
+TimingsFile         timings.txt
+
+% [IGNORED] The restart state is NOT configured here. Pass "--restart-file <path>" on the
+% command line to enable it and "--resume" to restart from it. Without --restart-file nothing
+% is written and the run cannot be resumed. The format is this code's own, not GADGET-2's.
+RestartFile         restart
+
+% [IGNORED] No job is ever resubmitted; this command is never executed.
+ResubmitCommand     none
+
+% [CONDITIONAL] Read only when OutputListOn is non-zero. Whitespace-separated output times (in
+% the same units as TimeBegin/TimeMax); the path is resolved relative to the working
+% directory, not to OutputDir. Entries outside [TimeBegin, TimeMax] are dropped silently, as
+% GADGET-2 does; duplicates are collapsed. If the file cannot be read, or contains no time
+% inside the run, the run stops rather than falling back to the TimeBetSnapshot cadence.
+OutputListFilename  ./outputs.txt
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SNAPSHOT AND STATISTICS CADENCE
+%
+% Either a fixed cadence (TimeOfFirstSnapshot + TimeBetSnapshot) or an explicit output list.
+% One snapshot is always written at the end of the run, whether or not it lands on an output
+% time.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] 0 = use the TimeOfFirstSnapshot/TimeBetSnapshot cadence; non-zero = use the times
+% in OutputListFilename and ignore both of those keys entirely. With a list, more than 500
+% entries is accepted but warned about, since stock GADGET-2 reads at most 500 and would not
+% produce the same set of snapshots from the same file.
+OutputListOn        0
+
+% [CONDITIONAL] First output epoch; used only when OutputListOn is 0. With an output list the
+% first in-range entry of the list takes its place.
+TimeOfFirstSnapshot 0.0625
+
+% [CONDITIONAL] Used only when OutputListOn is 0. Under ComovingIntegrationOn it is a RATIO
+% applied multiplicatively (a_next = a_prev * TimeBetSnapshot), so it must be greater than 1 --
+% that is not validated here, and a value of 1 or less makes the output epoch stop advancing.
+% Without comoving integration it is an additive interval.
+TimeBetSnapshot     1.1892071
+
+% [HONOURED] Interval between global energy statistics, additive in Time in both comoving and
+% non-comoving runs. On these steps the potential is recomputed for every particle, so they
+% cost noticeably more than an ordinary step; the first and last steps always sample. A value
+% of 0 or less disables the samples. (The cadence can be overridden at runtime to evaluate
+% every step -- see docs/ENVIRONMENT.md.)
+TimeBetStatistics   0.05
+
+% [HONOURED] Format of the snapshots written. 1 = plain block format, 2 = block format with
+% 4-character block labels. HDF5 (3) is not supported and is refused. The on-disk ID width is
+% a build option (GADGET_HIP_LONGIDS), not a parameter.
+SnapFormat          1
+
+% [HONOURED] Format of InitCondFile; 1 or 2, with the same meaning as SnapFormat. Like
+% GADGET-2, the format is NOT auto-detected -- this value must be right. 3 (HDF5) is refused.
+ICFormat            1
+
+% [HONOURED] Number of files per snapshot. It is a REQUEST: because a block length marker is a
+% 4-byte int and positions are 12 bytes per particle, one file holds at most 178,956,970
+% particles, and the count is raised to the minimum that fits, with a line on stderr saying
+% so. Multi-file snapshots are named "<base>_NNN.0", ".1", ...
+NumFilesPerSnapshot 1
+
+% [REQUIRED] Must be exactly 1. This code runs in a single process, so any other value is
+% refused at parse time.
+NumFilesWrittenInParallel 1
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% RUN LIMITS AND CHECKPOINTING
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] Wall-clock budget in seconds. At 0.85 of it -- GADGET-2's own margin -- the run
+% stops at the next step boundary, writing the restart state first if --restart-file was given.
+% A value of 0 or less disables the limit.
+TimeLimitCPU        86400
+
+% [CONDITIONAL] Seconds of wall clock between periodic restart dumps. Only has an effect when
+% --restart-file was given on the command line; 0 disables periodic dumps (a final dump is
+% still written at the end of the run).
+CpuTimeBetRestartFile 3600
+
+% [IGNORED] No automatic resubmission exists; the value is never read.
+ResubmitOn          0
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COSMOLOGY, BOX AND TIME SPAN
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] 1 = comoving integration (Time is the scale factor a, the timeline is uniform in
+% log a, drift and kick factors come from the cosmology tables). 0 = plain Newtonian
+% integration with Time a linear clock; Omega0, OmegaLambda, OmegaBaryon and the MaxPhys
+% softening caps then have no effect, and the RMS-displacement timestep limit is not applied.
+ComovingIntegrationOn 1
+
+% [HONOURED] Start of the run. Under comoving integration this is also tick 0 of the integer
+% timeline, and it MUST agree with the IC file's own header epoch to better than 1e-6
+% relative -- the run refuses to start otherwise. (Stock GADGET-2 starts from TimeBegin
+% regardless of what the IC was generated for; here a mismatch is treated as a configuration
+% error, because it silently produces the wrong growth factor and velocity normalisation.)
+% Not checked when ComovingIntegrationOn is 0, where the clock origin is arbitrary.
+TimeBegin           0.02
+
+% [HONOURED] End of the run. It also fixes the timestep ladder: the span TimeBegin..TimeMax is
+% divided into 2^28 ticks and every particle timestep is a power-of-two multiple of one tick,
+% so two runs with different TimeMax do not take the same steps, and a restart state written
+% under one TimeMax cannot be resumed under another. The final step is truncated exactly onto
+% TimeMax.
+TimeMax             1.0
+
+% [HONOURED] Total matter density parameter. Used for H(a) in the drift/kick factors and the
+% timestep criterion, for the mean-density term of the periodic comoving potential, for the
+% mean interparticle spacing in the RMS-displacement limit, and written to snapshot headers.
+% Only read when ComovingIntegrationOn is 1.
+Omega0              0.3
+
+% [HONOURED] Dark energy density parameter. Same consumers as Omega0; curvature is taken as
+% 1 - Omega0 - OmegaLambda.
+OmegaLambda         0.7
+
+% [HONOURED] Baryon density parameter -- and it does something even in a run with no gas. The
+% RMS-displacement timestep limit computes each type's mean interparticle spacing from its own
+% density share: OmegaBaryon for type 0, and Omega0 - OmegaBaryon for every other type. That
+% is GADGET-2's own rule. In a dark-matter-only run whose particles carry all the matter,
+% leave this at 0, or the limit is computed from too little mass.
+OmegaBaryon         0.0
+
+% [HONOURED] "Little h". Bookkeeping only: it is written to snapshot headers and is NOT used
+% to rescale the gravitational constant or H0, both of which come from the unit system below.
+% Same role as in stock GADGET-2.
+HubbleParam         0.7
+
+% [CONDITIONAL] Box side length, in internal length units. Honoured only in a build configured
+% with PERIODIC, where it sets the periodic box for the tree walk, the PM mesh, and the
+% per-step wrapping of coordinates back into [0, BoxSize). Together with the compile-time mesh
+% size GADGET_HIP_PMGRID it also fixes the TreePM split: Asmth = 1.25*BoxSize/PMGRID and the
+% short-range cutoff Rcut = 4.5*Asmth. In a non-periodic build the value only reaches the
+% snapshot header. It must match the box the ICs were made for; that is not checked.
+BoxSize             100.0
+
+% [REQUIRED] Must match how the binary was built: 1 requires PERIODIC=ON, 0 requires
+% PERIODIC=OFF. Any mismatch is refused at parse time rather than quietly running the other
+% geometry. Note that PERIODIC additionally requires a PM mesh (GADGET_HIP_PMGRID) at
+% configure time. When it is 1 and the run is comoving, it also switches on the mean-density
+% term of the periodic potential.
+PeriodicBoundariesOn 1
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% UNIT SYSTEM
+%
+% These three numbers plus GravityConstantInternal fully determine the internal gravitational
+% constant G and H0, by GADGET-2's own formulas. The derived values are printed at startup on
+% the "[PARAM]" line, which is the quickest way to confirm the unit system is what you meant:
+% the triplet below gives G = 43.0071 and H0 = 100 (km/s)/(Mpc/h).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] Internal unit of length in cm. 3.085678e24 = 1 Mpc/h.
+UnitLength_in_cm         3.085678e24
+
+% [HONOURED] Internal unit of mass in g. 1.989e43 = 1e10 Msun/h.
+UnitMass_in_g            1.989e43
+
+% [HONOURED] Internal unit of velocity in cm/s. 1e5 = 1 km/s. The internal unit of time is
+% derived as UnitLength_in_cm / UnitVelocity_in_cm_per_s.
+UnitVelocity_in_cm_per_s 1e5
+
+% [HONOURED] Overrides the internal G. When 0 (the usual choice), G is derived from the unit
+% triplet above. When non-zero, that value is used verbatim and the unit triplet no longer
+% determines G -- while still determining the unit of time and H0.
+GravityConstantInternal  0
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% GRAVITY ACCURACY (MULTIPOLE ACCEPTANCE CRITERION)
+%
+% The two criteria GADGET-2 defines are a BUILD-TIME choice here, selected by the CMake option
+% MAC_SPRINGEL. TypeOfOpeningCriterion is checked against that choice, so a parameter file can
+% never silently get the criterion it did not ask for.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [REQUIRED] 0 = geometric opening angle (driven by ErrTolTheta), 1 = relative / Springel
+% (driven by ErrTolForceAcc). Any other value is refused. Requesting 1 on a binary built
+% without MAC_SPRINGEL is a fatal error with an explanation, rather than a silent substitution
+% of the geometric criterion.
+% Be aware of the asymmetry: a binary built WITH MAC_SPRINGEL always evaluates the relative
+% criterion, so setting 0 there does not get you the geometric one. Match the build, and check
+% the startup banner's "[INIT] MAC:" line to see which criterion is actually live.
+TypeOfOpeningCriterion   0
+
+% [HONOURED] Opening angle for the geometric criterion (an improved Barnes-Hut test using the
+% node's centre of mass). Also used on a relative-criterion build for the first force
+% evaluation of each particle group, which has no previous acceleration to form the relative
+% criterion from -- GADGET-2 bootstraps the same way.
+ErrTolTheta              0.5
+
+% [CONDITIONAL] Relative force-accuracy tolerance. Drives node opening only on a binary built
+% with MAC_SPRINGEL, which also echoes it in the startup banner. On a geometric build it is
+% parsed, quoted in the refusal message above if TypeOfOpeningCriterion is 1, and otherwise
+% unused.
+ErrTolForceAcc           0.005
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% TIME STEPPING
+%
+% The criterion is GADGET-2's: dt = sqrt(2 * ErrTolIntAccuracy * a * eps / |acc|), expressed in
+% d(log a) under comoving integration, then clamped and snapped down to a power-of-two
+% multiple of one timeline tick.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [REQUIRED] Must be 0 (the acceleration criterion). Stock GADGET-2 also accepts only 0; any
+% other value is refused at parse time.
+TypeOfTimestepCriterion  0
+
+% [HONOURED] Accuracy parameter of the timestep criterion. Smaller means shorter steps.
+ErrTolIntAccuracy        0.025
+
+% [HONOURED] Upper limit on a single particle timestep. Under comoving integration this is a
+% limit on d(log a), NOT on da -- the same convention as stock GADGET-2. It also caps the
+% RMS-displacement limit below.
+MaxSizeTimestep          0.03
+
+% [HONOURED] Lower limit on a single particle timestep, in the same units as MaxSizeTimestep.
+% 0 is the normal choice. Note that a hard internal floor keeps the step large enough to
+% advance the clock in any case, so values below roughly 1e-8 have no additional effect;
+% unlike stock GADGET-2 the run does not abort when a particle asks for less.
+MinSizeTimestep          0
+
+% [CONDITIONAL] RMS-displacement ceiling: limits any type's mean displacement per step to this
+% fraction of its mean interparticle spacing (or of the PM smoothing scale, where that is
+% finer). Applied only under comoving integration, and recomputed per tree rebuild rather than
+% per step. Set it to 0 to disable the ceiling; MaxSizeTimestep then governs alone.
+MaxRMSDisplacementFac    0.2
+
+% [IGNORED] Domain decomposition frequency. There is one GPU and no MPI domain decomposition,
+% so there is nothing for this to tune.
+TreeDomainUpdateFrequency 0.1
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% GRAVITATIONAL SOFTENING
+%
+% Per particle type, in the GADGET-2 type order: 0 Gas, 1 Halo, 2 Disk, 3 Bulge, 4 Stars,
+% 5 Bndry. The values are Plummer-equivalent softening lengths; the spline force softening is
+% 2.8 times them.
+%
+% Two things to know before setting these:
+%
+%  * On a binary built WITHOUT UNEQUAL_SOFTENINGS (the default), every populated type must
+%    share ONE softening value. Two or more distinct non-zero values are refused at startup,
+%    because without that build option a tree node containing coarser members is softened with
+%    the target's length and is never force-opened. Types left at 0 impose nothing.
+%  * Under comoving integration, SofteningXMaxPhys is a cap in PHYSICAL units and it is always
+%    applied. A type whose MaxPhys is 0 therefore gets a softening of 0 -- the same trap as in
+%    stock GADGET-2. Give every populated type a sensible cap; MaxPhys = Softening/3 (comoving
+%    below a = 1/3, physical after) is the usual choice and is what is set below.
+%    Without comoving integration the MaxPhys keys have no effect.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] Comoving softening, type 0 (Gas). 0 because this run has no gas particles.
+SofteningGas             0
+% [HONOURED] Comoving softening, type 1 (Halo). The only populated type here: 1/40 of the mean
+% interparticle spacing for 512^3 particles in a 100 Mpc/h box.
+SofteningHalo            0.00488281
+% [HONOURED] Comoving softening, type 2 (Disk).
+SofteningDisk            0
+% [HONOURED] Comoving softening, type 3 (Bulge).
+SofteningBulge           0
+% [HONOURED] Comoving softening, type 4 (Stars).
+SofteningStars           0
+% [HONOURED] Comoving softening, type 5 (Bndry) -- the coarse type in zoom ICs.
+SofteningBndry           0
+
+% [CONDITIONAL] Physical softening caps, one per type; applied only under comoving integration.
+% Read the section header above before setting any of these to 0 for a populated type.
+SofteningGasMaxPhys      0
+SofteningHaloMaxPhys     0.00162760
+SofteningDiskMaxPhys     0
+SofteningBulgeMaxPhys    0
+SofteningStarsMaxPhys    0
+SofteningBndryMaxPhys    0
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% MEMORY AND ALLOCATION
+%
+% Particle storage is sized from the actual particle count, so only the tree arena is tunable
+% from here. For very large runs see the GADGET_HIP_UNIFIED_MEM build option in
+% docs/COMPILE_OPTIONS.md.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [HONOURED] Tree node storage, as a multiple of the particle count. 0.8 is ample for a
+% uniform cosmological box; a highly refined zoom region, or a build with a small leaf size,
+% can need several times that. If the arena runs out the run stops with a message naming the
+% node count it reached and this parameter. 0 selects the 0.8 default, and values below 0.05
+% are raised to 0.05. It can also be overridden at runtime (see docs/ENVIRONMENT.md), which is
+% the only way to set it for the built-in particle generators, which use no parameter file.
+TreeAllocFactor          0.8
+
+% [IGNORED] Particle storage slack. Particle arrays are sized from the actual count, with no
+% user-tunable margin, so this is never read.
+PartAllocFactor          1.6
+
+% [IGNORED] Communication buffer size in MB. There is no MPI communication buffer.
+BufferSize               30
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SPH AND GAS PHYSICS -- ALL IGNORED
+%
+% This is a collisionless gravity code: there is no hydrodynamics. Every key in this section is
+% parsed and stored purely so that an unmodified GADGET-2 parameter file is portable, and none
+% of them is ever read. They still have to be present. If your ICs contain type-0 particles,
+% they are integrated as collisionless particles under gravity alone.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% [IGNORED] Desired number of SPH neighbours.
+DesNumNgb                33
+% [IGNORED] Tolerated deviation from DesNumNgb.
+MaxNumNgbDeviation       2
+% [IGNORED] Courant factor for the hydrodynamic timestep.
+CourantFac               0.15
+% [IGNORED] Artificial bulk viscosity coefficient.
+ArtBulkViscConst         0.8
+% [IGNORED] Minimum SPH smoothing length as a fraction of the gravitational softening.
+MinGasHsmlFractional     0.25
+% [IGNORED] Initial gas temperature in K.
+InitGasTemp              0
+% [IGNORED] Temperature floor for gas in K.
+MinGasTemp               0

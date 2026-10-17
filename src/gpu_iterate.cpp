@@ -1712,25 +1712,29 @@ bool octree::iterate_once(IterationData &idata) {
           const bool pmIdSpaceOk = !pmNoIdSpace && gadgetTypeByIdOk &&
                                    (s_d_pmIdX != nullptr) &&
                                    (gadgetTypeByIdMax == (ullong)(localTree.n - 1));
-          // WHY THIS IS OFF BY DEFAULT.
+          // WHICH OPERATOR THE CADENCE USES, AND WHY IT IS NOT THE OBVIOUS ONE.
           //
-          // Skipping the PM solve between PM steps looks like it just reproduces Gadget, which
-          // also keeps the long-range force fixed between them. It does not, because Gadget applies
-          // that force DIFFERENTLY: a separate long-range kick over the whole PM interval, applied
-          // to EVERY particle exactly once (`advance_and_find_timesteps`, the
-          // `All.PM_Ti_endstep == All.Ti_Current` block). This port instead folds the stored force
-          // into bodies_acc1 for ACTIVE particles and lets each particle's own kick integrate it
-          // over its own timestep. The two agree in the time-integral to first order -- which is
-          // exactly why a short test could not tell them apart -- but they are not the same
-          // operator, and the difference accumulates.
+          // The cadence is ON by default (T76; see pmCadenceOn above). What makes that safe is the
+          // operator, not the scheduling: skipping the PM solve between PM steps only reproduces
+          // Gadget if the stored force is APPLIED the way Gadget applies it -- a separate
+          // long-range kick over the whole PM interval, midpoint to midpoint, to EVERY particle
+          // exactly once (`advance_and_find_timesteps`, the
+          // `All.PM_Ti_endstep == All.Ti_Current` block). That is what gadgetPMKick does below.
           //
-          // Measured: a full 512^3 run to z=0 with the cadence on drifted from -2.0% in Ekin at
-          // a=0.06 to -10.9% at a=0.96 against the CPU reference, where PM-every-step gives
-          // +0.06%. A 60-step bisect isolated it to this switch alone (the two T35 device kernels
-          // were bit-exact over the same interval).
+          // The tempting alternative is to fold the stored force into bodies_acc1 for ACTIVE
+          // particles and let each particle's own kick integrate it over its own timestep. That
+          // agrees in the time-integral to FIRST ORDER -- which is exactly why a short test cannot
+          // tell the two apart -- but it is a different operator and the difference accumulates:
+          // measured, a full 512^3 run to z=0 drifted from -2.0% in Ekin at a=0.06 to -10.9% at
+          // a=0.96 against the CPU reference, where every-step PM gives +0.06%. A 60-step bisect
+          // isolated it to the operator alone. GADGET_HIP_PM_KEEP_IN_ACC selects it, for that
+          // comparison and nothing else -- do not ship it.
           //
-          // Getting the 0.73 s/step back means implementing Gadget's actual structure -- a separate
-          // long-range kick over the PM interval for all particles -- not skipping the solve.
+          // With the separate kick, the cadence's worst Ekin deviation at 512^3 is 0.133% (T45),
+          // which is what made it defensible as the default. Two other consumers of the long-range
+          // force had to be given it as well before that held: the energy diagnostic, which Gadget
+          // drift-corrects back to the current time (global.c:79-87), and the Springel MAC's aold,
+          // which Gadget builds from tree AND PM (gravtree.c:309-311).
           //
           // The cadence also depends ONLY on time, never on whether this step samples the energies.
           // `energyDue` is driven by TimeBetStatistics, a DIAGNOSTIC parameter, and I wired it in

@@ -1972,7 +1972,8 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   // comment (dev_approximate_gravity_warp_new.cu) for the full env-var contract.
   t27_set_soft_floor_coef(0.0f);
 
-  // T6 (contract C-D-01): drift anchor. Off by default pending the A/B in ticket T6.
+  // T6 (contract C-D-01): drift anchor. ON by default -- the A/B was done; the comment here used
+  // to say "off by default pending the A/B" while the line below already defaulted it to 1.
   {
     const char *e = getenv("GADGET_HIP_T6_DRIFT_TP");
     t6_set_drift_anchor(e ? atoi(e) : 1);
