@@ -130,10 +130,12 @@ Three things this mode requires that the periodic one does not:
 - **Particles must lie within `[0, meshSize/2)` on every axis.** To guarantee that, every loaded
   coordinate is shifted by `+meshSize/4` at startup, which centres an origin-centred distribution
   in the occupied half with equal padding on both sides.
-- **That shift is not undone when snapshots are written.** Output therefore sits `meshSize/4` from
-  the frame of the initial conditions on every axis. Subtract it before comparing positions against
-  the input, or against any other code's output. (The zoom mode's `--zoom-recenter`, by contrast,
-  does restore its own shift on write.)
+- **The shift is undone when snapshots are written**, so output stays in the initial conditions'
+  frame — no correction is needed on your side. It is recorded in a sidecar next to the checkpoint
+  file, so a resumed run writes in the same frame as the run it continues. Unlike the periodic
+  zoom's recentring, coordinates are *not* then wrapped into `[0, BoxSize)`: an isolated system has
+  no periodic images, and wrapping would move particles to the far side of a box that does not
+  exist.
 - The parameter file's `PeriodicBoundariesOn` must be `0`, since periodicity is matched against the
   build in both directions.
 

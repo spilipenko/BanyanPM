@@ -1727,7 +1727,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
       haveZoomShift = needed;
       // Hand it to the octree HERE, where it finally exists: writeGadgetSnapshot() needs it to
       // undo the translation, and setZoomConfig() above already ran long before the IC was read.
-      if (haveZoomShift) tree->setZoomShift(zoomShiftApplied);
+      // wrapOnWrite = true: the zoom is a periodic run, so after un-shifting, coordinates are
+      // folded back into [0, BoxSize).
+      if (haveZoomShift) tree->setLoadShift(zoomShiftApplied, /*wrapOnWrite=*/true);
     }
 #endif
 
@@ -1854,6 +1856,22 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     bodyPositions[i].x += meshSize * 0.25f;
     bodyPositions[i].y += meshSize * 0.25f;
     bodyPositions[i].z += meshSize * 0.25f;
+  }
+  // Record it so snapshots are written back in the initial conditions' frame, the way the zoom
+  // recentring already does. Without this the shift is applied on the way in and never undone, and
+  // every snapshot of an isolated run sits meshSize/4 from the ICs on every axis -- which is
+  // invisible in the run itself and wrong in any comparison against the input or another code.
+  //
+  // wrapOnWrite = FALSE here, and that is the whole difference from the zoom case: an isolated run
+  // has vacuum boundaries and no periodic images, so folding coordinates into [0, BoxSize) would
+  // move particles to the far side of a box that does not exist.
+  {
+    const double sh[3] = { (double)(meshSize * 0.25f),
+                           (double)(meshSize * 0.25f),
+                           (double)(meshSize * 0.25f) };
+    tree->setLoadShift(sh, /*wrapOnWrite=*/false);
+    fprintf(stderr, "[ISOLATED] placed particles in [0, meshSize/2) by shifting +%.6g on every "
+                    "axis; snapshots are written back in the IC frame.\n", sh[0]);
   }
 #endif
 

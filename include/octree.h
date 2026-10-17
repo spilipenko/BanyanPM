@@ -855,10 +855,6 @@ inline bool gadget_hip_stage_trace()
   // at the box centre and the fine grid cannot cross a periodic boundary by construction. Physically
   // inert (a periodic box is translation invariant when it all moves together) and undone when a
   // snapshot is written, so output coordinates match the IC's frame. Zero when recentring is off.
-  double           gadgetZoomShift[3] = {0.0, 0.0, 0.0};
-  bool             gadgetZoomShifted  = false;
-  void setZoomShift(const double s[3]) { for (int a=0;a<3;a++) gadgetZoomShift[a]=s[a];
-                                         gadgetZoomShifted = (s[0]!=0.0)||(s[1]!=0.0)||(s[2]!=0.0); }
   PMIsolatedSolver gadgetZoomSolver;
   bool             gadgetZoomSolverReady = false;
   void setZoomConfig(unsigned int mask, float enlargeRegion);
@@ -872,6 +868,21 @@ inline bool gadget_hip_stage_trace()
   void recomputeZoomRegion(tree_structure &tree, double asmth0, double rcut0, int gridSize,
                             float periodicBoxSize);
 #endif
+
+  // A translation applied to every particle at IC load and undone when snapshots are written, so
+  // output stays in the initial conditions' frame. Set by the zoom recentring (periodic, wraps on
+  // the way out) and by the isolated solver's placement into the occupied half of its doubled grid
+  // (non-periodic, must NOT wrap). Deliberately not inside a GADGET_HIP_HIGHRES guard: an isolated
+  // build does not define that option and needs the same bookkeeping.
+  double           gadgetLoadShift[3] = {0.0, 0.0, 0.0};
+  bool             gadgetLoadShifted  = false;
+  // wrapOnWrite: fold coordinates back into [0, BoxSize) after un-shifting. True for the periodic
+  // zoom; false for an isolated run, which has no images to fold into.
+  bool             gadgetLoadShiftWrap = false;
+  void setLoadShift(const double s[3], bool wrapOnWrite)
+  { for (int a=0;a<3;a++) gadgetLoadShift[a]=s[a];
+    gadgetLoadShifted   = (s[0]!=0.0)||(s[1]!=0.0)||(s[2]!=0.0);
+    gadgetLoadShiftWrap = wrapOnWrite; }
 
   void   direct_gravity(tree_structure &tree);
   void   computeGroupMaxAccel(tree_structure &tree);  //Phase 3: Springel MAC per-group |a_old|

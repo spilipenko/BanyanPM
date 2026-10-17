@@ -3624,15 +3624,15 @@ void octree::writeGadgetSnapshot(bool preKick)
   src.velPerm = preKick ? (const unsigned int *) &localTree.oriParticleOrder[0] : nullptr;
   src.id      = (const unsigned long long *) &localTree.bodies_ids[0];
   src.type    = ((int) localTree.bodies_type.size() == n) ? localTree.bodies_type.data() : nullptr;
-#ifdef GADGET_HIP_HIGHRES
-  // T51: undo the recentring translation so the snapshot is in the IC's own frame.
-  if (gadgetZoomShifted && gadgetParams.BoxSize > 0.0)
+  // Undo the load-time translation so the snapshot is in the IC's own frame. Applies to the zoom
+  // recentring and to the isolated solver's half-grid placement alike; the two differ only in
+  // whether coordinates are then wrapped back into the box.
+  if (gadgetLoadShifted)
   {
     src.shiftPositions = true;
-    for (int a = 0; a < 3; ++a) src.shift[a] = gadgetZoomShift[a];
-    src.boxSize = gadgetParams.BoxSize;
+    for (int a = 0; a < 3; ++a) src.shift[a] = gadgetLoadShift[a];
+    src.boxSize = (gadgetLoadShiftWrap && gadgetParams.BoxSize > 0.0) ? gadgetParams.BoxSize : 0.0;
   }
-#endif
 
   GadgetSnapshotHeader header;
   header.time        = (double) t_current;
@@ -6583,25 +6583,27 @@ bool octree::writeRestartFile(const char *path)
   h.ekin1 = this->Ekin1; h.epot1 = this->Epot1; h.etot1 = this->Etot1;
   h.storeEnergyFlag = this->store_energy_flag ? 1 : 0;
 
-  // T51: the recentring shift, as a sidecar rather than a header field -- see the comment on
-  // gadgetZoomShift. Absent sidecar == no shift, which is the right reading of any restart written
-  // before this existed. Guarded: the octree members only exist in a GADGET_HIP_HIGHRES build.
-#ifdef GADGET_HIP_HIGHRES
-  if (gadgetZoomShifted)
+  // The load-time shift, as a sidecar rather than a header field. Absent sidecar == no shift, which
+  // is the right reading of any restart written before this existed. NOT guarded on
+  // GADGET_HIP_HIGHRES: an isolated (non-periodic) run carries a shift too and must resume with it,
+  // or its post-resume snapshots come out in a different frame from its pre-resume ones.
+  if (gadgetLoadShifted)
   {
+    // Filename kept as ".zoomshift" rather than renamed with the members: restart files written
+    // before this generalisation carry that name, and a resume must keep finding them.
     const std::string zp = std::string(path) + ".zoomshift";
     FILE *zf = fopen(zp.c_str(), "w");
     if (zf)
     {
-      fprintf(zf, "%.17g %.17g %.17g\n", gadgetZoomShift[0], gadgetZoomShift[1], gadgetZoomShift[2]);
+      fprintf(zf, "%.17g %.17g %.17g %d\n", gadgetLoadShift[0], gadgetLoadShift[1],
+              gadgetLoadShift[2], gadgetLoadShiftWrap ? 1 : 0);
       fclose(zf);
     }
     else
-      fprintf(stderr, "[ZOOM] WARNING: could not write %s -- a resume from this restart will not "
-                      "know the recentring shift, and its snapshots would come out offset.\n",
+      fprintf(stderr, "[SHIFT] WARNING: could not write %s -- a resume from this restart will not "
+                      "know the load-time shift, and its snapshots would come out offset.\n",
               zp.c_str());
   }
-#endif
 
   // T65 item 6b: gather-and-write in chunks through inv[], instead of from a full-size copy.
   const int CHUNK = 1 << 18;                    // 262,144 particles: 4 MiB of real4, 2 MiB of ullong
@@ -6641,32 +6643,34 @@ bool octree::readRestartFile(const char *path)
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "FATAL: restart: cannot open %s\n", path); return false; }
 
-#ifdef GADGET_HIP_HIGHRES
-  // T51: recover the recentring shift from the sidecar. Its ABSENCE is meaningful and correct --
-  // a restart written before this existed holds unshifted coordinates -- so this is not an error.
+  // Recover the load-time shift from the sidecar. Its ABSENCE is meaningful and correct -- a
+  // restart written before this existed holds unshifted coordinates -- so it is not an error.
   // A resume must not recompute the shift from the resumed positions: those are already shifted, so
-  // recomputing would yield ~0 and the snapshot un-shift would be lost.
+  // recomputing would yield ~0 and the snapshot un-shift would be lost. Not guarded on
+  // GADGET_HIP_HIGHRES: an isolated run carries a shift too.
   {
     const std::string zp = std::string(path) + ".zoomshift";
     FILE *zf = fopen(zp.c_str(), "r");
     if (zf)
     {
       double sx = 0, sy = 0, sz = 0;
-      if (fscanf(zf, "%lg %lg %lg", &sx, &sy, &sz) == 3)
+      // The 4th field (wrap-on-write) was added when this was generalised beyond the zoom. A
+      // sidecar without it was written by a zoom run, which is the wrapping case -- so default 1.
+      int wrap = 1;
+      if (fscanf(zf, "%lg %lg %lg %d", &sx, &sy, &sz, &wrap) >= 3)
       {
         const double sh[3] = { sx, sy, sz };
-        setZoomShift(sh);
-        fprintf(stderr, "[ZOOM] resumed recentring shift (%.6g, %.6g, %.6g) from %s\n",
-                sx, sy, sz, zp.c_str());
+        setLoadShift(sh, wrap != 0);
+        fprintf(stderr, "[SHIFT] resumed load-time shift (%.6g, %.6g, %.6g) wrap=%d from %s\n",
+                sx, sy, sz, wrap, zp.c_str());
       }
       else
-        fprintf(stderr, "[ZOOM] WARNING: %s is unreadable; continuing with NO shift, which will "
-                        "offset this run's snapshots if the restart was in fact recentred.\n",
+        fprintf(stderr, "[SHIFT] WARNING: %s is unreadable; continuing with NO shift, which will "
+                        "offset this run's snapshots if the restart was in fact shifted.\n",
                 zp.c_str());
       fclose(zf);
     }
   }
-#endif
 
   GadgetHipRestartHeader h;
   if (fread(&h, sizeof(h), 1, f) != 1) { fprintf(stderr, "FATAL: restart: %s is truncated\n", path); fclose(f); return false; }

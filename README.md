@@ -39,8 +39,9 @@ Three long-range configurations, all of them GADGET-2 modes, selected at build t
 | **isolated** | `GADGET_HIP_PMGRID` alone | non-periodic mesh on a zero-padded doubled grid, vacuum boundaries |
 
 `PERIODIC` without a mesh is refused at configure time — it would drop the long-range force with
-nothing computing it. The isolated mode needs `--meshsize` and places particles in the first half of
-the grid; see [`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md#non-periodic-isolated-runs).
+nothing computing it. The isolated mode needs `--meshsize`, and places particles in the first half
+of its doubled grid at load, restoring the initial conditions' frame when snapshots are written; see
+[`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md#non-periodic-isolated-runs).
 
 ## Build
 

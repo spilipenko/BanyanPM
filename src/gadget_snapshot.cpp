@@ -316,11 +316,18 @@ bool gadget_snapshot_write_streaming(const std::string &basePath, int snapFormat
           for (int c = 0; c < 3; ++c)
           {
             double x = (double) src.pos4[4 * i + c];
-            if (src.shiftPositions && src.boxSize > 0.0)
+            if (src.shiftPositions)
             {
               x -= src.shift[c];
-              while (x >= src.boxSize) x -= src.boxSize;
-              while (x < 0.0)          x += src.boxSize;
+              // Fold back into the box only for a PERIODIC run. boxSize == 0 is the caller saying
+              // "un-shift, do not wrap": an isolated (vacuum-boundary) run has no images to fold
+              // into, and wrapping its coordinates would move particles to the far side of a box
+              // that does not exist. The zoom recentring passes a real boxSize and does wrap.
+              if (src.boxSize > 0.0)
+              {
+                while (x >= src.boxSize) x -= src.boxSize;
+                while (x < 0.0)          x += src.boxSize;
+              }
             }
             bufF[3 * k + c] = (float) x;
           }

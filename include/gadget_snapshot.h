@@ -85,7 +85,11 @@ struct GadgetSnapshotSource
   const unsigned int       *velPerm = nullptr;   // vel index = velPerm[i]; null = identity
   const unsigned long long *id      = nullptr;
   const int                *type    = nullptr;   // null = every particle is type 1 (Halo/DM)
-  bool                      shiftPositions = false;   // undo a zoom recentring on the way out
+  // Undo, on the way out, a translation that was applied to every particle at load, so the
+  // snapshot lands in the initial conditions' own frame. Two callers: the zoom recentring, and the
+  // isolated (non-periodic) solver's placement of particles into the occupied half of its doubled
+  // grid. boxSize > 0 additionally wraps into [0, boxSize) and is for the periodic case only.
+  bool                      shiftPositions = false;
   double                    shift[3] = {0.0, 0.0, 0.0};
   double                    boxSize  = 0.0;
 };
