@@ -138,6 +138,16 @@ endif()
 # them, and any difference in the output is that change rather than the noise floor. Without it a
 # sub-0.5% effect at 64^3 cannot be distinguished from run-to-run scatter at all.
 option(GADGET_HIP_DETERMINISTIC_CIC "Bit-reproducible fixed-point CIC scatter (diagnostic; slower, +1 grid of uint64)" OFF)
+# T65 item 3. On an APU, hipMalloc is served from GTT carved out of the same system DRAM as
+# hipHostMalloc, so the device copy of a PINNED buffer is a second physical copy of the same bytes.
+# With this on, a pinned allocation takes its device pointer from hipHostGetDevicePointer instead of
+# allocating one, and h2d/d2h become synchronisation points rather than copies.
+# OFF by default: on a discrete GPU the copy is genuinely required.
+# GADGET_HIP_UNIFIED_MEM=0 in the environment turns it off again at runtime, for A/B.
+option(GADGET_HIP_UNIFIED_MEM "Alias pinned host buffers as device memory instead of copying them (APU only)" OFF)
+if(GADGET_HIP_UNIFIED_MEM)
+  add_definitions(-DGADGET_HIP_UNIFIED_MEM)
+endif()
 if(GADGET_HIP_DETERMINISTIC_CIC)
   add_definitions(-DGADGET_HIP_DETERMINISTIC_CIC)
 endif()

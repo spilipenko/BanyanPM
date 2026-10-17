@@ -354,7 +354,7 @@ KERNEL_DECLARE(cl_build_nodes)(uint level,
                              uint4 *bodies_key,
                              uint4 *node_key,
                              uint  *n_children,
-                             uint2 *node_bodies){
+                             uint4 *node_bodies){
 
   CUXTIMER("cl_build_nodes");
   uint bid = blockIdx.y * gridDim.x + blockIdx.x;
@@ -376,7 +376,9 @@ KERNEL_DECLARE(cl_build_nodes)(uint level,
     uint4 mask = get_mask(level);
     key = make_uint4(key.x & mask.x, key.y & mask.y, key.z & mask.z, 0); 
 
-    node_bodies[offset+id] = make_uint2(bi | (level << BITLEVELS), bj);
+    // T74: .x is the first-body index at FULL width and .z is the level, where the two used to
+    // share one word as 27 bits + 5. .w is unused on purpose.
+    node_bodies[offset+id] = make_uint4(bi, bj, level, 0);
     node_key   [offset+id] = key;
     n_children [offset+id] = 0;
   
@@ -435,7 +437,7 @@ KERNEL_DECLARE(cl_build_nodes)(uint level,
 
 KERNEL_DECLARE(cl_link_tree)(int n_nodes,
                             uint *n_children,
-                            uint2 *node_bodies,
+                            uint4 *node_bodies,
                             real4 *bodies_pos,
                             real4 corner,
                             uint2 *level_list,
@@ -451,9 +453,9 @@ KERNEL_DECLARE(cl_link_tree)(int n_nodes,
   
   if (id >= n_nodes) return;
 
-  uint2 bij  = node_bodies[id];
-  uint level = (bij.x &  LEVELMASK) >> BITLEVELS;
-  uint bi    =  bij.x & ILEVELMASK;
+  uint4 bij  = node_bodies[id];     // T74: .x first body (full width), .y one past last, .z level
+  uint level =  bij.z;
+  uint bi    =  bij.x;
   uint bj    =  bij.y;
 
   real4 pos  = bodies_pos[bi];
@@ -528,7 +530,7 @@ KERNEL_DECLARE(cl_link_tree)(int n_nodes,
 KERNEL_DECLARE(gpu_build_level_list)(const int    n_nodes,
                                  const int    n_leafs,
                                        uint  *leafsIdxs,
-                                       uint2 *node_bodies,
+                                       uint4 *node_bodies,
                                        uint  *valid_list)
 {
   CUXTIMER("build_level_list");
@@ -543,13 +545,13 @@ KERNEL_DECLARE(gpu_build_level_list)(const int    n_nodes,
   int level_c, level_m, level_p;
 
 
-  uint2 bij   = node_bodies[leafsIdxs[id+n_leafs]];    //current non-leaf
-  level_c     = (bij.x &  LEVELMASK) >> BITLEVELS;
+  uint4 bij   = node_bodies[leafsIdxs[id+n_leafs]];    //current non-leaf
+  level_c     =  bij.z;                                // T74: own lane, was packed in .x
 
   if((id+1) < (n_nodes-n_leafs))        //The last node gets a default level
   {
     bij         = node_bodies[leafsIdxs[id+1+n_leafs]]; //next non-leaf
-    level_p     = (bij.x &  LEVELMASK) >> BITLEVELS;
+    level_p     =  bij.z;
   }
   else
     level_p     = MAXLEVELS+5;  //Last is always an end
@@ -562,7 +564,7 @@ KERNEL_DECLARE(gpu_build_level_list)(const int    n_nodes,
   else
   {
     bij         = node_bodies[ leafsIdxs[id-1+n_leafs]]; //Get info of previous non-leaf node
-    level_m     =  (bij.x &  LEVELMASK) >> BITLEVELS;   
+    level_m     =  bij.z;   
   }
 
   int valid0 = 0;
@@ -689,7 +691,7 @@ void t10_set_group_shift(int enabled)
 KERNEL_DECLARE(build_group_list2)(const int   n_particles,
                                   uint       *validList,
                                   const uint2 startLevelBeginEnd,
-                                  uint2      *node_bodies,
+                                  uint4      *node_bodies,
                                   int        *node_level_list,
                                   int         treeDepth)
 {
@@ -731,7 +733,7 @@ KERNEL_DECLARE(build_group_list2)(const int   n_particles,
   //Use the end-indices of all tree-nodes above our minimum level
   if (idx < startLevelBeginEnd.y-1) //THe -1 to prevent last node
   {
-    const uint2 bij          =  node_bodies[idx];
+    const uint4 bij          =  node_bodies[idx];
     const uint lastChild     =  bij.y;
 
     // BUG6 FIX: validList is sized 2*n_particles (indices 0..2*n_particles-1). lastChild is a

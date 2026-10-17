@@ -41,18 +41,61 @@ void octree::allocateParticleMemory(tree_structure &tree)
   //MULTI_GPU_MEM_INCREASE% extra space, only in parallel when
   if(nProcs > 1) n_bodies = (int)(n_bodies*MULTI_GPU_MEM_INCREASE);    //number of particles can fluctuate
 
+  // T74. Two of the four index/count co-packings this ticket is about are fixed; the third is
+  // what this guard is for.
+  //
+  //   node_bodies[].x     was 5-bit level + 27-bit index  -> now a uint4, index at full width
+  //   groupSizeInfo[].w   was 5-bit count + 27-bit index  -> now the index at full width, with the
+  //                                                          count derived as start[g+1]-start[g]
+  //   boxSizeInfo[].w     (count-1) in the top 32-LEAFBIT bits + the leaf's first-body index in
+  //                       the rest. STILL PACKED, by decision: at the shipping NLEAF=16 that is a
+  //                       28-bit index, so 2^28 = 268,435,456 particles, which is comfortably
+  //                       above the 140-160M zoom ICs this is sized for.
+  //   n_children[]        child count at bit 28 + first-child NODE index below it. Also 2^28, but
+  //                       in NODES, and n_nodes is roughly 0.3*N, so it is not the binding one.
+  //
+  // Above 2^LEAFBIT the leaf indirection truncates and the walk forces the wrong particles --
+  // silently: measured at 339,738,624 particles, 21,043,318 of 100,325,533 leaves disagreed with
+  // node_bodies (21.0%, exactly the fraction whose first-body index exceeds 2^28) while every
+  // other invariant still reported OK and the run exited 0 with a plausible-looking trajectory.
+  // GADGET_HIP_INVARIANTS=1's C-A-19c check is the watchdog; this is the refusal.
+  //
+  // Raising it means giving the count its own storage, which for leaves cannot be derived from a
+  // neighbour the way the group count can -- C-A-19 shows the leaves tile [0,n) in SORTED order,
+  // not in node order -- so it would add a load to the walk's inner loop. See the audit repo's T74.
+  if ((unsigned long long) n_bodies > (1ull << LEAFBIT))
+  {
+    fprintf(stderr,
+      "\nFATAL (T74): %lld particles exceeds what the leaf indirection can address.\n"
+      "  limit     : %llu particles (2^LEAFBIT, LEAFBIT = %d at NLEAF = %d)\n"
+      "  requested : %lld\n"
+      "boxSizeInfo[].w packs a leaf's particle count minus one into its top %d bits and the index\n"
+      "of its first body into the bottom %d. Above the limit that index truncates and the tree walk\n"
+      "forces the wrong particles -- WITHOUT failing: at 339,738,624 particles 21.0%% of leaves were\n"
+      "corrupt and the run still exited 0. Run with GADGET_HIP_INVARIANTS=1 to see the C-A-19c\n"
+      "check report it.\n"
+      "Smaller NLEAF buys index bits (LEAFBIT = 32 - log2(NLEAF)) but is an accuracy/performance\n"
+      "knob (C-A-02); the real fix is to stop packing. See the audit repo's T74.\n\n",
+      (long long) n_bodies, (unsigned long long)(1ull << LEAFBIT), LEAFBIT, NLEAF,
+      (long long) n_bodies, 32 - LEAFBIT, LEAFBIT);
+    exit(1);
+  }
+
   //Particle properties
   tree.bodies_pos.cmalloc(1, true);              // bound to bodies_Ppos, see gpu_iterate.cpp   //+1 to set end pos, host mapped? TODO not needed right since we use Ppos
-  tree.bodies_key.cmalloc(n_bodies+1, false);   //+1 to set end key
-  tree.bodies_ids.cmalloc(n_bodies+1, false);   //+1 to set end key
+  // T65 item 4: these were plain malloc + a separate hipMalloc. cmalloc_unified allocates them
+  // pinned and aliases the device side when GADGET_HIP_UNIFIED_MEM is on, and leaves them exactly
+  // as they were when it is off -- the two have to be one decision, see aliasWanted().
+  tree.bodies_key.cmalloc_unified(n_bodies+1, my_dev::dev_mem<uint4>::ALIAS_KEY);   //+1 to set end key
+  tree.bodies_ids.cmalloc_unified(n_bodies+1, my_dev::dev_mem<ullong>::ALIAS_IDS);   //+1 to set end key
 
-  tree.bodies_Ppos.cmalloc(n_bodies+1, true);   //Memory to store predicted positions, host mapped
-  tree.bodies_Pvel.cmalloc(n_bodies+1, true);   //Memory to store predicted velocities, host mapped
+  tree.bodies_Ppos.cmalloc(n_bodies+1, true, 0, my_dev::dev_mem<real4>::ALIAS_PPOS);   //Memory to store predicted positions, host mapped (T65 item 3)
+  tree.bodies_Pvel.cmalloc(n_bodies+1, true, 0, my_dev::dev_mem<real4>::ALIAS_PVEL);   //Memory to store predicted velocities, host mapped (T65 item 3)
 
-  tree.bodies_vel.cmalloc(n_bodies, false);
-  tree.bodies_acc0.ccalloc(n_bodies, false);    //ccalloc -> init to 0
-  tree.bodies_acc1.ccalloc(n_bodies, false);    //ccalloc -> init to 0
-  tree.bodies_time.ccalloc(n_bodies, false);    //ccalloc -> init to 0
+  tree.bodies_vel.cmalloc_unified(n_bodies, my_dev::dev_mem<real4>::ALIAS_VEL);
+  tree.bodies_acc0.ccalloc_unified(n_bodies, my_dev::dev_mem<real4>::ALIAS_ACC0);    //ccalloc -> init to 0
+  tree.bodies_acc1.ccalloc_unified(n_bodies, my_dev::dev_mem<real4>::ALIAS_ACC1);    //ccalloc -> init to 0
+  tree.bodies_time.ccalloc_unified(n_bodies, my_dev::dev_mem<int2>::ALIAS_TIME);    //ccalloc -> init to 0
 
   //density
 #if BONSAI_DENSITY
@@ -75,7 +118,7 @@ void octree::allocateParticleMemory(tree_structure &tree)
   // octree::recomputeSoftening() before it's ever read by the gravity kernel -- initial content
   // here is never actually consumed, but zero-init (via ccalloc, not cmalloc) is still safer than
   // leaving it as garbage in case some future caller reads it before the first tree rebuild.
-  tree.bodies_forceSoftening.ccalloc(n_bodies, true);
+  tree.bodies_forceSoftening.ccalloc(n_bodies, true, 0, my_dev::dev_mem<real>::ALIAS_FSOFTEN);   // T65 item 3
   tree.bodies_type.resize(n_bodies, 1); // default Gadget-2 type 1 (Halo/DM); main.cpp overwrites
 
   // Phase 5 ticket 06 (PLAN.md): on-device mirror of bodies_type, refreshed alongside
@@ -84,16 +127,16 @@ void octree::allocateParticleMemory(tree_structure &tree)
   // pm_add_masked_force_to_acc/pm_add_masked_potential_to_acc; made UNCONDITIONAL in Ticket 07
   // (PLAN.md) since the tree-walk gravity kernel now also reads it (for the per-target Rcut/Asmth
   // selection) in every build, not just HIGHRES ones.
-  tree.bodies_typeDevice.ccalloc(n_bodies, false);
+  tree.bodies_typeDevice.ccalloc_unified(n_bodies, my_dev::dev_mem<int>::ALIAS_TYPEDEV);
 
 
-  tree.oriParticleOrder.cmalloc(n_bodies, false);      //To desort the bodies tree later on
+  tree.oriParticleOrder.cmalloc_unified(n_bodies, my_dev::dev_mem<uint>::ALIAS_ORIORDER);      //To desort the bodies tree later on
   //iteration properties / information
-  tree.activePartlist.ccalloc(n_bodies+2, false);   //+2 since we use the last two values as a atomicCounter (for grp count and semaphore access)
+  tree.activePartlist.ccalloc_unified(n_bodies+2, my_dev::dev_mem<uint>::ALIAS_ACTIVEPART);   //+2 since we use the last two values as a atomicCounter (for grp count and semaphore access)
   tree.ngb.ccalloc(1, false);           // write-only, see dev_approximate_gravity_warp_new.cu
   tree.interactions.cmalloc(1, false);  // INTCOUNT off, see dev_approximate_gravity_warp_new.cu
 
-  tree.body2group_list.cmalloc(n_bodies, false);
+  tree.body2group_list.cmalloc_unified(n_bodies, my_dev::dev_mem<uint>::ALIAS_BODY2GROUP);
 
   tree.level_list.cmalloc(MAXLEVELS);
   tree.node_level_list.cmalloc(MAXLEVELS*2 , false);
@@ -130,8 +173,8 @@ void octree::allocateParticleMemory(tree_structure &tree)
   size_t tempmem = (size_t)(treeAllocFactor() * (double)n_bodies);
   if (tempmem < 2048) tempmem = 2048;
 
-  tree.n_children.cmalloc (tempmem, false);
-  tree.node_bodies.cmalloc(tempmem, false);
+  tree.n_children.cmalloc_unified (tempmem, my_dev::dev_mem<uint>::ALIAS_TREESCRATCH);
+  tree.node_bodies.cmalloc_unified(tempmem, my_dev::dev_mem<uint4>::ALIAS_TREESCRATCH);
 
   // generalBuffer1 must simultaneously hold, during build()'s per-level loop: validList
   // (2*n_bodies uints) + compactList (2*n_bodies uints) + node_key (4*tempmem uints, a uint4
@@ -171,7 +214,30 @@ void octree::allocateParticleMemory(tree_structure &tree)
   tempSize        = std::max(tempSize, treeWalkStackSize);
 
   //General buffer is used at multiple locations and reused in different functions
-  tree.generalBuffer1.cmalloc(tempSize, true);
+  // T65 item 1: NON-PINNED, was pinned. This is the single largest allocation in the run --
+  // 5.010 GiB at any N below ~139e6 (where it sits on the tree-walk stack floor,
+  // 2*(LMEM_STACK_SIZE*NTHREAD + LMEM_EXTRA_SIZE)*nBlocksForTreeWalk uints) and 16.3 GiB at 768^3.
+  // `pinned` meant hipHostMalloc, which is physically backed the instant it is allocated, so the
+  // host side cost real RAM on top of the device copy: measured 10.02 GiB of a 123 GiB machine
+  // before a single particle is placed, 32.7 GiB at 768^3.
+  //
+  // Of that host side, the ONLY bytes any live code reads are energy[0..255] (4 KB,
+  // gpu_iterate.cpp's compute_energies) and one element each of levelOffset and maxLevel
+  // (build.cpp, below). The one other d2h on an arena child, srcValues.d2h() in
+  // sort_bodies_gpu.cpp, is inside #if 0. About 6 KB of a 16 GB allocation, in other words.
+  // cmalloc_copy only takes the ADDRESS of its parent's host pointer (&sourcemem[offset]); it
+  // never touches the page.
+  //
+  // malloc'd memory is lazily backed -- measured in probes/t65-memory/t65_lazy_backing: 8 GB
+  // untouched costs nothing, and even READING it costs nothing because untouched pages map to the
+  // shared zero page; only a write faults real RAM. So as non-pinned this allocation costs address
+  // space plus the two or three pages those three consumers actually touch.
+  //
+  // Safe because no arena child uses the ASYNC h2d/d2h form, which is the only thing that requires
+  // page-locked memory (and asserts pinned_mem). Every host transfer on a child is blocking:
+  // levelOffset.d2h(1), maxLevel.d2h(1), energy.d2h(). parallel.cpp's bodyBuffer already has a
+  // "non-pinned" comment on its own d2h.
+  tree.generalBuffer1.cmalloc(tempSize, false);
 
   //General memory buffers
 
@@ -289,7 +355,13 @@ void octree::reallocateParticleMemory(tree_structure &tree)
   tempSize        = std::max(tempSize, treeWalkStackSize);
 
   //General buffer is used at multiple locations and reused in different functions
-  tree.generalBuffer1.cresize(tempSize, reduce);
+  // T65 item 1: cresize_nocpy, not cresize. The arena is pure scratch -- nothing in it has to
+  // survive a resize -- and cresize copies the old contents, which at 768^3 is a 16 GB
+  // device-to-device memcpy for data that is about to be overwritten. cresize_nocpy also frees
+  // before allocating, where cresize allocates the new buffer BEFORE freeing the old one and so
+  // transiently needs twice the arena on both sides (~65 GB at 768^3). Same reasoning as the
+  // compute_properties() site; if you change one, consider both.
+  tree.generalBuffer1.cresize_nocpy(tempSize, reduce);
 
   my_dev::base_mem::printMemUsage();
 }
@@ -316,10 +388,12 @@ void octree::allocateTreePropMemory(tree_structure &tree)
 #endif
 
     int n_groups = tree.n_groups;
-    if(tree.groupSizeInfo.get_size() <= n_groups)
+    // T74: tested against groupCenterInfo, not groupSizeInfo -- the latter is deliberately one
+    // entry LARGER than n_groups (the sentinel), so it would never look too small here.
+    if(tree.groupCenterInfo.get_size() <= n_groups)
       n_groups *= MULTI_GPU_MEM_INCREASE;
 
-    tree.groupSizeInfo.cresize_nocpy(n_groups,   false);
+    tree.groupSizeInfo.cresize_nocpy(n_groups + 1, false);   // T74: +1 for the [n_groups] sentinel
     tree.groupCenterInfo.cresize_nocpy(n_groups, false);
     tree.groupMaxAccInfo.cresize_nocpy(n_groups, false);  //Phase 3: Springel MAC input
     tree.groupMaxSofteningInfo.cresize_nocpy(n_groups, false);  //T27: softening-based bJ floor input
@@ -328,12 +402,12 @@ void octree::allocateTreePropMemory(tree_structure &tree)
   {
     //First call to this function
     n_nodes = (int)(n_nodes * 1.1f);
-    tree.multipole.cmalloc(3*n_nodes, true); //host allocated
+    tree.multipole.cmalloc(3*n_nodes, true, 0, my_dev::dev_mem<real4>::ALIAS_TREEPROPS); //host allocated (T65 item 3)
 
-    tree.boxSizeInfo.cmalloc(n_nodes, true);     //host allocated
-    tree.groupSizeInfo.cmalloc(tree.n_groups, true);
-    tree.cellSizeInfo.cmalloc(n_nodes, true);    //T26: fixed octree-cell size per node
-    tree.cellCenterInfo.cmalloc(n_nodes, true);  //C-A-01(b): fixed octree-cell centre per node
+    tree.boxSizeInfo.cmalloc(n_nodes, true, 0, my_dev::dev_mem<float4>::ALIAS_TREEPROPS);     //host allocated (T65 item 3)
+    tree.groupSizeInfo.cmalloc(tree.n_groups + 1, true, 0, my_dev::dev_mem<float4>::ALIAS_GROUPPROPS);   // T65 item 3; +1 = T74 sentinel
+    tree.cellSizeInfo.cmalloc(n_nodes, true, 0, my_dev::dev_mem<float>::ALIAS_TREEPROPS);    //T26: fixed octree-cell size per node (T65 item 3)
+    tree.cellCenterInfo.cmalloc(n_nodes, true, 0, my_dev::dev_mem<real4>::ALIAS_TREEPROPS);  //C-A-01(b): fixed octree-cell centre per node (T65 item 3)
 #ifdef UNEQUALSOFTENINGS
     tree.nodeSoftInfo.cmalloc(n_nodes, true);    //T28/C-A-04: per-node softening summary
 #else
@@ -341,10 +415,10 @@ void octree::allocateTreePropMemory(tree_structure &tree)
     tree.nodeSoftInfo.cmalloc(1, true);
 #endif
 
-    tree.boxCenterInfo.cmalloc(n_nodes, true); //host allocated
-    tree.groupCenterInfo.cmalloc(tree.n_groups,true);
-    tree.groupMaxAccInfo.cmalloc(tree.n_groups, true);    //Phase 3: Springel MAC input
-    tree.groupMaxSofteningInfo.cmalloc(tree.n_groups, true);    //T27: softening-based bJ floor input
+    tree.boxCenterInfo.cmalloc(n_nodes, true, 0, my_dev::dev_mem<float4>::ALIAS_TREEPROPS); //host allocated (T65 item 3)
+    tree.groupCenterInfo.cmalloc(tree.n_groups, true, 0, my_dev::dev_mem<float4>::ALIAS_GROUPPROPS);   // T65 item 3
+    tree.groupMaxAccInfo.cmalloc(tree.n_groups, true, 0, my_dev::dev_mem<float>::ALIAS_GROUPPROPS);    //Phase 3: Springel MAC input (T65 item 3)
+    tree.groupMaxSofteningInfo.cmalloc(tree.n_groups, true, 0, my_dev::dev_mem<float>::ALIAS_GROUPPROPS);    //T27: softening-based bJ floor input (T65 item 3)
   }
   devContext->stopTiming("Memory", 11, execStream->s());
 }
@@ -368,9 +442,9 @@ void octree::build (tree_structure &tree) {
 
 
 
-  int memBufOffset = validList.cmalloc_copy  (tree.generalBuffer1, tree.n*2, 0);
-      memBufOffset = compactList.cmalloc_copy(tree.generalBuffer1, tree.n*2, memBufOffset);
-  int memBufOffsetValidList = memBufOffset;
+  size_t memBufOffset = validList.cmalloc_copy  (tree.generalBuffer1, (size_t)tree.n*2, 0);   // T72: size_t
+      memBufOffset = compactList.cmalloc_copy(tree.generalBuffer1, (size_t)tree.n*2, memBufOffset);
+  size_t memBufOffsetValidList = memBufOffset;
 
   // 2026-08-30: node_key must have the same worst-case node capacity as n_children/node_bodies
   // (allocateParticleMemory/reallocateParticleMemory's own tempmem, see their comments) -- all
@@ -799,8 +873,8 @@ void octree::build (tree_structure &tree) {
     atoms.reserve(tree.n_leafs);
     for (int i = 0; i < tree.n_leafs; i++)
     {
-      uint2 nb = tree.node_bodies[tree.leafNodeIdx[i]];
-      uint start = nb.x & ILEVELMASK;
+      uint4 nb = tree.node_bodies[tree.leafNodeIdx[i]];
+      uint start = nb.x;                            // T74: full width, no mask
       uint end   = nb.y;
       if (end > start) atoms.push_back(std::make_pair(start, end));
     }

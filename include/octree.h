@@ -284,7 +284,10 @@ class tree_structure
     
     my_dev::dev_mem<uint2> level_list;    //List containing the start and end positions of each level
     my_dev::dev_mem<uint>  n_children;
-    my_dev::dev_mem<uint2> node_bodies;
+    // T74: uint4, was uint2. .x = index of the node's first body (FULL 32 bits), .y = index one
+    // past its last, .z = tree level, .w = UNUSED -- and deliberately left unused: packing a
+    // second field into a spare lane is how the 27-bit limit this replaces came about.
+    my_dev::dev_mem<uint4> node_bodies;
     my_dev::dev_mem<uint>  leafNodeIdx;    //First n_leaf items represent indices of leafs
                                            //remaining (n_nodes-n_leafs) are indices of non-leafs
 
@@ -629,11 +632,30 @@ public:
                 my_dev::dev_mem<char>   &tempE,       //For sorting space
                 int N);
 
+   // T65 item 3: devOnly now defaults to TRUE, was false.
+   //
+   // With devOnly false, dataReorder's write-back goes through dev_mem::copy(), which copies the
+   // scratch buffer on the DEVICE and then separately memcpy's it on the HOST. The scratch buffer
+   // is always a view carved out of generalBuffer1, whose host side is never written by anything
+   // -- so that host memcpy copied UNINITIALISED bytes over the host side of bodies_vel,
+   // bodies_acc0, bodies_acc1, bodies_Ppos, bodies_Pvel, bodies_time and bodies_ids on every full
+   // shuffle. Harmless until now only because every reader of those host sides does a d2h first,
+   // which overwrites the garbage before it can be seen.
+   //
+   // It stopped being harmless the moment a buffer could be ALIASED, because then host_ptr IS the
+   // device memory and the garbage lands on the live data. That is exactly how it was found:
+   // aliasing bodies_Ppos alone made the 64^3 run die in its first tree build with
+   // "box size 0.000000" -- the boundary reduction over positions that had just been overwritten
+   // with arena contents. bodies_Pvel survived the same treatment only because predict()
+   // recomputes it from bodies_vel every step; bodies_Ppos is the position of record (it is what
+   // bodies_pos was folded into), so corrupting it destroys the run.
+   //
+   // Nothing can depend on the old behaviour: what it wrote was uninitialised memory.
    template <typename T>
    void dataReorder(const int N, my_dev::dev_mem<uint> &permutation,
                     my_dev::dev_mem<T>  &dIn, my_dev::dev_mem<T>  &scratch,
                     bool overwrite = true,
-                    bool devOnly   = false);
+                    bool devOnly   = true);
 
    template <typename T>
    void dataReorder2(const int N, my_dev::dev_mem<uint> &permutation,

@@ -108,7 +108,7 @@ static const BufferSpec kBufferRegistry[] =
   // --- node / group indexed ------------------------------------------------------------------
   {"level_list",            SPACE_NODE,   EV_INFERRED, ""},
   {"n_children",            SPACE_NODE,   EV_INFERRED, ""},
-  {"node_bodies",           SPACE_NODE,   EV_VERIFIED, "carries the build-time level bits (T26)"},
+  {"node_bodies",           SPACE_NODE,   EV_VERIFIED, "uint4: .x first body, .y one past last, .z level (T74)"},
   {"leafNodeIdx",           SPACE_NODE,   EV_INFERRED, ""},
   {"node_level_list",       SPACE_NODE,   EV_VERIFIED, "Bug 5 overflowed this under unbalanced trees"},
   {"multipole",             SPACE_NODE,   EV_VERIFIED, "3 real4 per node: M0 (mass+COM), Q0, Q1. The monopole path reads only M0 (dev_approximate_gravity_warp_new.cu:1030,:864); the quadrupole path reads Q0/Q1 at :809-810 but zeroes Q0.w. So 2 of 3 real4 per node are dead in the default build", 2.0f/3.0f},

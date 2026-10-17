@@ -155,7 +155,7 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
   my_dev::dev_mem<uint> tempB, tempC,  tempD;
   my_dev::dev_mem<char> tempE;
   //The generalBuffer1 has size uint*4*N*3 = uint*12*N
-  int genBufOffset2 = 0;
+  size_t genBufOffset2 = 0;   // T72: size_t -- this chain reaches 7.25*N uints
 
   genBufOffset2 = srcValues.cmalloc_copy(tree.generalBuffer1, tree.n, 0);  //uint*N -uint5*N
   genBufOffset2 = tempB    .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint5*N-uint6*N
@@ -316,6 +316,9 @@ template<typename T> void octree::dataReorder(const int              N,
   dataReorder2(N, permutation, dIn, scratch);
   if(overwrite)
   {
+      // devOnly defaults to TRUE as of T65 item 3 -- see the long comment on the declaration in
+      // octree.h. The `else` branch's host memcpy reads `scratch`, which is always a view into
+      // generalBuffer1, whose host side holds uninitialised bytes.
       if(devOnly) dIn.copy_devonly(scratch,  N);
       else        dIn.copy        (scratch,  N);
   }

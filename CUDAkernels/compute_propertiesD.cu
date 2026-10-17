@@ -145,7 +145,7 @@ static __device__ void compute_bounds_node(float3 &r_min, float3 &r_max,
 
 KERNEL_DECLARE(compute_leaf)( const int n_leafs,
                               uint *leafsIdxs,
-                              uint2 *node_bodies,
+                              uint4 *node_bodies,
                               real4 *body_pos,
                               double4 *multipole,
                               real4 *nodeLowerBounds,
@@ -180,8 +180,8 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
   //we get a leaf-id from the leafsIdxs array
   int nodeID = leafsIdxs[id];
 
-  const uint2 bij          =  node_bodies[nodeID];
-  const uint firstChild    =  bij.x & ILEVELMASK;
+  const uint4 bij          =  node_bodies[nodeID];
+  const uint firstChild    =  bij.x;                 // T74: full width, no mask
   const uint lastChild     =  bij.y;  //TODO maybe have to increase it by 1
 
   //Variables holding properties and intermediate answers
@@ -539,7 +539,7 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
                                            float theta,
                                            real4 *boxSizeInfo,
                                            real4 *boxCenterInfo,
-                                           uint2 *node_bodies,
+                                           uint4 *node_bodies,
                                            float  domain_fac,
                                            float  *cellSizeInfo,
                                            real4  corner,          //C-A-01(b): tree.corner
@@ -557,9 +557,9 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
   // semantics -- independent of how tightly the node's actual particles happen to be clustered
   // (unlike boxSizeInfo below, which is a particle-fitted AABB and is the quantity Ticket 24 found
   // can shrink pathologically for a tightly-clustered node). Each node's own build-time octree
-  // depth ("level") is already stored in node_bodies[idx].x's top BITLEVELS..31 bits (written once,
-  // unconditionally, by build_tree.cu's cl_build_nodes -- the same field build_tree.cu's own
-  // level-decode logic reads via `(bij.x & LEVELMASK) >> BITLEVELS`), so this is a cheap, exact
+  // depth ("level") is already stored in node_bodies[idx].z (written once, unconditionally, by
+  // build_tree.cu's cl_build_nodes -- the same field build_tree.cu's own level-decode logic reads;
+  // T74 gave it its own lane, it used to share .x with the body index), so this is a cheap, exact
   // decode, not an approximation: the root domain box (tree.corner/tree.domain_fac, sort_bodies_gpu.cpp)
   // is subdivided by exactly 1 bit/axis (3 bits total) per level down to MAXLEVELS -- see
   // support_kernels.cu's get_key()/get_mask() -- so a node at depth `level` has fixed cube side
@@ -567,7 +567,7 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
   // later, at kernel-walk time) since domain_fac/node level are both known up front and this is a
   // one-time O(n_nodes) cost identical in kind to boxSizeInfo/boxCenterInfo's own computation below.
   {
-    const uint  bijLevel   = (node_bodies[idx].x & LEVELMASK) >> BITLEVELS;
+    const uint  bijLevel   =  node_bodies[idx].z;
     const uint  shiftLevel = (bijLevel <= (uint)MAXLEVELS) ? (uint)MAXLEVELS - bijLevel : 0u;
     cellSizeInfo[idx] = domain_fac * (float)(1u << shiftLevel);
   }
@@ -734,8 +734,8 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
     
   cellOp = cellOp*cellOp;
 
-  uint2 bij     = node_bodies[idx];
-  uint pfirst   = bij.x & ILEVELMASK;
+  uint4 bij     = node_bodies[idx];
+  uint pfirst   = bij.x;                             // T74: full width, no mask
   uint nchild   = bij.y - pfirst;
   
 
@@ -846,9 +846,11 @@ KERNEL_DECLARE(gpu_setPHGroupData)(const int n_groups,
     groupSizeInfo[bid].y = grpSize.y;
     groupSizeInfo[bid].z = grpSize.z;
 
-    int nchild             = end-start;
-    start                  = start | (nchild-1) << CRITBIT;
-    groupSizeInfo[bid].w   = __int_as_float(start);  
+    // T74: the first-particle index at FULL 32-bit width, with no count packed into the top
+    // bits. The consumer derives the count as start[g+1] - start[g]; see node_specs.h.
+    groupSizeInfo[bid].w   = __int_as_float(start);
+    // The sentinel that makes that derivation branch-free for the last group.
+    if (bid == 0) groupSizeInfo[n_groups].w = __int_as_float(n_particles);
 
     float l = max(grpSize.x, max(grpSize.y, grpSize.z));
 
@@ -944,9 +946,11 @@ KERNEL_DECLARE(gpu_setPHGroupDataGetKey)(const int n_groups,
 
     real4 pos = bodies_pos[start];
 
-    int nchild             = end-start;
-    start                  = start | (nchild-1) << CRITBIT;
+    // T74: full-width index, count derived by the consumer -- see the sibling kernel above and
+    // node_specs.h. Kept identical to that one on purpose: this is the GetKey variant, and
+    // memory/second-copy-of-a-kernel.md is about exactly this pair drifting apart.
     groupSizeInfo[bid].w   = __int_as_float(start);
+    if (bid == 0) groupSizeInfo[n_groups].w = __int_as_float(n_particles);
 
     float l = max(grpSize.x, max(grpSize.y, grpSize.z));
 

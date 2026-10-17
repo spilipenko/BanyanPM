@@ -80,7 +80,10 @@ grep -m1 'MAC:' "$banner" | tr -s '\t' ' ' | sed 's/^/  ok    /'
 
 # ---------------------------------------------------------------- the runs
 step RUNS "4 x 64^3 to z=0"
-run every                                              || fail
+# T76 made the cadence the DEFAULT, so the every-step arm must now say so EXPLICITLY. Left
+# implicit it would silently become a second cadence run, and this gate would keep passing while
+# its first arm tested nothing -- the every-vs-cadence comparison below is the whole point of it.
+run every    GADGET_HIP_PM_CADENCE=0                   || fail
 run cadence  GADGET_HIP_PM_CADENCE=1                   || fail
 run nopm     GADGET_HIP_PM_CADENCE=1 GADGET_HIP_PM_NO_KICK=1   || fail
 run kick10   GADGET_HIP_PM_CADENCE=1 GADGET_HIP_PM_KICK_SCALE=10 || fail

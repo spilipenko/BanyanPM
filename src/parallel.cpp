@@ -1468,9 +1468,9 @@ void octree::gpuRedistributeParticles_SFC(uint4 *boundaries)
   my_dev::dev_mem<uint>   idList;
   my_dev::dev_mem<uint>   atomicBuff; //Used for counting during particle movement
 
-  int tempOffset1 = validList2.   cmalloc_copy(localTree.generalBuffer1, localTree.n, 0);
+  size_t tempOffset1 = validList2.   cmalloc_copy(localTree.generalBuffer1, localTree.n, 0);   // T72: size_t
       tempOffset1 = validList3.   cmalloc_copy(localTree.generalBuffer1, localTree.n, tempOffset1);
-  int tempOffset  = idList.       cmalloc_copy(localTree.generalBuffer1, localTree.n, tempOffset1);
+  size_t tempOffset  = idList.       cmalloc_copy(localTree.generalBuffer1, localTree.n, tempOffset1);
                     boundariesGPU.cmalloc_copy(localTree.generalBuffer1, nProcs+2,    tempOffset);
   tempOffset1     = atomicBuff.   cmalloc_copy(localTree.generalBuffer1, 1,           tempOffset1);
 
@@ -1544,7 +1544,11 @@ void octree::gpuRedistributeParticles_SFC(uint4 *boundaries)
         //Check if the memory size, of the generalBuffer is large enough to store the exported particles
         //if not allocate a buffer on the host that will store the data instead
         int validCount = nExportParticles;
-        int tempSize   = localTree.generalBuffer1.get_size() - tempOffset1;
+        // T72: get_size() is size_t and reaches 4.4e9 uints at 768^3, so the subtraction must
+        // not land in an int. The staging loop below is int-based throughout and does not need
+        // more than INT_MAX uints, so clamp rather than widen the whole loop.
+        const size_t tempSizeFull = localTree.generalBuffer1.get_size() - tempOffset1;
+        int tempSize   = (int) std::min(tempSizeFull, (size_t) INT_MAX);
         int stepSize   = (tempSize / (sizeof(bodyStruct) / sizeof(int)))-512; //Available space in # of bodyStructs
 
         if(stepSize > nExportParticles)
@@ -1560,7 +1564,7 @@ void octree::gpuRedistributeParticles_SFC(uint4 *boundaries)
 
 
         my_dev::dev_mem<bodyStruct>  bodyBuffer;
-        int memOffset1 = bodyBuffer.cmalloc_copy(localTree.generalBuffer1, stepSize, tempOffset1);
+        size_t memOffset1 = bodyBuffer.cmalloc_copy(localTree.generalBuffer1, stepSize, tempOffset1);
 
         double tx  = get_time();
         int extractOffset = 0;
@@ -1797,7 +1801,7 @@ int octree::gpu_exchange_particles_with_overflow_check_SFC2(tree_structure &tree
 
   my_dev::dev_mem<bodyStruct>  bodyBuffer;
 
-  int memOffset1 = bodyBuffer.cmalloc_copy(localTree.generalBuffer1, stepSize, 0);
+  size_t memOffset1 = bodyBuffer.cmalloc_copy(localTree.generalBuffer1, stepSize, 0);   // T72: size_t
 
   double tAllocComplete = get_time();
 

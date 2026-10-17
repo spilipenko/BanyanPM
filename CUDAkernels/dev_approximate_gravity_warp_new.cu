@@ -1477,7 +1477,8 @@ static __device__ bool split_node_grav_springel(
   // function's own header comment predicted back in the original Phase 3 session: replace bJ with
   // the node's FIXED octree-cell side length (`cellSizeInfo`, computed once at tree-build time in
   // compute_propertiesD.cu's compute_scaling as domain_fac*2^(MAXLEVELS-level), decoded from each
-  // node's own build-time subdivision depth already stored in node_bodies[idx].x -- the literal
+  // node's own build-time subdivision depth already stored in node_bodies[idx].z (T74; .x before
+  // it got its own lane) -- the literal
   // structural analogue of Gadget-2's own fixed-size `len`, not a proxy for it). The plumbing (this
   // parameter, cellSizeInfo itself, and the full call-chain threading it down to this function) is
   // real, builds cleanly, and was verified NOT to be the source of any bug via a direct control
@@ -1500,7 +1501,7 @@ static __device__ bool split_node_grav_springel(
   // hypothesis for a follow-up session: Bonsai's octree is not guaranteed perfectly balanced/uniform
   // in the way this derivation assumes for every node (particularly for internally-linked/merged
   // nodes formed by link_tree from children created at different levels, vs. leaves created directly
-  // by cl_build_nodes's own per-level loop) -- node_bodies[idx].x's level field may not carry the
+  // by cl_build_nodes's own per-level loop) -- node_bodies[idx].z's level field may not carry the
   // same fixed-cell-size meaning uniformly across the whole tree the way it does for the leaf-level
   // nodes sampled here, an untested assumption this fix's derivation silently depends on. Per this
   // ticket's own explicit fallback instruction ("if the structural fix isn't safely implementable in
@@ -2172,13 +2173,36 @@ bool treewalk(
 
   /*********** set necessary thread constants **********/
 #ifdef DO_BLOCK_TIMESTEP
-  real4 curGroupSize    = groupSizeInfo[active_groups[bid]];
+  const int   grpIdx    = active_groups[bid];
 #else
-  real4 curGroupSize    = groupSizeInfo[bid];
+  const int   grpIdx    = bid;
 #endif
-  const int   groupData       = __float_as_int(curGroupSize.w);
-  const uint body_addr        =   groupData & CRITMASK;
-  const uint nb_i             = ((groupData & INVCMASK) >> CRITBIT) + 1;
+  real4 curGroupSize    = groupSizeInfo[grpIdx];
+  // T74: .w is the group's first-particle index at full 32-bit width, and the count comes from the
+  // next group's start -- groups tile [0,n) contiguously in group order (C-A-19b), and
+  // groupSizeInfo carries an [n_groups] sentinel holding n so this needs no branch. One extra
+  // 4-byte load per GROUP, i.e. once per block, against the thousands of cell interactions the
+  // walk then does for it. It replaces a 5-bit count field that capped the run at 2^27 particles.
+  const uint body_addr        = (uint) __float_as_int(curGroupSize.w);
+  // T75: the clamp is NOT defensive -- it is load-bearing, and removing it costs 18% per step.
+  //
+  // A group holds at most NCRIT particles by construction, and the packing T74 replaced relied on
+  // exactly that fact: it stored count-1 in log2(NCRIT) bits, so the compiler could PROVE
+  // nb_i <= NCRIT from the mask arithmetic alone. A difference of two loaded 32-bit indices carries
+  // no such range, and that lost proof -- not the extra load -- is what the regression was. With
+  // NCRIT == WARP_SIZE the `ni` below is then provably 1, and the `laneId % (nb_i - WARP_SIZE)` two
+  // lines down is dead code: a modulo by ZERO that only ever compiled because it was eliminated.
+  // Kept live it is a full runtime integer modulo, and measured on the walk kernel at 512^3:
+  //
+  //                            VGPRs   scratch   SGPR spills   per-step
+  //   provable range (<=T74)     100       0 B             0     6.93 s
+  //   range lost                 184      56 B            24     8.15 s   +18%
+  //   restored by this min()     back to 100/0/0                 (see analysis/t65/PERF.md)
+  //
+  // The VGPR file is fixed per SIMD, so 100 -> 184 roughly halves the walk's occupancy. min() is
+  // one VALU op and restores the range the old bit-field had for free.
+  const uint nb_i_raw         = (uint) __float_as_int(groupSizeInfo[grpIdx + 1].w) - body_addr;
+  const uint nb_i             = min(nb_i_raw, (uint) NCRIT);
 
 #ifdef DO_BLOCK_TIMESTEP
   real4 group_pos       = groupCenterInfo[active_groups[bid]];

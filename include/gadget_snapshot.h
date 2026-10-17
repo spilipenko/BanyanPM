@@ -56,6 +56,49 @@ struct GadgetParticleData
                                 // appear in practice, but nothing here enforces that.
 };
 
+// T65: a streaming, optionally MULTI-FILE writer, reading straight out of the port's live host
+// arrays instead of a GadgetParticleData copy of them.
+//
+// Two reasons it has to exist, and the first one is not about memory at all:
+//
+//  1. Format 1/2 brackets every block with a PLAIN 4-BYTE INT length marker (io.c, and
+//     gadget_snapshot.cpp's writeRecord). The POS block is 12 bytes per particle, so a single
+//     physical file cannot hold more than (INT_MAX-8)/12 = 178,956,970 particles -- whatever the
+//     machine's memory. 768^3 is 452,984,832. Gadget-2's answer is NumFilesPerSnapshot, which this
+//     port parsed and ignored; gadget_snapshot_write() hard-coded num_files = 1 and computed its
+//     block sizes in `int`, so above that count it silently wrote a negative marker.
+//  2. gadget_snapshot_write() needs the whole snapshot staged as a GadgetParticleData (40 B per
+//     particle) plus a size_t permutation (8), plus std::stable_sort's own temporary (8), plus a
+//     float buffer per block (12) -- about 30 GB at 768^3 on top of a run that already needs 100.
+//
+// This writer holds one chunk at a time (a few MB) and a 4-byte permutation only when the particle
+// types are actually mixed. With numFiles = 1 and a single particle type it produces a
+// byte-identical file to gadget_snapshot_write().
+//
+// Positions come from `pos4` as x,y,z,MASS at stride 4 (the port's real4 bodies_Ppos, whose .w is
+// the mass); velocities from `vel4` at stride 4, optionally indirected through `velPerm`.
+struct GadgetSnapshotSource
+{
+  size_t                    n       = 0;
+  const float              *pos4    = nullptr;   // 4 floats/particle: x, y, z, mass
+  const float              *vel4    = nullptr;   // 4 floats/particle: x, y, z, (unused)
+  const unsigned int       *velPerm = nullptr;   // vel index = velPerm[i]; null = identity
+  const unsigned long long *id      = nullptr;
+  const int                *type    = nullptr;   // null = every particle is type 1 (Halo/DM)
+  bool                      shiftPositions = false;   // undo a zoom recentring on the way out
+  double                    shift[3] = {0.0, 0.0, 0.0};
+  double                    boxSize  = 0.0;
+};
+
+// `numFiles` is a REQUEST: it is raised to the minimum the 4-byte markers allow, with a line on
+// stderr saying so, because writing a truncated snapshot would be worse than writing more files
+// than asked. Files are named "<basePath>" for one file and "<basePath>.0", ".1", ... for several,
+// matching Gadget-2's find_files() convention, which is also what gadget_snapshot_read() expects.
+bool gadget_snapshot_write_streaming(const std::string &basePath, int snapFormat, bool longIds,
+                                     bool comovingIntegrationOn, GadgetSnapshotHeader header,
+                                     int numFiles, const GadgetSnapshotSource &src,
+                                     std::string &error);
+
 // Writes a DM-only-shaped Gadget-2 snapshot: HEAD, POS, VEL, ID, and MASS only for particle types
 // that don't get a fixed per-type mass. `header.npart`/`npartTotal`/`npartTotalHighWord`/
 // `num_files` are computed here from `data.type` and OVERWRITTEN regardless of what the caller

@@ -355,17 +355,21 @@ namespace my_dev {
     static long long currentMemUsage;
     static long long maxMemUsage;
 
-    void increaseMemUsage(int bytes)
+    // T72: these took `int bytes` and are called as increaseMemUsage(size*sizeof(T)), so every
+    // allocation over 2 GB was recorded wrapped -- and generalBuffer1 alone is 5.0 GiB at 512^3.
+    // The accumulators were already long long; only the parameters were narrow, which made
+    // printMemUsage()'s "Current/Maximum usage" lines useless for exactly the runs that need them.
+    void increaseMemUsage(size_t bytes)
     {
-      currentMemUsage +=  bytes;
+      currentMemUsage +=  (long long) bytes;
 
       if(currentMemUsage > maxMemUsage)
         maxMemUsage = currentMemUsage;
     }
 
-    void decreaseMemUsage(int bytes)
+    void decreaseMemUsage(size_t bytes)
     {
-      currentMemUsage -=  bytes;
+      currentMemUsage -=  (long long) bytes;
     }
 
     static void printMemUsage()
@@ -399,6 +403,9 @@ namespace my_dev {
     hipEvent_t  asyncCopyEvent = nullptr;
 
     bool pinned_mem, flags;
+    // T65 item 3: hDeviceMem points AT host_ptr -- one physical buffer, no device copy, nothing to
+    // transfer. Only ever true for pinned memory in a GADGET_HIP_UNIFIED_MEM build.
+    bool aliased = false;
     bool hDeviceMem_flag;
     bool childMemory; //Indicates that this is a shared buffer that will be freed by a parent
 
@@ -413,7 +420,9 @@ namespace my_dev {
       if (hDeviceMem_flag)
       {
     	  assert(size > 0);
-    	  (hipFree(hDeviceMem));
+    	  // T65 item 3: an aliased buffer has no device allocation of its own -- hDeviceMem is
+    	  // host_ptr, and hipHostFree below releases it. hipFree on it would be a double free.
+    	  if (!aliased) (hipFree(hDeviceMem));
     	  decreaseMemUsage(size*sizeof(T));
 
     	  if(pinned_mem){
@@ -422,6 +431,7 @@ namespace my_dev {
     		  free(host_ptr);
     	  }
           hDeviceMem_flag = false;
+          aliased = false;
       }
     } //cuda_free
 
@@ -458,11 +468,13 @@ namespace my_dev {
     ///////////
     //Return the number of elements (of type uint) to be padded
     //to get to the correct address boundary
-    static int getGlobalMemAllignmentPadding(int n)
+    // T72: every intermediate here was `int`, and `offset = n*sizeof(uint)` alone overflows at
+    // n = 537e6 uints -- reached by build()'s arena chain at N = 61e6 particles.
+    static size_t getGlobalMemAllignmentPadding(size_t n)
     {
-      const int allignBoundary = 128*sizeof(uint); //CC 2.X and 3.X ,128 bytes
+      const size_t allignBoundary = 128*sizeof(uint); //CC 2.X and 3.X ,128 bytes
 
-      int offset = 0;
+      size_t offset = 0;
       //Compute the number of bytes
       offset = n*sizeof(uint);
       //Compute number of allignBoundary byte blocks
@@ -481,29 +493,38 @@ namespace my_dev {
     //offset    -> The offset, this *MUST* be the return value of previous calls
     //             to this function to ensure alignment. Note this is the number
     //             of elements in type uint
-    int  cmalloc_copy(dev_mem<uint> &sourcemem, const size_t n, const int offset)
+    // T72: `offset` and the return value were `int`. build()'s chain through this function is
+    // validList(2N) + compactList(2N) + node_key(4*TreeAllocFactor*N) = 8.8*N uints at the
+    // production TreeAllocFactor of 1.2, so the running offset crossed INT_MAX at
+    // N = 2^31/8.8 = 244e6 particles (625^3) and no run above that could start -- which happened
+    // to sit almost exactly on the measured memory ceiling, so every failure looked like memory.
+    // Bug 9 widened `n`, `tempSize` and dev_mem::size to size_t and stopped one level short.
+    size_t cmalloc_copy(dev_mem<uint> &sourcemem, const size_t n, const size_t offset)
     {
       //The properties
       this->pinned_mem  = sourcemem.get_pinned();
       this->flags       = sourcemem.get_flags();
+      // T65 item 3: a child carved out of an aliased parent is itself aliased -- the two pointer
+      // derivations below land on the same address, so its d2h/h2d must no-op for the same reason.
+      this->aliased     = sourcemem.is_aliased();
       this->childMemory = true;
       this->size 		= n;
 
 
-      void* ParentHost_ptr = &sourcemem[offset];
+      void* ParentHost_ptr = &sourcemem[(ptrdiff_t)offset];
       host_ptr = (T*) ((char*)ParentHost_ptr);
 
 
       /* jbedorf: fixed so address is correct, casting before adding gives a different
        * result. So divide by size of object */
       void *cudaMem     = sourcemem.get_devMem();
-      hDeviceMem        = (T*)cudaMem + ((offset*sizeof(uint)) / sizeof(T));
+      hDeviceMem        = (T*)cudaMem + ((offset*sizeof(uint)) / sizeof(T));   // size_t throughout (T72)
       DeviceMemPtr      = (void*)(size_t)(hDeviceMem);
       hDeviceMem_flag   = true;
 
       //Compute the alignment
-      int currentOffset = offset + ((n*sizeof(T)) / sizeof(uint));
-      int padding       = getGlobalMemAllignmentPadding(currentOffset);
+      size_t currentOffset = offset + ((n*sizeof(T)) / sizeof(uint));
+      size_t padding       = getGlobalMemAllignmentPadding(currentOffset);
 
       // The "TODO for safety" that used to sit here, now implemented -- it is load-bearing.
       // generalBuffer1 is a shared scratch arena carved up by several unrelated consumers
@@ -514,18 +535,20 @@ namespace my_dev {
       // independently of the node count) silently ran off the end and the only symptom was a
       // bare "Memory access fault by GPU node-1" with no indication of which buffer or why.
       // Fail here, naming the consumer, instead.
-      const size_t endUint = (size_t)currentOffset + (size_t)padding;
+      const size_t endUint = currentOffset + padding;
       if (endUint > sourcemem.get_size())
       {
         fprintf(stderr,
           "\nFATAL: scratch arena overflow while sub-allocating %zu element(s) of size %zu.\n"
           "  arena capacity : %zu uints\n"
-          "  required       : %zu uints (offset %d + this allocation + alignment)\n"
+          "  required       : %zu uints (offset %zu + this allocation + alignment)\n"
           "This is a shared scratch buffer; the consumer that overflowed it is the caller of\n"
-          "cmalloc_copy immediately above this line in the backtrace. If the run is large,\n"
-          "raise TreeAllocFactor in the parameter file; otherwise the arena sizing in\n"
-          "octree::allocateParticleMemory / reallocateParticleMemory needs to account for this\n"
-          "consumer explicitly.\n\n",
+          "cmalloc_copy immediately above this line in the backtrace. The arena sizing in\n"
+          "octree::allocateParticleMemory / reallocateParticleMemory has to account for this\n"
+          "consumer explicitly.\n"
+          "NOTE (T72): do NOT raise TreeAllocFactor to escape this -- build()'s own chain through\n"
+          "this function is 4*N + 4*TreeAllocFactor*N uints, so a larger factor makes the\n"
+          "requirement bigger, not the arena. This message used to advise exactly that.\n\n",
           (size_t)n, sizeof(T), (size_t)sourcemem.get_size(), endUint, offset);
         exit(1);
       }
@@ -580,21 +603,133 @@ namespace my_dev {
       }
     }
 
-    void cmalloc(size_t n, bool pinned = false, int flags = 0)
+    // T65 item 3. Measured on gfx1151 (probes/t65-memory in the audit repo): an 8 GB pinned host
+    // buffer plus its hipMalloc device copy costs 16 GB of MemAvailable -- two distinct sets of
+    // physical pages -- and hipHostGetDevicePointer returns the SAME address for pinned
+    // allocations of 8, 16, 32, 48, 64 and 80 GB, with a kernel writing correctly through it
+    // across the whole buffer including its last element. Bandwidth through the alias is 0.990 of
+    // a hipMalloc buffer for reads, 0.971 for read-modify-write and 0.935 for streaming writes, so
+    // this is close to free but not quite: budget 6-8% on write-heavy kernels.
+    //
+    // Compile-time gated because a DISCRETE GPU needs the copy; env-overridable because the
+    // codebase idiom is that any behaviour change gets an A/B knob (verification-toolkit item 4).
+    static bool unifiedMem()
+    {
+#ifdef GADGET_HIP_UNIFIED_MEM
+      static int on = -1;
+      if (on < 0) { const char *e = getenv("GADGET_HIP_UNIFIED_MEM"); on = e ? atoi(e) : 1; }
+      return on != 0;
+#else
+      return false;
+#endif
+    }
+
+    // Aliasing is OPT-IN PER BUFFER, not blanket. T65's own plan said to audit and convert one
+    // array at a time, and the first attempt at doing it blanket proved why: with every pinned
+    // buffer aliased, the 64^3 run died in its first tree build with "box size 0.000000" -- the
+    // boundary reduction over bodies_Ppos came back with r_min == r_max. The hardware is not the
+    // problem (probes/t65-memory/t65_alias_direction shows host->device and device->host both
+    // correct at that buffer size under every hipHostMalloc flag combination), so some site
+    // depends on the double buffering, and a blanket switch cannot say which.
+    //
+    // So each call site states whether its array has been audited, and the bitmask below selects
+    // which of the audited ones actually alias -- which is what makes bisecting possible at all.
+    // GADGET_HIP_UNIFIED_ARRAYS is a bitmask over AliasId; default all-ones.
+    enum AliasId
+    {
+      ALIAS_NONE        = 0,
+      ALIAS_PPOS        = 1u << 0,
+      ALIAS_PVEL        = 1u << 1,
+      ALIAS_FSOFTEN     = 1u << 2,
+      ALIAS_TREEPROPS   = 1u << 3,   // multipole, boxSize/boxCenter/cellSize/cellCenter
+      ALIAS_GROUPPROPS  = 1u << 4,   // groupSize/groupCenter/groupMaxAcc/groupMaxSoftening
+      // --- T65 item 4: arrays that were plain malloc + hipMalloc, converted to pinned+aliased
+      ALIAS_KEY         = 1u << 5,
+      ALIAS_IDS         = 1u << 6,
+      ALIAS_VEL         = 1u << 7,
+      ALIAS_ACC0        = 1u << 8,
+      ALIAS_ACC1        = 1u << 9,
+      ALIAS_TIME        = 1u << 10,
+      ALIAS_TYPEDEV     = 1u << 11,
+      ALIAS_ORIORDER    = 1u << 12,
+      ALIAS_ACTIVEPART  = 1u << 13,
+      ALIAS_BODY2GROUP  = 1u << 14,
+      ALIAS_TREESCRATCH = 1u << 15   // n_children, node_bodies
+    };
+    static unsigned unifiedArrays()
+    {
+      static long long v = -1;
+      if (v < 0)
+      {
+        const char *e = getenv("GADGET_HIP_UNIFIED_ARRAYS");
+        v = e ? strtoll(e, NULL, 0) : (long long) 0xFFFFFFFFu;
+      }
+      return (unsigned) v;
+    }
+
+    // Point hDeviceMem at the pinned host allocation. Returns false if the runtime declines, in
+    // which case the caller allocates a device copy as before -- so a driver that does not support
+    // the mapping degrades to the old behaviour instead of failing the run.
+    bool tryAliasHostAsDevice()
+    {
+      void *dp = nullptr;
+      if (hipHostGetDevicePointer(&dp, (void*) host_ptr, 0) != hipSuccess || dp == nullptr)
+      {
+        static bool warned = false;
+        if (!warned)
+        {
+          warned = true;
+          fprintf(stderr, "[UNIFIED-MEM] hipHostGetDevicePointer declined; falling back to a "
+                          "separate device allocation for every buffer.\n");
+        }
+        return false;
+      }
+      hDeviceMem = (T*) dp;
+      aliased    = true;
+      return true;
+    }
+
+    // Is this array going to be aliased? Needed at the CALL SITE, because for an array that is
+    // plain malloc today the pinned-ness and the aliasing are one decision and not two:
+    // malloc'd host memory is lazily backed (measured -- 8 GB untouched costs nothing), while
+    // hipHostMalloc'd memory is resident the moment it is allocated. Converting an array to pinned
+    // WITHOUT aliasing it would therefore make the footprint worse, not better. cmalloc_unified
+    // below exists so no call site can get that pairing wrong.
+    static bool aliasWanted(unsigned aliasId)
+    {
+      return unifiedMem() && aliasId != ALIAS_NONE && (unifiedArrays() & aliasId) != 0;
+    }
+
+    // T65 item 4: pinned+aliased when the build and the mask allow it, plain malloc + its own
+    // device buffer when they do not -- i.e. exactly the pre-T65 behaviour in that case.
+    void cmalloc_unified(size_t n, unsigned aliasId, int flags = 0)
+    { cmalloc(n, aliasWanted(aliasId), flags, aliasId); }
+    void ccalloc_unified(size_t n, unsigned aliasId, int flags = 0)
+    { ccalloc(n, aliasWanted(aliasId), flags, aliasId); }
+
+    void cmalloc(size_t n, bool pinned = false, int flags = 0, unsigned aliasId = ALIAS_NONE)
     {
       this->pinned_mem = pinned;
       this->flags = (flags == 0) ? false : true;
       if (size > 0) cuda_free();
       size = n;
 
+      aliased = false;
       if(pinned_mem){
-        CU_SAFE_CALL(hipHostMalloc((T**)&host_ptr, size*sizeof(T)));}
+        CU_SAFE_CALL(hipHostMalloc((T**)&host_ptr, size*sizeof(T)));
+        if (unifiedMem() && aliasId && (unifiedArrays() & aliasId) && size > 0)
+          tryAliasHostAsDevice();   // T65 item 3
+      }
       else{
         host_ptr = (T*)malloc(size*sizeof(T));}
 
       //fprintf(stderr,"host ptr: %p new: %d \n",host_ptr, size);
 
-      CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, size*sizeof(T)));
+      if (!aliased)
+        CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, size*sizeof(T)));
+      // Counted either way: aliased or not, these bytes are real physical memory that the device
+      // reads. Counting only the hipMalloc case would make the counter understate a unified-memory
+      // build by exactly the amount this change saves.
       increaseMemUsage(size*sizeof(T));
       DeviceMemPtr = (void*)(size_t)hDeviceMem;
 
@@ -602,19 +737,28 @@ namespace my_dev {
       poisonDeviceRange(0, (size_t) size);
     }
 
-    void ccalloc(size_t n, bool pinned = false, int flags = 0) {
+    void ccalloc(size_t n, bool pinned = false, int flags = 0, unsigned aliasId = ALIAS_NONE) {
       this->pinned_mem = pinned;
       this->flags = (flags == 0) ? false : true;
       if (size > 0) cuda_free();
       size = n;
 
+      aliased = false;
       if(pinned_mem)
+      {
         hipHostMalloc((T**)&host_ptr, size*sizeof(T));
+        if (unifiedMem() && aliasId && (unifiedArrays() & aliasId) && size > 0)
+          tryAliasHostAsDevice();   // T65 item 3
+      }
       else
         host_ptr = (T*)calloc(size, sizeof(T));
 
 
-      CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, size*sizeof(T)));
+      if (!aliased)
+        CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, size*sizeof(T)));
+      // The zero-init is load-bearing dynamics for bodies_acc0 (see poisonLevel()'s comment), so
+      // it stays a device-side memset even when aliased -- same memory, same result, and it keeps
+      // the guarantee in one place rather than depending on which pointer was used.
       CU_SAFE_CALL(hipMemset((void*)hDeviceMem, 0, size*sizeof(T)));
       increaseMemUsage(size*sizeof(T));
       DeviceMemPtr = (void*)(size_t)hDeviceMem;
@@ -666,6 +810,27 @@ namespace my_dev {
         }
       }
 
+      // T65 item 3: an aliased buffer's "device side" is the host allocation that was just moved,
+      // so the host-to-host copy above has already carried the contents across and there is
+      // nothing to allocate, copy or free. Only the derived pointer has to be refreshed.
+      if (aliased)
+      {
+        void *dp = nullptr;
+        if (hipHostGetDevicePointer(&dp, (void*) host_ptr, 0) != hipSuccess || dp == nullptr)
+        {
+          fprintf(stderr, "\nFATAL: cresize: hipHostGetDevicePointer failed on the resized pinned "
+                          "buffer, so its device alias cannot be re-derived. Rebuild without "
+                          "GADGET_HIP_UNIFIED_MEM.\n\n");
+          exit(1);
+        }
+        decreaseMemUsage(size*sizeof(T));
+        increaseMemUsage(n*sizeof(T));
+        hDeviceMem   = (T*) dp;
+        DeviceMemPtr = (void*)(size_t)hDeviceMem;
+        size = n;
+        return;
+      }
+
       //This version compared to the commented out one above, first allocates
       //new memory and then copies the old one in the new one and free's the old one
       T *hDeviceMemNew;
@@ -708,6 +873,24 @@ namespace my_dev {
        //host_ptr = (T*)realloc(host_ptr, n*sizeof(T));
      }
 
+     // T65 item 3: same as cresize -- no separate device allocation exists to free or replace.
+     if (aliased)
+     {
+       void *dp = nullptr;
+       if (hipHostGetDevicePointer(&dp, (void*) host_ptr, 0) != hipSuccess || dp == nullptr)
+       {
+         fprintf(stderr, "\nFATAL: cresize_nocpy: hipHostGetDevicePointer failed on the resized "
+                         "pinned buffer. Rebuild without GADGET_HIP_UNIFIED_MEM.\n\n");
+         exit(1);
+       }
+       decreaseMemUsage(size*sizeof(T));
+       increaseMemUsage(n*sizeof(T));
+       hDeviceMem   = (T*) dp;
+       DeviceMemPtr = (void*)(size_t)hDeviceMem;
+       size = n;
+       return;
+     }
+
      CU_SAFE_CALL(hipFree(hDeviceMem));
      decreaseMemUsage(size*sizeof(T));
      CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, n*sizeof(T)));
@@ -719,6 +902,32 @@ namespace my_dev {
 
 
     //Set the memory to zero
+    // T65 item 3: when the host and device pointers are the same memory there is nothing to copy
+    // -- but the copy was also the ONLY synchronisation point at these call sites, and removing it
+    // silently would turn every d2h-then-read into a race against the kernel still running.
+    //
+    // hipMemcpy on the default stream has legacy semantics: it synchronises every blocking stream
+    // in the process, and the port creates its streams with hipStreamCreate (not
+    // hipStreamNonBlocking), so hipDeviceSynchronize() is exactly as strong a barrier as the
+    // memcpy it replaces -- no stronger, no weaker.
+    //
+    // Returns true if the transfer was handled (i.e. the buffer is aliased and nothing more is
+    // needed); false if the caller should do the real copy.
+    bool aliasedTransfer(bool OCL_BLOCKING, hipStream_t stream)
+    {
+      if (!aliased) return false;
+      if (OCL_BLOCKING)
+        CU_SAFE_CALL(hipDeviceSynchronize());
+      else
+      {
+        // The async form's contract is that the caller later waits on asyncCopyEvent (or makes a
+        // stream wait on it), so the event still has to be recorded -- an un-recorded event would
+        // make waitForCopyEvent() return immediately and reintroduce the race it exists to close.
+        CU_SAFE_CALL(hipEventRecord(asyncCopyEvent, stream));
+      }
+      return true;
+    }
+
     void zeroMem()
     {
       assert(hDeviceMem_flag);
@@ -752,6 +961,8 @@ namespace my_dev {
 
       assert(size > 0);
 
+      if (aliasedTransfer(OCL_BLOCKING, stream)) return;   // T65 item 3
+
       if(OCL_BLOCKING)
       {
         CU_SAFE_CALL(hipMemcpy(&host_ptr[0], hDeviceMem, number*sizeof(T),hipMemcpyDeviceToHost));
@@ -766,6 +977,9 @@ namespace my_dev {
     }
 
     //Copy to a specified buffer
+    // Deliberately NOT short-circuited for aliasing: `dst` is a caller-supplied buffer somewhere
+    // else entirely (parallel.cpp's extraBodyBuffer), so this is a real copy whether or not
+    // hDeviceMem happens to be the same memory as host_ptr.
     void d2h(int number, void* dst, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
       assert(hDeviceMem_flag);
 
@@ -790,6 +1004,7 @@ namespace my_dev {
     void h2d(bool OCL_BLOCKING  = true, hipStream_t stream = 0)   {
       assert(hDeviceMem_flag);
       assert(size > 0);
+      if (aliasedTransfer(OCL_BLOCKING, stream)) return;   // T65 item 3
       //if (flags & CL_MEM_USE_HOST_PTR == 0) return;
       if(OCL_BLOCKING)
       {
@@ -811,6 +1026,8 @@ namespace my_dev {
       assert(size > 0);
 
       if(number == 0) return;
+
+      if (aliasedTransfer(OCL_BLOCKING, stream)) return;   // T65 item 3
 
       if(OCL_BLOCKING)
       {
@@ -869,7 +1086,10 @@ namespace my_dev {
 
     /////////
 
-    T& operator[] (int i){ return host_ptr[i]; }
+    // T72: was `int i`. cmalloc_copy indexes the parent arena through this operator to derive a
+    // child's host pointer, and that offset reaches 8.8*N uints -- 4.4e9 at 768^3, far past INT_MAX.
+    // ptrdiff_t rather than size_t so that any existing signed index arithmetic keeps its meaning.
+    T& operator[] (ptrdiff_t i){ return host_ptr[i]; }
 
     void*  get_devMem() {return (void*)hDeviceMem;}
     void*  d()          {return (void*)hDeviceMem;}
@@ -906,6 +1126,7 @@ namespace my_dev {
 
     size_t get_size(){return size;}
     bool get_pinned(){return pinned_mem;}
+    bool is_aliased(){return aliased;}   // T65 item 3: no device copy exists
     bool get_flags(){return flags;}
   };     // end of class dev_mem
 

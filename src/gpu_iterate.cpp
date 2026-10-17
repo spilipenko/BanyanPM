@@ -565,8 +565,8 @@ void octree::invariant_probe(tree_structure &tree, int iter)
   leaves.reserve(tree.n_leafs);
   for (int i = 0; i < tree.n_leafs; i++)
   {
-    uint2 nb = tree.node_bodies[tree.leafNodeIdx[i]];
-    leaves.push_back(std::make_pair(nb.x & ILEVELMASK, nb.y));
+    uint4 nb = tree.node_bodies[tree.leafNodeIdx[i]];
+    leaves.push_back(std::make_pair(nb.x, nb.y));     // T74: full width, no mask
   }
   std::sort(leaves.begin(), leaves.end());
 
@@ -585,16 +585,96 @@ void octree::invariant_probe(tree_structure &tree, int iter)
   const bool tiles = (gaps == 0 && overlaps == 0 && oob == 0 &&
                       covered == (long long)tree.n && expect == (uint)tree.n);
 
+  // C-A-19c (T74): the LEAF indirection the walk reads out of boxSizeInfo[].w must agree with
+  // node_bodies' own body range for that leaf.
+  //
+  // boxSizeInfo[].w packs (count-1) into its top 32-LEAFBIT bits and the index of the leaf's first
+  // body into the rest (compute_propertiesD.cu, `pfirst | ((nchild-1) << LEAFBIT)`), so at the
+  // shipping NLEAF=16 the index gets 28 bits and silently truncates above 2^28 = 268,435,456
+  // particles. NOTHING else checks this: C-A-19 below validates node_bodies, which is a different
+  // array, so a truncated leaf indirection passes every other probe while the walk forces the
+  // wrong particles. This is the remaining member of the packing family T74 is about -- left in
+  // place deliberately (the group one at 2^27 was the blocking one), so it needs a watchdog.
+  {
+    tree.boxSizeInfo.d2h();
+    long long leafMismatch = 0;
+    unsigned  worstPfirst  = 0;
+    for (int i = 0; i < tree.n_leafs; i++)
+    {
+      const int   li = (int) tree.leafNodeIdx[i];
+      const uint4 nb = tree.node_bodies[li];
+      const int   bd = *reinterpret_cast<const int*>(&tree.boxSizeInfo[li].w);
+      const unsigned pf = (unsigned)(bd & BODYMASK);
+      const unsigned nc = (unsigned)(((bd & INVBMASK) >> LEAFBIT) + 1);
+      if (nb.x > worstPfirst) worstPfirst = nb.x;
+      if (pf != nb.x || nc != (nb.y - nb.x)) leafMismatch++;
+    }
+    fprintf(stderr,
+      "[INVARIANT] C-A-19c leaf indirection: %s (%lld of %d leaves disagree with node_bodies; "
+      "boxSizeInfo[].w index is %d bits, limit %u, largest first-body index %u)\n",
+      leafMismatch == 0 ? "OK" : "VIOLATED", leafMismatch, tree.n_leafs,
+      LEAFBIT, (unsigned)(1u << LEAFBIT), worstPfirst);
+  }
+
+  // C-A-19b (T74): the GROUPS must tile [0,n) exactly AND CONTIGUOUSLY in group-index order,
+  // i.e. start_g + count_g == start_{g+1}, with start_0 == 0 and the last group ending at n.
+  //
+  // The first half is the group analogue of C-A-19 above and would have caught this family of
+  // defect. The second half is the one that matters for T74: if the groups are contiguous in group
+  // order, a group's particle COUNT is start_{g+1} - start_g and does not have to be packed into
+  // the top 5 bits of groupSizeInfo[].w -- which is what caps the particle count at
+  // 2^27 = 134,217,728 with NCRIT=32. Kept as a standing check now that the count IS derived.
+  //
+  // Decoded exactly the way the walk decodes it (dev_approximate_gravity_warp_new.cu:2182) rather
+  // than from tree.group_list, because groupSizeInfo[].w is what the walk actually reads and it is
+  // the thing that has to be derivable.
+  {
+    tree.groupSizeInfo.d2h();
+    long long gBad = 0, gGapOverlap = 0;
+    unsigned expectStart = 0;
+    unsigned firstStart = 0, lastEnd = 0;
+    // T75: the walk CLAMPS the derived count to NCRIT, which is what restores the range the old
+    // bit-field gave the compiler for free (walk VGPRs 184 -> 100, +18% per step without it).
+    // A group bigger than NCRIT would therefore be walked SHORT rather than failing, so the
+    // assumption the clamp rests on is checked here instead of merely asserted in a comment.
+    unsigned maxNb = 0; long long gOverNcrit = 0;
+    for (int g = 0; g < tree.n_groups; g++)
+    {
+      const unsigned st = (unsigned) *reinterpret_cast<const int*>(&tree.groupSizeInfo[g].w);
+      const unsigned nx = (unsigned) *reinterpret_cast<const int*>(&tree.groupSizeInfo[g+1].w);
+      const unsigned nb = (nx > st) ? (nx - st) : 0u;
+      if (g == 0) firstStart = st;
+      if (st > (unsigned) tree.n || nb == 0 || st + nb > (unsigned) tree.n) { gBad++; continue; }
+      if (st != expectStart) gGapOverlap++;
+      if (nb > maxNb) maxNb = nb;
+      if (nb > (unsigned) NCRIT) gOverNcrit++;
+      expectStart = st + nb;
+      lastEnd = expectStart;
+    }
+    const bool gTiles = (gBad == 0 && gGapOverlap == 0 && firstStart == 0 &&
+                         lastEnd == (unsigned) tree.n);
+    fprintf(stderr,
+      "[INVARIANT] C-A-19b group partition: %s (n_groups=%d bad=%lld gaps_or_overlaps=%lld "
+      "first_start=%u last_end=%u/%d) -> count %s derivable as start[g+1]-start[g]\n",
+      gTiles ? "OK" : "VIOLATED", tree.n_groups, gBad, gGapOverlap, firstStart, lastEnd, tree.n,
+      gTiles ? "IS" : "is NOT");
+    fprintf(stderr,
+      "[INVARIANT] C-A-19d group size vs NCRIT: %s (max_group=%u NCRIT=%d over=%lld) -> the "
+      "walk's min(nb_i, NCRIT) clamp (T75) %s lossless\n",
+      gOverNcrit == 0 ? "OK" : "VIOLATED", maxNb, NCRIT, gOverNcrit,
+      gOverNcrit == 0 ? "IS" : "is NOT");
+  }
+
   // C-A-21: level 0 is a single node spanning every particle.
-  uint2 root = tree.node_bodies[0];
-  const bool rootOk = ((root.x & ILEVELMASK) == 0u && root.y == (uint)tree.n);
+  uint4 root = tree.node_bodies[0];
+  const bool rootOk = (root.x == 0u && root.y == (uint)tree.n);
 
   fprintf(stderr,
     "[INVARIANT] iter=%d n=%d n_leafs=%d | C-A-19 leaf partition: %s "
     "(gaps=%lld overlaps=%lld oob=%lld covered=%lld/%d) | C-A-21 root spans all: %s (%u..%u)\n",
     iter, tree.n, tree.n_leafs, tiles ? "OK" : "VIOLATED",
     gaps, overlaps, oob, covered, tree.n, rootOk ? "OK" : "VIOLATED",
-    root.x & ILEVELMASK, root.y);
+    root.x, root.y);
 
   // C-A-20: START_LEVEL_MIN_NODES forces a minimum tree depth that Gadget-2 has no counterpart
   // for. Its probe asks for (level, startLevelMin, n_leafs, n_nodes) per rebuild, and whether
@@ -604,8 +684,8 @@ void octree::invariant_probe(tree_structure &tree, int iter)
     int shallow = 0;
     for (int i = 0; i < tree.n_leafs; i++)
     {
-      uint2 nb = tree.node_bodies[tree.leafNodeIdx[i]];
-      const int lvl = (int)(nb.x >> BITLEVELS);
+      uint4 nb = tree.node_bodies[tree.leafNodeIdx[i]];
+      const int lvl = (int) nb.z;                     // T74: own lane
       if (lvl < tree.startLevelMin) shallow++;
     }
     fprintf(stderr, "[INVARIANT] C-A-20 forced depth: n_levels=%d startLevelMin=%d n_nodes=%d "
@@ -1565,16 +1645,43 @@ bool octree::iterate_once(IterationData &idata) {
           // can reach them; the code below is unchanged.
           GFreeAcc *&s_d_pmIdX = s_gravPMx; GFreeAcc *&s_d_pmIdY = s_gravPMy;
           GFreeAcc *&s_d_pmIdZ = s_gravPMz; float *&s_d_pmIdPot = s_gravPMpot;
-          // T36 IS OFF BY DEFAULT -- it cost accuracy, measured. See the block below and
-          // tickets/T35-sparse-step-cost.md "Round 3 RETRACTED".
-          // GADGET_HIP_PM_CADENCE=1 opts back in for experiments; PM_EVERY_STEP is kept as the
-          // explicit spelling of the default.
-          static const bool pmCadenceOn = (getenv("GADGET_HIP_PM_CADENCE") != NULL) &&
-                                          (atoi(getenv("GADGET_HIP_PM_CADENCE")) != 0);
+          // T76: THE CADENCE IS ON BY DEFAULT. `GADGET_HIP_PM_CADENCE=0` turns it off.
+          //
+          // It was opt-in from T36's retraction until now, and the cost of that was measured, not
+          // guessed: 28 completed 512^3 production runs went without it because the only way to
+          // ask for it was an environment variable, and the pipeline that launched them never set
+          // one. 26.45 h of their 183.30 h was PM. A setting that can only be supplied per-launch
+          // is eventually missed on a launch -- and a suite driven by one script misses it every
+          // time. See tickets/T76 in the audit repo.
+          //
+          // What is being defaulted on is the T42/T45 cadence, whose worst Ekin deviation at 512^3
+          // is 0.133%. It is NOT T36, the retracted predecessor that cost 11% by folding the
+          // stored long-range force into each active particle's own kick; that operator is gone.
+          //
+          // Both spellings still work and either can force either mode:
+          //   GADGET_HIP_PM_CADENCE=0      -> PM every step (the old default)
+          //   GADGET_HIP_PM_EVERY_STEP=1   -> PM every step, explicit
+          //   GADGET_HIP_PM_CADENCE=1      -> the cadence, explicit (now redundant, still honoured)
+          static const char *pmCadEnv   = getenv("GADGET_HIP_PM_CADENCE");
+          static const bool pmCadenceOn = (pmCadEnv == NULL) ? true : (atoi(pmCadEnv) != 0);
           static const bool pmEveryStep = !pmCadenceOn ||
                                           (getenv("GADGET_HIP_PM_EVERY_STEP") != NULL);
 
-          if (s_pmStoredN != localTree.n)
+          // T65 item 2: gated on pmCadenceOn. These four arrays are 16 B/particle of device
+          // memory -- 2.1 GB at 512^3, 7.2 GB at 768^3 -- and they exist for exactly one purpose:
+          // to let the long-range force survive the per-step re-sort BETWEEN PM steps. With PM
+          // recomputed every step, which was the default from T36's retraction until T76, there is no
+          // "between": the comment below this block already said the id-space path "buys nothing
+          // and costs a 134M-element scatter over 2.1 GB every step" in that mode, but the
+          // allocation was made unconditionally anyway.
+          //
+          // Allocating only under the cadence also removes the scatter and the gather in the
+          // default mode, because pmIdSpaceOk below now requires the buffers to exist. The
+          // fallback that then runs (pm_add_force_to_acc_masked on the index-space arrays) is the
+          // original path, is documented as "always correct", and is bit-identical here: the
+          // scatter writes gpm[id[i]] = pmf[i] and the gather reads it straight back in the same
+          // step, so composing the permutation with its inverse moves the same floats.
+          if (pmCadenceOn && s_pmStoredN != localTree.n)
           {
             if (s_d_pmIdX) { hipFree(s_d_pmIdX); hipFree(s_d_pmIdY); hipFree(s_d_pmIdZ); hipFree(s_d_pmIdPot); }
             // sizeof(GFreeAcc) == sizeof(float): a single-float struct, so the allocation, the
@@ -1591,11 +1698,19 @@ bool octree::iterate_once(IterationData &idata) {
           // every step, which is what the port did before and is always correct.
           // GADGET_HIP_PM_NO_IDSPACE=1 bypasses the id-space store entirely and uses the original
           // per-index add. The id-space path only EXISTS to let the force survive between PM steps;
-          // with PM recomputed every step (the default since T36 was retracted) it buys nothing and
+          // with PM recomputed every step (the default until T76) it buys nothing and
           // costs a 134M-element scatter over 2.1 GB every step. Kept as a switch rather than
           // deleted because the cadence remains available behind GADGET_HIP_PM_CADENCE.
           static const bool pmNoIdSpace = (getenv("GADGET_HIP_PM_NO_IDSPACE") != NULL);
+          // T65 item 2: `s_d_pmIdX != nullptr` is the new clause. The store is only allocated
+          // under the cadence now, so this one test routes every consumer -- the scatter below,
+          // the gather in the no-PM-step branch, and s_pmCadenceActive itself -- to the
+          // index-space fallback when it does not exist. Nothing dereferences these pointers
+          // outside a pmIdSpaceOk / s_pmCadenceActive guard (checked: gpu_iterate.cpp:2955,
+          // 5068-5070 and 5141 all test s_pmCadenceActive; the two diagnostic memcpys test the
+          // pointer directly).
           const bool pmIdSpaceOk = !pmNoIdSpace && gadgetTypeByIdOk &&
+                                   (s_d_pmIdX != nullptr) &&
                                    (gadgetTypeByIdMax == (ullong)(localTree.n - 1));
           // WHY THIS IS OFF BY DEFAULT.
           //
@@ -1788,14 +1903,18 @@ bool octree::iterate_once(IterationData &idata) {
                               "(sum|da|^2=%.6e sum|a|^2=%.6e)\n",
                       s_pmKickCount, (den > 0.0) ? sqrt(num / den) : 0.0, num, den);
             }
-            if (pmIdSpaceOk)
+            // T76: the ladder-snapped PM interval, computed UNCONDITIONALLY so the mode banner
+            // below can print in both modes. It used to sit inside `if (pmIdSpaceOk)`, and T65
+            // item 2 then gated the id-space allocation on pmCadenceOn -- which silently gated
+            // the banner too, so "[T42] PM recomputed EVERY STEP" stopped printing in exactly the
+            // mode that needed announcing. Verified: present in a pre-T65 run, absent in a
+            // post-T65 every-step run, and absent from a completed 9429-step 512^3 z=0 run, which
+            // therefore has no runtime record of its PM mode at all.
+            //
+            // That is the same failure T76 is about. The banner is the only runtime evidence of
+            // the mode, so it must depend on the MODE and on nothing else.
+            const bool comoving = haveGadgetParams && gadgetParams.ComovingIntegrationOn != 0;
             {
-              pm_scatter_by_id(localTree.bodies_ids.raw_p(), s_d_pmfx, s_d_pmfy, s_d_pmfz, s_d_pmpot,
-                               s_d_pmIdX, s_d_pmIdY, s_d_pmIdZ, s_d_pmIdPot,
-                               localTree.n, gravStream->s());
-              // Next PM step: the ladder-snapped displacement constraint, in the same units the
-              // integrator uses (dloga under comoving integration, dt otherwise).
-              const bool comoving = haveGadgetParams && gadgetParams.ComovingIntegrationOn != 0;
               const double span = comoving ? (gadgetLogTimeMax - gadgetLogTimeBegin)
                                            : (gadgetParams.TimeMax - gadgetParams.TimeBegin);
               double q = span;
@@ -1803,9 +1922,12 @@ bool octree::iterate_once(IterationData &idata) {
                 while (q > gadgetDtDisplacement && q > 1e-12) q *= 0.5;
               else
                 q = 0.0;
-              s_pmNextTime = (q > 0.0)
+              // What the next PM step WOULD be. Computed here so the banner can report it; the
+              // actual s_pmNextTime assignment stays under pmIdSpaceOk below, because engaging the
+              // cadence without the id-space store would lose the force to the per-step re-sort.
+              const double pmNextWouldBe = (q > 0.0)
                   ? (comoving ? (double) t_current * exp(q) : (double) t_current + q)
-                  : -1.0;   // no usable constraint -> recompute next step
+                  : -1.0;
               static bool s_pmCadenceLogged = false;
               if (!s_pmCadenceLogged)
               {
@@ -1822,17 +1944,32 @@ bool octree::iterate_once(IterationData &idata) {
                   // 0.133% once the energy diagnostic and the Springel aold were given the
                   // long-range force too (T45). Leaving the old number in the runtime log made the
                   // cadence look 80x worse than it is, and it is the first thing anyone reads.
-                  fprintf(stderr, "[T42] PM recomputed EVERY STEP (cadence off by default; enable "
-                                  "with GADGET_HIP_PM_CADENCE=1 -- worst Ekin deviation 0.133%% at "
-                                  "512^3, see tickets/T45. The 11%% in tickets/T35/T36 was the "
-                                  "RETRACTED predecessor, not this cadence). The cadence this run "
-                                  "WOULD have used: dt_displacement=%.6g -> PM step %.6g (%s).\n",
+                  fprintf(stderr, "[T42] PM recomputed EVERY STEP -- the cadence is ON BY "
+                                  "DEFAULT since T76, so this run was OPTED OUT explicitly "
+                                  "(GADGET_HIP_PM_CADENCE=%s, GADGET_HIP_PM_EVERY_STEP=%s). That "
+                                  "is the more accurate mode and costs ~14%% of wall clock in PM; "
+                                  "the cadence's worst Ekin deviation at 512^3 is 0.133%%, see "
+                                  "tickets/T45. The 11%% in tickets/T35/T36 was the RETRACTED "
+                                  "predecessor, not this cadence. The cadence this run WOULD have "
+                                  "used: dt_displacement=%.6g -> PM step %.6g (%s).\n",
+                          pmCadEnv ? pmCadEnv : "unset",
+                          getenv("GADGET_HIP_PM_EVERY_STEP") ? getenv("GADGET_HIP_PM_EVERY_STEP") : "unset",
                           gadgetDtDisplacement, q, comoving ? "dloga" : "dt");
                 else
-                  fprintf(stderr, "[T36] PM CADENCE ACTIVE (opt-in): dt_displacement=%.6g -> PM step "
-                                  "%.6g (%s), first recompute at t=%.9g\n",
-                          gadgetDtDisplacement, q, comoving ? "dloga" : "dt", s_pmNextTime);
+                  fprintf(stderr, "[T42] PM CADENCE ACTIVE (%s since T76): dt_displacement=%.6g "
+                                  "-> PM step %.6g (%s), first recompute at t=%.9g. Worst Ekin "
+                                  "deviation 0.133%% at 512^3 (T45); GADGET_HIP_PM_CADENCE=0 for "
+                                  "PM every step.\n",
+                          pmCadEnv ? "explicit" : "DEFAULT",
+                          gadgetDtDisplacement, q, comoving ? "dloga" : "dt", pmNextWouldBe);
                 s_pmCadenceLogged = true;
+              }
+              if (pmIdSpaceOk)
+              {
+                pm_scatter_by_id(localTree.bodies_ids.raw_p(), s_d_pmfx, s_d_pmfy, s_d_pmfz, s_d_pmpot,
+                                 s_d_pmIdX, s_d_pmIdY, s_d_pmIdZ, s_d_pmIdPot,
+                                 localTree.n, gravStream->s());
+                s_pmNextTime = pmNextWouldBe;   // -1 => no usable constraint, recompute next step
               }
             }
           }
@@ -2735,7 +2872,7 @@ void octree::predict(tree_structure &tree)
           BUG4_MAP(bodies_ids, 8); BUG4_MAP(bodies_Ppos, 16); BUG4_MAP(bodies_Pvel, 16);
           BUG4_MAP(bodies_h, 4); BUG4_MAP(bodies_dens, 8); BUG4_MAP(bodies_forceSoftening, 4);
           BUG4_MAP(bodies_typeDevice, 4); BUG4_MAP(oriParticleOrder, 4);
-          BUG4_MAP(level_list, 8); BUG4_MAP(n_children, 4); BUG4_MAP(node_bodies, 8);
+          BUG4_MAP(level_list, 8); BUG4_MAP(n_children, 4); BUG4_MAP(node_bodies, 16);
           BUG4_MAP(leafNodeIdx, 4); BUG4_MAP(node_level_list, 4); BUG4_MAP(body2group_list, 4);
           BUG4_MAP(group_list, 8); BUG4_MAP(multipole, 16); BUG4_MAP(activeGrpList, 4);
           BUG4_MAP(active_group_list, 4); BUG4_MAP(activePartlist, 4); BUG4_MAP(ngb, 4);
@@ -2915,7 +3052,7 @@ void octree::direct_gravity(tree_structure &tree)
 // blocks of the CURRENT (this-iteration, freshly SFC-sorted) particle order -- groupSizeInfo is
 // built from build()/compute_properties() against whatever order sort_bodies() just produced this
 // same iteration (bodies_Ppos/bodies_ids/bodies_h). This function's start/nb_i decode
-// (groupSizeInfo[g].w, CRITMASK/INVCMASK, node_specs.h) replicates the kernel's own group-layout
+// (groupSizeInfo[g].w plus the next group's start, T74) replicates the kernel's own group-layout
 // decode to guarantee IT can't silently desync from the group layout.
 //
 // Ticket 23 fix: the comment this replaced claimed "bodies_acc0 already uses [the same SFC-sorted
@@ -3079,12 +3216,14 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
   // named here for the same reason they are named in the kernels.
   for (GroupIdx g = {0}; g.v < (unsigned int) tree.n_groups; g.v++)
   {
-    const int groupData = *reinterpret_cast<const int*>(&tree.groupSizeInfo[g.v].w);
-    const uint start = groupData & CRITMASK;
-    const uint nb_i   = ((groupData & INVCMASK) >> CRITBIT) + 1;
+    // T74: start at full width from .w, count derived from the next group's start. groupSizeInfo
+    // carries an [n_groups] sentinel holding tree.n, so g.v+1 is always in range.
+    const uint start  = (uint) *reinterpret_cast<const int*>(&tree.groupSizeInfo[g.v].w);
+    const uint nextSt = (uint) *reinterpret_cast<const int*>(&tree.groupSizeInfo[g.v + 1].w);
+    const uint nb_i   = (nextSt > start) ? (nextSt - start) : 0u;
     if (t31_verbose && !t31_reported && g.v < 3)
-      fprintf(stderr, "[T31] group %u: raw=0x%08x start=%u nb_i=%u  (n_groups=%d, tree.n=%d, CRITBIT=%d)\n",
-              g.v, (unsigned) groupData, start, nb_i, tree.n_groups, tree.n, CRITBIT);
+      fprintf(stderr, "[T31] group %u: start=%u next=%u nb_i=%u  (n_groups=%d, tree.n=%d)\n",
+              g.v, start, nextSt, nb_i, tree.n_groups, tree.n);
     t31_visited += nb_i;
 
     float maxAcc2 = 0.0f;
@@ -3283,10 +3422,16 @@ void octree::reportDeviceMemory(const char *stage)
   if (on < 0) { const char *e = getenv("GADGET_HIP_MEMREPORT"); on = e ? atoi(e) : 0; }
   if (!on) return;
 
-  struct Row { const char *name; size_t n, esz; };
+  // T65: each row now records whether the host side is PINNED (hipHostMalloc, resident the moment
+  // it is allocated) or plain malloc (lazily backed -- measured: 8 GB untouched costs nothing, and
+  // even reading it costs nothing), and whether the buffer has a separate DEVICE copy at all.
+  // Without those two bits this report counted every buffer ONCE and so understated the real
+  // footprint by nearly a factor of two: cmalloc always made two allocations, host and device.
+  struct Row { const char *name; size_t n, esz; bool pinned, aliased; };
   std::vector<Row> rows;
   tree_structure &tree = localTree;
-#define MEMREP(b) rows.push_back(Row{#b, (size_t) tree.b.get_size(), sizeof(*tree.b.raw_p())})
+#define MEMREP(b) rows.push_back(Row{#b, (size_t) tree.b.get_size(), sizeof(*tree.b.raw_p()), \
+                                     tree.b.get_pinned(), tree.b.is_aliased()})
   MEMREP(bodies_pos);
   MEMREP(bodies_key);
   MEMREP(bodies_vel);
@@ -3327,7 +3472,8 @@ void octree::reportDeviceMemory(const char *stage)
   MEMREP(fullRemoteTree);
 #undef MEMREP
   // These two live on the octree, not on tree_structure.
-#define MEMREPO(b) rows.push_back(Row{#b, (size_t) this->b.get_size(), sizeof(*this->b.raw_p())})
+#define MEMREPO(b) rows.push_back(Row{#b, (size_t) this->b.get_size(), sizeof(*this->b.raw_p()), \
+                                      this->b.get_pinned(), this->b.is_aliased()})
   MEMREPO(gadgetDriftTable);
   MEMREPO(gadgetGravKickTable);
   MEMREPO(devMemRMIN);
@@ -3354,15 +3500,41 @@ void octree::reportDeviceMemory(const char *stage)
     if (scales) scalingBytes += b; else fixedBytes += b;
   }
   const double perPart = tree.n > 0 ? (double) scalingBytes / (double) tree.n : 0.0;
+
+  // T65: the three allocators, separately, because they do not cost the same thing. Only `pinned`
+  // and `device` are necessarily resident; `malloc` is an upper bound until something writes it.
+  size_t hostB = 0, pinB = 0, devB = 0, physScalingB = 0, physFixedB = 0;
+  for (size_t i = 0; i < rows.size(); i++)
+  {
+    const size_t b = rows[i].n * rows[i].esz;
+    if (rows[i].pinned) pinB += b; else hostB += b;
+    const size_t resident = (rows[i].pinned ? b : 0) + (rows[i].aliased ? 0 : b);
+    // same fixed/scaling split as above -- a per-particle figure that includes the 5 GB scratch
+    // arena floor is meaningless at small N, which is the whole reason that split exists
+    if (tree.n > 0 && rows[i].n <= (size_t) tree.n * 64) physScalingB += resident;
+    else                                                 physFixedB   += resident;
+    if (!rows[i].aliased) devB += b;
+  }
+  const size_t physB = pinB + devB;                       // definitely resident
+  const double physPerPart = tree.n > 0 ? (double) physScalingB / (double) tree.n : 0.0;
+
   fprintf(stderr, "[MEMREPORT] === %s ===  n=%d  n_nodes=%d  n_groups=%d\n",
           stage, tree.n, tree.n_nodes, tree.n_groups);
-  fprintf(stderr, "[MEMREPORT] total %.3f GB   scaling %.3f GB (%.1f B/particle)   fixed %.3f GB\n",
+  fprintf(stderr, "[MEMREPORT] logical %.3f GB   scaling %.3f GB (%.1f B/particle)   fixed %.3f GB\n",
           total / 1073741824.0, scalingBytes / 1073741824.0, perPart, fixedBytes / 1073741824.0);
+  fprintf(stderr, "[MEMREPORT] allocators: malloc %.3f GB (lazily backed)   pinned %.3f GB   "
+                  "device %.3f GB   -> resident >= %.3f GB = fixed %.3f + %.1f B/particle\n",
+          hostB / 1073741824.0, pinB / 1073741824.0, devB / 1073741824.0,
+          physB / 1073741824.0, physFixedB / 1073741824.0, physPerPart);
   fprintf(stderr, "[MEMREPORT] model: fixed + %.1f B/part  ->  512^3 %.1f GB,  3e8 %.1f GB"
                   "   (Gadget-2 ~120 B/part -> 16 / 36 GB)\n",
           perPart,
           (fixedBytes + perPart * 134217728.0) / 1073741824.0,
           (fixedBytes + perPart * 3.0e8) / 1073741824.0);
+  fprintf(stderr, "[MEMREPORT] NOTE: this walks named members only. It does NOT see the PM grids "
+                  "(2*PMGRID^2*(PMGRID+2)*4 B), rocFFT's work buffer, the per-particle PM force "
+                  "arrays, or the host IC staging. For the whole footprint use the audit repo's "
+                  "probes/t65-memory/t65_ledger.so.\n");
   int unregistered = 0;
   for (size_t i = 0; i < rows.size(); i++)
   {
@@ -3370,9 +3542,11 @@ void octree::reportDeviceMemory(const char *stage)
     if (b == 0) continue;
     const BufferSpec *spec = bufferSpecFor(rows[i].name);
     if (!spec) unregistered++;
-    fprintf(stderr, "[MEMREPORT]   %-24s %11zu x %2zu = %9.2f MB  %7.1f B/part  %-8s%s\n",
+    fprintf(stderr, "[MEMREPORT]   %-24s %11zu x %2zu = %9.2f MB  %7.1f B/part  %-7s %-7s %-8s%s\n",
             rows[i].name, rows[i].n, rows[i].esz, b / 1048576.0,
             tree.n > 0 ? (double) b / tree.n : 0.0,
+            rows[i].pinned ? "pinned" : "malloc",
+            rows[i].aliased ? "ALIASED" : "+device",
             spec ? bufferSpaceName(spec->space) : "UNREGISTERED",
             spec && spec->evidence == EV_INFERRED ? " (inferred)" : "");
   }
@@ -3425,44 +3599,36 @@ void octree::writeGadgetSnapshot(bool preKick)
   // function's own comment) -- no d2h needed, and already index-aligned with bodies_pos/ids here.
 
   const int n = localTree.n;
-  GadgetParticleData data;
-  data.pos.resize(3 * n);
-  data.vel.resize(3 * n);
-  data.id.resize(n);
-  data.mass.resize(n);
-  data.type.resize(n);
-  const bool haveTypes = (int) localTree.bodies_type.size() == n;
-  for (int i = 0; i < n; ++i)
-  {
-    const real4 sp = localTree.bodies_Ppos[i];   // pos is bound to Ppos; identical post-correct
-    const real4 sv = preKick ? localTree.bodies_Pvel[localTree.oriParticleOrder[i]]
-                             : localTree.bodies_vel[i];
-    data.pos[3 * i + 0] = sp.x;
-    data.pos[3 * i + 1] = sp.y;
-    data.pos[3 * i + 2] = sp.z;
+
+  // T65: hand the writer the live host arrays instead of staging a GadgetParticleData copy of
+  // them. The copy was 40 B/particle, and gadget_snapshot_write then added a size_t permutation
+  // (8), stable_sort's own temporary (8) and a float buffer per block (12) on top -- about 30 GB
+  // at 768^3, on a run that already needs 100. More importantly it could not write 768^3 at ALL:
+  // a format-1/2 block length is a plain 4-byte int and POS is 12 B/particle, so one physical file
+  // holds at most 178,956,970 particles, and NumFilesPerSnapshot was parsed and ignored.
+  //
+  // bodies_Ppos's .w IS the mass, so pos4 carries both. bodies_type stays host-only and is kept
+  // fresh by recomputeSoftening() every rebuild, so it needs no d2h.
+  GadgetSnapshotSource src;
+  src.n    = (size_t) n;
+  src.pos4 = (const float *) &localTree.bodies_Ppos[0];
+  // preKick: the velocity of record is bodies_Pvel in ORIGINAL order, reached through
+  // oriParticleOrder -- the same indirection the old staging loop did per particle, handed to the
+  // writer as a permutation instead of being materialised.
+  src.vel4    = preKick ? (const float *) &localTree.bodies_Pvel[0]
+                        : (const float *) &localTree.bodies_vel[0];
+  src.velPerm = preKick ? (const unsigned int *) &localTree.oriParticleOrder[0] : nullptr;
+  src.id      = (const unsigned long long *) &localTree.bodies_ids[0];
+  src.type    = ((int) localTree.bodies_type.size() == n) ? localTree.bodies_type.data() : nullptr;
 #ifdef GADGET_HIP_HIGHRES
-    // T51: undo the recentring translation so the snapshot is in the IC's own frame. Without this
-    // the output would be silently offset and every downstream analysis tool would need to know the
-    // shift -- which is exactly the manual bookkeeping this feature exists to remove.
-    if (gadgetZoomShifted && gadgetParams.BoxSize > 0.0)
-      for (int a = 0; a < 3; ++a)
-      {
-        double x = (double) data.pos[3 * i + a] - gadgetZoomShift[a];
-        while (x >= gadgetParams.BoxSize) x -= gadgetParams.BoxSize;
-        while (x < 0.0)                   x += gadgetParams.BoxSize;
-        data.pos[3 * i + a] = (float) x;
-      }
-#endif
-    data.vel[3 * i + 0] = sv.x;
-    data.vel[3 * i + 1] = sv.y;
-    data.vel[3 * i + 2] = sv.z;
-    data.id[i]          = localTree.bodies_ids[i];
-    data.mass[i]         = localTree.bodies_Ppos[i].w;
-    // Falls back to type 1 (Halo) -- the same default Gadget-2 DM-only convention this port
-    // already uses elsewhere -- when no --param IC ever populated bodies_type (e.g. a
-    // --plummer/--cube dev run somehow reaching a --param-configured output path).
-    data.type[i]         = haveTypes ? localTree.bodies_type[i] : 1;
+  // T51: undo the recentring translation so the snapshot is in the IC's own frame.
+  if (gadgetZoomShifted && gadgetParams.BoxSize > 0.0)
+  {
+    src.shiftPositions = true;
+    for (int a = 0; a < 3; ++a) src.shift[a] = gadgetZoomShift[a];
+    src.boxSize = gadgetParams.BoxSize;
   }
+#endif
 
   GadgetSnapshotHeader header;
   header.time        = (double) t_current;
@@ -3485,8 +3651,9 @@ void octree::writeGadgetSnapshot(bool preKick)
   path += gadgetParams.SnapshotFileBase + numbuf;
 
   std::string err;
-  if (!gadget_snapshot_write(path, gadgetParams.SnapFormat, longIds,
-                              gadgetParams.ComovingIntegrationOn != 0, header, data, err))
+  if (!gadget_snapshot_write_streaming(path, gadgetParams.SnapFormat, longIds,
+                                       gadgetParams.ComovingIntegrationOn != 0, header,
+                                       gadgetParams.NumFilesPerSnapshot, src, err))
   {
     if (procId == 0)
       fprintf(stderr, "[GADGET-SNAPSHOT] write failed for '%s': %s\n", path.c_str(), err.c_str());
@@ -4163,10 +4330,10 @@ void octree::approximate_gravity(tree_structure &tree)
         const bool isNode = (ctr.w > 0.0f);      // compute_scaling's leaf/node sign convention
         if (isNode) nInternal++; else { nLeaf++; }
 
-        const uint bijx  = tree.node_bodies[i].x;
-        const uint level = (bijx & LEVELMASK) >> BITLEVELS;
+        const uint4 bijv = tree.node_bodies[i];
+        const uint level = bijv.z;                    // T74: own lane
         const uint shiftLevelForNode = (level <= (uint)MAXLEVELS) ? (uint)MAXLEVELS - level : 0u;
-        const uint pfirst = bijx & ILEVELMASK;
+        const uint pfirst = bijv.x;
         const int  nchild = (int)(tree.node_bodies[i].y - pfirst);
         if (!isNode) { if (nchild == 1) nSingle++; nLeafChild += nchild; }
         if (level > (uint)MAXLEVELS) { nLevelBad++; continue; }
@@ -4961,7 +5128,7 @@ void octree::correct(tree_structure &tree)
   my_dev::dev_mem<real4>   real4Buffer1;
   my_dev::dev_mem<int>     newEndBuffer;   // Phase 2: the new Ti_endstep, in ticks
 
-  int memOffset = timeBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
+  size_t memOffset = timeBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);   // T72: size_t
       memOffset = real4Buffer1.cmalloc_copy(tree.generalBuffer1, tree.n, memOffset);
       memOffset = newEndBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, memOffset);
 
@@ -5665,7 +5832,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     // partitions the SAME tree.bodies_Ppos index space compute_leaf/propsLeafD itself uses --
     // confirmed via compute_properties.cpp's propsLeafD.set_args call, which passes
     // tree.bodies_Ppos as the leaf kernel's own body_pos array) and dump its real subdivision level
-    // (decoded exactly from node_bodies[idx].x's LEVELMASK/BITLEVELS bits, node_specs.h -- the same
+    // (decoded exactly from node_bodies[idx].z, its own lane since T74 -- the same
     // bits build_tree.cu itself writes once at creation and cellSizeInfo's own host-independent
     // compute_scaling decode already relies on, not inferred), raw AABB half-extents (boxSizeInfo,
     // NEVER modified by any runtime bJ floor -- the floor only clamps a kernel-local float variable,
@@ -5724,13 +5891,13 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
         for (int n = 0; n < nNodes; n++)
         {
           if (tree.boxCenterInfo[n].w > 0.0f) continue; // internal node, not a leaf (cellOp sign convention)
-          const uint2 bij = tree.node_bodies[n];
-          const unsigned pfirst = bij.x & ILEVELMASK;
+          const uint4 bij = tree.node_bodies[n];
+          const unsigned pfirst = bij.x;              // T74: full width
           if (bij.y <= pfirst) continue;
           const unsigned nchild = bij.y - pfirst;
           if ((unsigned)pidx < pfirst || (unsigned)pidx >= pfirst + nchild) continue;
           L.found = true; L.nodeIdx = n;
-          L.level = (bij.x & LEVELMASK) >> BITLEVELS;
+          L.level = bij.z;
           const float4 sz  = tree.boxSizeInfo[n];
           const float4 ctr = tree.boxCenterInfo[n];
           const real4  com = tree.multipole[3*n];
@@ -5864,8 +6031,8 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
             if (!splitCell && bJraw <= 0.0f) nZeroBJWrongApprox++;
             if (!splitCell && ds2 < bestDs2) { bestDs2 = ds2; bestNode = n; bestBJ = bJraw; bestMJ = mJ; }
             if (!splitCell && bJraw > 0.0f) {
-              const uint2 bijn = tree.node_bodies[n];
-              const unsigned pf = bijn.x & ILEVELMASK;
+              const uint4 bijn = tree.node_bodies[n];
+              const unsigned pf = bijn.x;
               const unsigned nc = (bijn.y > pf) ? (bijn.y - pf) : 0;
               nonzeroWrong.push_back(std::make_tuple(ds2, n, bJraw, mJ, nc));
             }
@@ -5884,9 +6051,9 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
         unsigned bestLevel = 0, bestNchild = 0, bestPfirst = 0;
         float bestPx = 0, bestPy = 0, bestPz = 0;
         if (bestNode >= 0) {
-          const uint2 bij = tree.node_bodies[bestNode];
-          bestPfirst = bij.x & ILEVELMASK;
-          bestLevel = (bij.x & LEVELMASK) >> BITLEVELS;
+          const uint4 bij = tree.node_bodies[bestNode];
+          bestPfirst = bij.x;
+          bestLevel  = bij.z;
           bestNchild = (bij.y > bestPfirst) ? (bij.y - bestPfirst) : 0;
           const bool bestIsLeaf = tree.boxCenterInfo[bestNode].w <= 0.0f;
           if (bestIsLeaf && bestNchild >= 1) {
@@ -6356,14 +6523,34 @@ bool octree::writeRestartFile(const char *path)
 
   // Un-permute the two arrays the per-iteration reorder touches, so the whole file is in one
   // (original) order. oriParticleOrder[i] is the ORIGINAL index of the particle now at i.
-  std::vector<real4>      pos(n);
-  std::vector<ullong>     ids(n);
+  //
+  // T65 item 6b: this used to materialise the whole un-permuted result -- std::vector<real4>
+  // pos(n) plus std::vector<ullong> ids(n), 24 B/particle, 3.2 GiB at 512^3 and 10.9 GB at
+  // 768^3 -- and the measured host-memory PEAK of an entire 512^3 run was exactly here, at the
+  // first restart write, not at IC load. Now it inverts the permutation once (4 B/particle) and
+  // gathers through it in chunks, so the staging is 4 B/particle plus a 6 MiB window.
+  //
+  // output[o] = Ppos[inv[o]] is the same mapping as pos[o] = Ppos[i] with o = ori[i], so the
+  // bytes written are unchanged -- verified byte for byte against the pre-change writer on the
+  // 64^3 deterministic run.
+  //
+  // The inversion is also a strictly stronger check than the old bound test. n writes, each to a
+  // distinct slot (rejected below if not) and each in range, is a bijection -- so there can be no
+  // unwritten hole. The old scatter tested `o < n` but not distinctness, and a duplicated o would
+  // have left pos[] with an uninitialised entry and written garbage into the restart file for a
+  // particle that then resumed from it.
+  std::vector<uint> inv(n, 0xFFFFFFFFu);
   for (int i = 0; i < n; i++)
   {
     const uint o = tree.oriParticleOrder[i];
     if ((int) o >= n) { fprintf(stderr, "FATAL: restart write: oriParticleOrder[%d]=%u out of range\n", i, o); return false; }
-    pos[o] = tree.bodies_Ppos[i];
-    ids[o] = tree.bodies_ids[i];
+    if (inv[o] != 0xFFFFFFFFu)
+    {
+      fprintf(stderr, "FATAL: restart write: oriParticleOrder is not a permutation -- original "
+                      "index %u claimed by both current index %u and %d\n", o, inv[o], i);
+      return false;
+    }
+    inv[o] = (uint) i;
   }
 
   const std::string tmp = std::string(path) + ".tmp";
@@ -6412,9 +6599,25 @@ bool octree::writeRestartFile(const char *path)
   }
 #endif
 
+  // T65 item 6b: gather-and-write in chunks through inv[], instead of from a full-size copy.
+  const int CHUNK = 1 << 18;                    // 262,144 particles: 4 MiB of real4, 2 MiB of ullong
+  const int bufN  = (n < CHUNK) ? n : CHUNK;
+  std::vector<real4>  bufPos((size_t) (bufN > 0 ? bufN : 1));
+  std::vector<ullong> bufIds((size_t) (bufN > 0 ? bufN : 1));
+
   bool ok = fwrite(&h, sizeof(h), 1, f) == 1;
-  ok = ok && fwrite(pos.data(),               sizeof(real4),  n, f) == (size_t) n;
-  ok = ok && fwrite(ids.data(),               sizeof(ullong), n, f) == (size_t) n;
+  for (int a = 0; ok && a < n; a += CHUNK)
+  {
+    const int m = ((n - a) < CHUNK) ? (n - a) : CHUNK;
+    for (int k = 0; k < m; k++) bufPos[k] = tree.bodies_Ppos[inv[a + k]];
+    ok = fwrite(bufPos.data(), sizeof(real4), m, f) == (size_t) m;
+  }
+  for (int a = 0; ok && a < n; a += CHUNK)
+  {
+    const int m = ((n - a) < CHUNK) ? (n - a) : CHUNK;
+    for (int k = 0; k < m; k++) bufIds[k] = tree.bodies_ids[inv[a + k]];
+    ok = fwrite(bufIds.data(), sizeof(ullong), m, f) == (size_t) m;
+  }
   ok = ok && fwrite(&tree.bodies_vel[0],      sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_Pvel[0],     sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_time[0],     sizeof(int2), n, f) == (size_t) n;

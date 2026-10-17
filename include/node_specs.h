@@ -76,7 +76,23 @@ typedef struct bodyStruct
 
 //Tree-walk and stack configuration
 //#define LMEM_STACK_SIZE            3072         //Number of storage places PER thread, MUST be power 2 !!!!
-#define LMEM_STACK_SIZE             2048        //Number of storage places PER thread, MUST be power 2 !!!!
+// T61: 2048 -> 8192, i.e. the walk's per-warp cell-list ring buffer goes from 65,536 to 262,144
+// entries. 2048 was not enough to reach z=0 on a 130M-particle zoom: the ama-gi-1 run overflowed at
+// iteration 14288 (z=2.41, snapshot 122 of 682) with a live frontier of 69,307 against the 65,536
+// capacity, and the T49-A guard correctly refused to integrate the incomplete forces rather than
+// wrapping the ring silently.
+//
+// Measured at that step, which is what sets the size:
+//     frontier 57,233 (87.3% of 65,536) with the pre-T55 spherical Rcut prune
+//     frontier 69,307 (105.8%)           with T55's per-axis prune, i.e. the shipping default
+// So T55 contributed +21% -- and the run would have failed within a few hundred steps regardless,
+// since 87.3% at z=2.41 leaves no room for the remaining 560 snapshots' worth of clustering.
+//
+// 262,144 is 3.8x the measured peak. No fixed size is provably safe here -- the frontier has a long
+// tail (see the audit repo's cell-list-overflow note: a 60x tail against a 20x margin) -- so the
+// guard matters more than the number. What this buys is headroom to z=0 at this particle count;
+// the guard remains the thing that makes an overflow a clean stop instead of wrong forces.
+#define LMEM_STACK_SIZE             8192        //Number of storage places PER thread, MUST be power 2 !!!!
 #define LMEM_EXTRA_SIZE             2048
 #define CELL_LIST_MEM_PER_WARP     (LMEM_STACK_SIZE*32)
 #if ((CELL_LIST_MEM_PER_WARP-1) & CELL_LIST_MEM_PER_WARP) != 0
@@ -125,9 +141,18 @@ inline int getTreeWalkBlocksPerSM(int devMajor, int devMinor)
 //Minimum number of nodes that is required  before we make leafs
 #define START_LEVEL_MIN_NODES 16
 
-#define BITLEVELS 27
-#define ILEVELMASK 0x07FFFFFF
-#define  LEVELMASK 0xF8000000
+// T74: BITLEVELS / ILEVELMASK / LEVELMASK are GONE, deliberately.
+//
+// node_bodies[].x used to pack the tree level into its top 5 bits and the index of the node's
+// first body into the bottom 27, which capped the whole code at 2^27 = 134,217,728 particles --
+// exactly 512^3, the one production size this port had ever run, so it sat precisely on the limit
+// and nobody noticed. Above it the index truncated AND overwrote the level, and the corrupted
+// level then indexed level_list[level-1] past its MAXLEVELS entries: measured, 226,492,416
+// particles exited 0 with the clock frozen at TimeBegin and 339,738,624 took a GPU page fault.
+//
+// node_bodies is now a uint4 with the level in its own lane (.z) and the index at full width in
+// .x. These three macros are removed rather than left unused so that any site still reaching for
+// the old packing FAILS TO COMPILE instead of silently reading the wrong bits.
 
 #ifndef NLEAF
 #define NLEAF 16
@@ -141,6 +166,26 @@ inline int getTreeWalkBlocksPerSM(int devMajor, int devMinor)
 // costing 20% more VGPR/wave: 120 vs 96). Overridable via the CMake option GADGET_HIP_NCRIT
 // (CMakeLists.txt -> -DNCRIT=<value>) so 64 (or any other value) stays available as an explicit,
 // no-source-edit build option -- see build-ncrit64/ -- same convention as MAC_SPRINGEL.
+// T74: CRITBIT / CRITMASK / INVCMASK are GONE, deliberately -- same reason as
+// BITLEVELS/ILEVELMASK/LEVELMASK above.
+//
+// groupSizeInfo[].w used to pack a group's particle count minus one into its top
+// 32-log2(NCRIT) bits and the index of its first particle into the rest, which at the shipping
+// NCRIT=32 left the index 27 bits and so capped the run at 2^27 = 134,217,728 particles --
+// exactly 512^3. Above it the index truncated and the count was corrupted by the spill, and the
+// walk integrated the wrong particles: measured, 226,492,416 particles exited 0 with every
+// timestep zero and the clock frozen at TimeBegin.
+//
+// The count is now DERIVED as start[g+1] - start[g] and .w holds the index at full 32-bit width.
+// That is sound because groups tile [0,n) contiguously in group-index order, which
+// GADGET_HIP_INVARIANTS=1's C-A-19b check verifies on every rebuild -- measured OK on a uniform
+// 64^3 IC and on the 130,341,198-particle four-species ama-gi zoom. Both group-construction paths
+// guarantee it: store_group_list() emits consecutive compacted boundaries, and the experimental
+// GADGET_HIP_COMPACT_GROUPS path chains them explicitly (build.cpp).
+//
+// groupSizeInfo therefore carries ONE EXTRA entry, [n_groups], holding n as a sentinel so the
+// derivation needs no branch for the last group.
+//
 #ifndef NCRIT
 #define NCRIT 32
 #endif
@@ -210,44 +255,26 @@ inline int getTreeWalkBlocksPerSM(int devMajor, int devMinor)
 // count-1 field is always 0 regardless of how many bits are reserved for it.
 
 #define NCRIT2 1
-#define CRITBIT 31
-#define CRITMASK 0x7FFFFFFF
-#define INVCMASK 0x80000000
 
 #elif NCRIT == 8
 
 #define NCRIT2 3
-#define CRITBIT 29
-#define CRITMASK 0x1FFFFFFF
-#define INVCMASK 0xE0000000
 
 #elif NCRIT == 16
 
 #define NCRIT2 4
-#define CRITBIT 28
-#define CRITMASK 0x0FFFFFFF
-#define INVCMASK 0xF0000000
 
 #elif NCRIT == 32
 
 #define NCRIT2 5
-#define CRITBIT 27
-#define CRITMASK 0x07FFFFFF
-#define INVCMASK 0xF8000000
 
 #elif NCRIT == 64
 
 #define NCRIT2 6
-#define CRITBIT 26
-#define CRITMASK 0x03FFFFFF
-#define INVCMASK 0xFC000000
 
 #elif NCRIT == 128
 
 #define NCRIT2 7
-#define CRITBIT 25
-#define CRITMASK 0x01FFFFFF
-#define INVCMASK 0xFE000000
 
 #else
 #error "Please choose correct NCRIT available in node_specs.h"

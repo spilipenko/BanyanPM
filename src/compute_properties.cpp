@@ -25,14 +25,26 @@ void octree::compute_properties(tree_structure &tree) {
     LOG("Resize generalBuffer1 in compute_properties\n");
     // Bug 9: `10*tree.n_nodes*4` is int32 arithmetic and overflows past ~53.7M nodes, which is
     // reached well inside a 512^3 run. Promoted to size_t; dev_mem's size API is now 64-bit too.
-    tree.generalBuffer1.cresize((size_t)10 * (size_t)tree.n_nodes * 4, false);
+    // T65 item 1: cresize_nocpy, not cresize. Two reasons, both measured.
+    // (a) Nothing in the arena has to survive this resize. build()'s validList/compactList/node_key
+    //     are finished by the time compute_properties runs, and on the no-rebuild path the arena
+    //     holds only the previous tree walk's stack. cresize copies the old contents, which at
+    //     768^3 is a 16 GB device-to-device memcpy of data about to be overwritten.
+    // (b) cresize allocates the new buffer BEFORE freeing the old one, on both the host and the
+    //     device side, so growing the arena transiently needs twice the arena twice over -- about
+    //     65 GB at 768^3, on a machine with 123 GiB. cresize_nocpy frees first.
+    // This growth is not hypothetical: it fires whenever n_nodes/N > 0.3, and n_nodes/N is
+    // distribution-dependent -- measured 0.143 for a 512^3 IC at z=100 but 0.354 for a uniform
+    // random cube, where the 5.010 GiB arena was observed being replaced by a 5.280 GiB one. A run
+    // that fits at z=100 can therefore die later as clustering changes the node count.
+    tree.generalBuffer1.cresize_nocpy((size_t)10 * (size_t)tree.n_nodes * 4, false);
   }
   
   my_dev::dev_mem<double4> multipoleD;      //Double precision buffer to store temporary results
   my_dev::dev_mem<real4>   nodeLowerBounds; //Lower bounds used for computing box sizes
   my_dev::dev_mem<real4>   nodeUpperBounds; //Upper bounds used for computing box sizes
   
-  int memBufOffset = multipoleD.cmalloc_copy     (tree.generalBuffer1, 3*tree.n_nodes, 0);
+  size_t memBufOffset = multipoleD.cmalloc_copy  (tree.generalBuffer1, (size_t)3*tree.n_nodes, 0);  // T72: size_t
       memBufOffset = nodeLowerBounds.cmalloc_copy(tree.generalBuffer1,   tree.n_nodes, memBufOffset);
       memBufOffset = nodeUpperBounds.cmalloc_copy(tree.generalBuffer1,   tree.n_nodes, memBufOffset);
 

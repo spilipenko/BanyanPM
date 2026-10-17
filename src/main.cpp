@@ -1628,21 +1628,33 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
             snapHeader.HubbleParam, snapHeader.time);
 
     const size_t n = snapData.type.size();
+
+    // T65: one array at a time, releasing each source as it is consumed, instead of one loop that
+    // reads all five snapData vectors while all three destinations already exist. The old shape
+    // held 84 B/particle at this point (snapData's 40 plus the destinations' 44) -- 38 GB at
+    // 768^3; this holds 56 at worst. swap-with-empty rather than clear(), which keeps capacity.
     bodyPositions.resize(n);
-    bodyVelocities.resize(n);
-    bodyIDs.resize(n);
     for (size_t i = 0; i < n; ++i)
-    {
-      bodyPositions[i]  = make_float4(snapData.pos[3 * i + 0], snapData.pos[3 * i + 1],
-                                       snapData.pos[3 * i + 2], snapData.mass[i]);
+      bodyPositions[i] = make_float4(snapData.pos[3 * i + 0], snapData.pos[3 * i + 1],
+                                      snapData.pos[3 * i + 2], snapData.mass[i]);
+    std::vector<float>().swap(snapData.pos);
+    std::vector<float>().swap(snapData.mass);
+
+    bodyVelocities.resize(n);
+    for (size_t i = 0; i < n; ++i)
       bodyVelocities[i] = make_float4(snapData.vel[3 * i + 0], snapData.vel[3 * i + 1],
                                        snapData.vel[3 * i + 2], 0.0f);
-      bodyIDs[i]        = snapData.id[i];
-    }
+    std::vector<float>().swap(snapData.vel);
+
+    bodyIDs.resize(n);
+    for (size_t i = 0; i < n; ++i) bodyIDs[i] = snapData.id[i];
+    std::vector<uint64_t>().swap(snapData.id);
+
     // Phase 5 ticket 03 (PLAN.md): captured here, applied to tree->localTree.bodies_type once it
     // exists (right after allocateParticleMemory(), further below) -- per-type softening is the
     // first real consumer of snapData.type; tickets 06/07's zoom work will read it too.
-    bodyTypes = snapData.type;
+    // Moved, not copied: snapData is dead from here on.
+    bodyTypes = std::move(snapData.type);
 
 #ifdef GADGET_HIP_HIGHRES
     // T51: recentre the high-res region on the box centre. Done HERE because this is the one point
@@ -1885,6 +1897,28 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   tree->localTree.bodies_Pvel.h2d();
   tree->localTree.bodies_ids. h2d();
 
+  // T65 item 6: release the host IC staging now that every byte of it is on the device.
+  //
+  // These four vectors are 44 B/particle -- real4 positions 16, real4 velocities 16, ullong ids 8,
+  // int types 4 -- which is 5.5 GiB at 512^3 and 19.9 GB at 768^3, and before this they stayed
+  // allocated AND resident for the entire run. Measured with the allocation ledger
+  // (probes/t65-memory, audit repo): live host memory held exactly 44 B/particle of these from the
+  // IC load to the final step without ever dropping, on top of the dev_mem host sides that
+  // duplicate the same data.
+  //
+  // This is deliberately NOT a streaming rewrite of the reader, which is what the first reading of
+  // the ledger suggested. The ledger's footprint profile settles it: the IC-load TRANSIENT
+  // (GadgetParticleData's 40 B/particle plus these 44) peaks at 10.5 GiB at 512^3 at a point where
+  // the device arrays do not exist yet and total live memory is a third of the run's peak, so it
+  // never sets the ceiling. Keeping these four afterwards did.
+  //
+  // swap-with-empty rather than clear(): clear() leaves capacity allocated, which is the whole
+  // problem here. Everything downstream of this point uses tree->localTree.n for the count.
+  vector<real4>().swap(bodyPositions);
+  vector<real4>().swap(bodyVelocities);
+  vector<ullong>().swap(bodyIDs);
+  vector<int>().swap(bodyTypes);
+
   // Resume AFTER the IC upload: the IC established the particle count and the (id -> type) map,
   // and the restart file now overwrites the state arrays with the saved ones. readRestartFile
   // refuses on a count or setup mismatch rather than producing a scrambled continuation.
@@ -2011,7 +2045,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     CU_SAFE_CALL(hipMalloc((void**)&d_density, gridElems * sizeof(float)));
     CU_SAFE_CALL(hipMemset(d_density, 0, gridElems * sizeof(float)));
 
-    pm_cic_assign_mass(tree->localTree.bodies_Ppos.raw_p(), (int)bodyPositions.size(), d_density,
+    pm_cic_assign_mass(tree->localTree.bodies_Ppos.raw_p(), tree->localTree.n, d_density,
                         gridSize, gridPitch, pmTestCicBoxSize, 0);
     CU_SAFE_CALL(hipDeviceSynchronize());
 
@@ -2025,7 +2059,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 
     const double relErr = fabs(gridMass - totalMass) / totalMass;
     fprintf(stderr, "[PM_TEST_CIC] gridSize=%d boxSize=%g nBodies=%zu totalMass=%.9g gridMass=%.9g relErr=%.3e\n",
-            gridSize, pmTestCicBoxSize, bodyPositions.size(), totalMass, gridMass, relErr);
+            gridSize, pmTestCicBoxSize, (size_t) tree->localTree.n, totalMass, gridMass, relErr);
     ::exit(relErr < 1e-5 ? 0 : 1);
   }
 

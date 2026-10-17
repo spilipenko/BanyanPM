@@ -108,6 +108,42 @@ Verified: with the timeout raised, 512³ Springel at `ErrTolForceAcc=0.002` runs
 session active and zero GPU resets. Expect the desktop to be sluggish during dense steps — the GPU
 really is busy.
 
+## Memory and problem size
+
+Footprint at 512³ (134,217,728 particles), measured with an allocation ledger rather than estimated:
+
+| | B/particle | 512³ |
+|---|---|---|
+| before | 547 | 68.3 GiB |
+| **now** | **333** | **41.7 GiB** |
+
+−39%, which moves the largest problem that fits in 128 GB from about 600³ to **about 770³**. Four
+things got it there: the shared scratch arena no longer pins a host mirror it never reads; the
+id-space long-range store is allocated only when the cadence can actually use it; the host IC
+arrays are released once uploaded, and the checkpoint writer gathers in chunks instead of staging
+the whole box; and `-DGADGET_HIP_UNIFIED_MEM=ON` aliases pinned host buffers as device memory on an
+APU, where host and device memory are the same silicon.
+
+**Aliasing is a trade, so measure it where it matters.** It costs about **6% per step early in a
+run and about 11% by z ≈ 1** — the penalty is on streaming writes, and the write-heavy phases are a
+larger share of a late step. `GADGET_HIP_UNIFIED_MEM=0` turns it off at runtime with no rebuild.
+At 512³, where 41.7 GiB fits comfortably, leave it off; switch it on above ~600³, where it is what
+makes the run fit at all.
+
+**The particle ceiling is 2²⁸ = 268,435,456, and it is enforced.** It used to be 2²⁷ = 134,217,728
+— exactly 512³ — because a tree node packed a 5-bit level and a group packed a 5-bit particle count
+into the spare top bits of a 32-bit index. Above that the index truncated and the walk forced the
+wrong particles *without failing*: in one measured case every timestep came out zero and the clock
+stayed at `TimeBegin`, and in another 21% of leaves disagreed with the node table while the run
+exited 0 with a plausible-looking trajectory. The level now has its own field and the group count
+is derived from the next group's offset, so both indices are full-width. The remaining packing is
+the leaf indirection's 4-bit count, which caps it at 2²⁸; the build **refuses** above that, naming
+the field, rather than running and corrupting the tree. Three invariant checks
+(`GADGET_HIP_INVARIANTS=1`) watch the three packings on every rebuild.
+
+A separate 32-bit wall sat at **244 million particles (625³)**: the scratch arena's sub-allocation
+offsets were `int`, so no larger run could start whatever the memory. They are `size_t` now.
+
 ## Zoom simulations (`PLACEHIGHRESREGION`)
 
 A zoom run resolves one region at high resolution inside a larger, coarser box. GADGET does this
@@ -162,7 +198,7 @@ enclosed mass within 1% outside 0.1 Mpc/h.
 
 **Mesh size.** Measured at 115M particles, per step over matched 10-step runs:
 
-| PMGRID | every-step PM | with `GADGET_HIP_PM_CADENCE=1` |
+| PMGRID | `GADGET_HIP_PM_CADENCE=0` | cadence (the default) |
 |---|---|---|
 | 128 | 4.325 s | **2.673 s** |
 | 256 | **3.491 s** | **2.677 s** |
@@ -214,6 +250,24 @@ box, ΛCDM (Ωm = 0.307, ΩΛ = 0.693, h = 0.678), z = 99 → 0, Springel openin
 
 **Energy.** Kinetic energy at all 20 statistics epochs, worst deviation **+0.145%** (at a = 0.26),
 with no trend — +0.101% at a = 0.91 and +0.064% at a = 0.96.
+
+Re-run end to end after the memory work above, on the same initial conditions and the same
+reference: **worst deviation +0.152%** at a = 0.81, every epoch positive, and the first epoch
+agreeing to all six printed digits, which is what confirms the initial conditions and unit system
+are identical rather than merely close. Structure at z = 0, σ(δ) against the reference's own
+z = 0 snapshot, checked at four grid resolutions because a single one can agree by luck:
+
+| cells per side | CPU GADGET-2 | BanyanPM | |
+|---|---|---|---|
+| 32 | 3.43988 | 3.44289 | +0.088% |
+| 64 | 6.37706 | 6.38380 | +0.106% |
+| 128 | 11.24498 | 11.25885 | +0.123% |
+| 256 | 17.53811 | 17.53659 | −0.009% |
+
+Agreement holds from 3.1 down to 0.39 Mpc/h, i.e. from the mildly into the deeply non-linear
+regime. For scale, the PM cadence itself moves kinetic energy by up to 0.133% at this resolution,
+so the port tracks an independent CPU code more closely than its own two long-range modes track
+each other.
 
 **Halo mass function** at z = 0, both catalogues built by the same Rockstar binary with the same
 configuration:
@@ -282,20 +336,30 @@ Both runs were 9,200–9,600 steps. The gain is concentrated at late times, wher
 the mesh assignment expensive; early steps are roughly at parity.
 
 That wall clock was measured on the float-timeline build. Full z = 0 runs on the integer timeline
-have since been timed, with the PM cadence on:
+have since been timed:
 
 | 512³ to z = 0 | steps | wall clock | per step |
 |---|---|---|---|
 | cadence | 9,538 | 7.9 h | 2.98 s |
+| every-step PM, aliasing on | 9,429 | 9.4 h | 3.58 s |
 | GADGET-2, 16 CPU cores | 9,557 | 48.3 h | 18.20 s |
 
-The step counts agree to **0.2%**, which is the sharper of the two validations: the timestep
-criterion is built from the same force GADGET builds it from, so the two codes subdivide time nearly
-identically rather than merely arriving at the same place.
+The step counts agree with GADGET to **0.2–1.3%**, which is the sharper of the two validations: the
+timestep criterion is built from the same force GADGET builds it from, so the two codes subdivide
+time nearly identically rather than merely arriving at the same place.
 
-A per-phase breakdown of any run is in its `cpu.txt`. On a late step the cost is dominated by the
-tree walk on dense steps (~47%) and by the tree rebuild otherwise (~40%) — the long-range force is
-about 20%.
+**Compare per-step cost, not wall clock, and check the softening first.** Step count is extremely
+sensitive to the gravitational softening, and not smoothly: the timeline is quantised in powers of
+two, so a softening 4/3 finer can add a whole extra rung to the hierarchy and with it ~42% more
+steps, where a `dt ∝ √ε` estimate would predict ~15%. Two runs of this code at ε = box/512/30 and
+ε = box/512/40 came out at 6.6 h and 9.4 h — and **3.561 against 3.578 s per step**, i.e. the same
+code at the same speed on two different physics configurations. A wall-clock comparison across a
+softening change measures the softening.
+
+A per-phase breakdown of any run is in its `cpu.txt`. Over a whole z = 0 run with PM every step:
+tree walk 29%, tree rebuild 19%, long-range force 18%, Peano reorder 14%, timeline 12%. The tree is
+rebuilt every step; GADGET rebuilds at `TreeDomainUpdateFrequency`, which this code parses and
+ignores, and that remains the largest single structural difference in the cost profile.
 
 ---
 
@@ -338,15 +402,22 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
 
 - **Dark matter only**, single GPU, single process.
 - **Monopole tree**, matching GADGET-2. Bonsai's quadrupole correction is available but off.
-- **The long-range force follows GADGET's cadence**, opt-in with `GADGET_HIP_PM_CADENCE=1`. PM is
-  solved only on PM steps, the interval is chosen on the integer timeline the way GADGET chooses it
-  (the largest power-of-two tick count not exceeding `dt_displacement`), and the stored force is
-  applied as a *separate kick over the PM interval, midpoint to midpoint, to every particle exactly
-  once*. Measured at 512³ to z = 0: **439 PM solves against GADGET's 438**, worst kinetic-energy
-  deviation **0.142%**, and about **17% less wall clock** than recomputing every step. Every-step remains
-  the default, but "because it is newer" has stopped being a reason -- the measured cost is 0.133%
-  in worst-case kinetic energy, and on a zoom run the cadence is worth 17-38% of the step depending
-  on mesh size. Turning it on is reasonable; the default has simply not been revisited.
+- **The long-range force follows GADGET's cadence**, and this is now the **default**;
+  `GADGET_HIP_PM_CADENCE=0` solves PM every step instead. PM is solved only on PM steps, the
+  interval is chosen on the integer timeline the way GADGET chooses it (the largest power-of-two
+  tick count not exceeding `dt_displacement`), and the stored force is applied as a *separate kick
+  over the PM interval, midpoint to midpoint, to every particle exactly once*. Measured at 512³ to
+  z = 0: **439 PM solves against GADGET's 438**, worst kinetic-energy deviation **0.142%**, and
+  about **17% less wall clock** than recomputing every step; on a zoom run it is worth 17–38% of
+  the step depending on mesh size.
+
+  It was opt-in for a long time, on the reasoning that it was newer. The cost of leaving it that
+  way turned out to be measurable: a 28-run production suite went without it because an environment
+  variable was the only way to ask for one, and the launching script never set it — 26 of those
+  runs' 183 hours went into PM that the cadence would largely have skipped. A switch that can only
+  be given per-launch is eventually missed on a launch. Every-step PM remains the marginally more
+  accurate mode and is one variable away; the banner on the first PM step always states which mode
+  is in force **and whether it was chosen or defaulted**.
 
   Both meshes follow the cadence, as in GADGET. (The fine mesh used not to: it was solved every
   step while the coarse one was not, costing up to 42% of a zoom step. Fixed by accumulating it into
@@ -396,11 +467,21 @@ Read this before trusting a comparison. Items marked **open** are known gaps, no
   everything else combined. A single run at that resolution is therefore not a measurement: average
   several, or test a signature noise cannot fake. Any acceptance tolerance must exceed this floor,
   because one tighter than it fails at random.
-- **I/O**: GADGET-2 format 1 only; one file per snapshot. `energy.txt` and `timings.txt` are not
-  written — energies go to stdout instead. `info.txt` and `cpu.txt` *are* written, both in
-  GADGET's own format. Checkpointing uses its own format, not GADGET restart files.
-- Unsupported parameter keys: `TreeDomainUpdateFrequency`, `TypeOfTimestepCriterion`,
-  `NumFilesPerSnapshot`, and all SPH keys.
+- **I/O**: GADGET-2 formats 1 and 2. `energy.txt` and `timings.txt` are not written — energies go
+  to stdout instead. `info.txt` and `cpu.txt` *are* written, both in GADGET's own format.
+  Checkpointing uses its own format, not GADGET restart files.
+- **`NumFilesPerSnapshot` is now honoured**, and above a certain size it is not optional. GADGET's
+  block length markers are plain 4-byte ints, and POS is 12 bytes per particle, so **one physical
+  file cannot hold more than (INT_MAX − 8)/12 = 178,956,970 particles** whatever the machine. The
+  writer raises `numFiles` to the minimum the markers allow and says so on stderr: writing more
+  files than asked beats writing a truncated one. Naming follows GADGET's own `find_files()`
+  convention (`<base>` for one file, `<base>.0`, `.1`, … for several). The writer streams from the
+  live arrays one 262,144-particle chunk at a time rather than staging the snapshot, and the
+  multi-file reader sizes its output from the headers and scatters each `(file, type)` run in with
+  one `memcpy` — it reads a zoom IC whose resolution levels arrive out of type order without
+  holding two copies.
+- Unsupported parameter keys: `TreeDomainUpdateFrequency`, `TypeOfTimestepCriterion`, and all SPH
+  keys.
 - **`OutputListOn`/`OutputListFilename` are now honoured.** Snapshot times are read from the file,
   filtered to `[TimeBegin, TimeMax]`, sorted, and de-duplicated, exactly as GADGET does; entries
   outside the run are normal rather than an error. Two differences, both toward saying something:
