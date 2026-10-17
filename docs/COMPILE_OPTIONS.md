@@ -66,6 +66,14 @@ physics, by reading the startup banner, which catches a missing `PERIODIC` or `P
 
 ---
 
+## Prerequisites
+
+ROCm with its Clang toolchain, rocFFT, hipCUB/rocPRIM headers and OpenMP. The package list and the
+diagnostic for a failed OpenMP detection are in the
+[README](../README.md#requirements) — `rocm-omp-devel` is the one most often missing, because
+ROCm's `clang++` carries no `omp.h` in its own resource directory and takes it from that separate
+package.
+
 ## Canonical builds
 
 ### Standard periodic cosmological box

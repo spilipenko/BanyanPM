@@ -43,6 +43,47 @@ nothing computing it. The isolated mode needs `--meshsize`, and places particles
 of its doubled grid at load, restoring the initial conditions' frame when snapshots are written; see
 [`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md#non-periodic-isolated-runs).
 
+## Requirements
+
+ROCm with its Clang toolchain, plus three ROCm libraries and OpenMP. On Fedora 44 with native ROCm
+packages:
+
+```bash
+sudo dnf install cmake rocm-hip-devel rocm-clang rocm-omp-devel libomp \
+                 rocfft-devel hipcub-devel rocprim-devel
+```
+
+| needed for | provides | why |
+|---|---|---|
+| `rocm-hip-devel` | `hip-config.cmake` | `find_package(hip)` |
+| `rocm-clang` | ROCm's `clang++` | the host and device compiler; CMake searches for it automatically |
+| **`rocm-omp-devel`** | **`/usr/lib64/rocm/llvm/include/omp.h`** | **the `omp.h` ROCm's `clang++` actually uses — it has none in its own resource directory, so this is a separate package and the easiest one to miss** |
+| `libomp` | `libomp.so` | links `-lomp` |
+| `rocfft-devel` | `rocfft-config.cmake` | the particle-mesh FFT; required whenever `GADGET_HIP_PMGRID` is set |
+| `hipcub-devel`, `rocprim-devel` | headers under `/usr/include` | device sort and scan primitives |
+
+**OpenMP is not optional**, even though this is a single-GPU, single-process code: the main loop
+runs inside an `omp parallel` region of one or two threads, so that snapshot writing can overlap
+integration. A configure that ends in
+
+```
+Could NOT find OpenMP_CXX (missing: OpenMP_CXX_FLAGS OpenMP_CXX_LIB_NAMES)
+```
+
+means Clang could not compile a trivial OpenMP program. Reproduce it directly to see which half is
+missing:
+
+```bash
+printf '#include <omp.h>\nint main(){return omp_get_thread_num();}\n' > /tmp/omp.cpp
+/usr/lib64/rocm/llvm/bin/clang++ -fopenmp=libomp /tmp/omp.cpp -o /tmp/omp && echo "OpenMP OK"
+```
+
+`omp.h' file not found` is a missing `rocm-omp-devel`; `cannot find -lomp` is a missing `libomp`.
+CMake's own reason is in `build/CMakeFiles/CMakeError.log`, or `CMakeConfigureLog.yaml` on CMake
+3.26 and newer.
+
+MPI is **not** required — see the note at the end of this section.
+
 ## Build
 
 ```bash
