@@ -65,18 +65,6 @@ if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
 endif()
 
 find_package(hip REQUIRED)
-# MPI is NOT required to build the simulation. T17 removed -DUSE_MPI, so every USE_MPI block is
-# compiled out and the core library contains zero MPI references -- verified with
-# `nm -uC libgadget_hip_core.a | grep -c MPI_` -> 0, and `nm -uC gadget_hip | grep -i mpi` -> empty,
-# while `ldd gadget_hip` still showed libmpi.so.40 purely because MPI::MPI_CXX was linked anyway.
-# The only real consumers are three legacy Bonsai-era utilities (bonsai_io, bonsai_driver,
-# bonsai_clrshm) which `#include <mpi.h>` unconditionally and have nothing to do with the Gadget
-# port. They are off by default; turn them on with -DGADGET_HIP_BUILD_BONSAI_TOOLS=ON, which then
-# requires MPI.
-option(GADGET_HIP_BUILD_BONSAI_TOOLS "Build the legacy Bonsai utilities (needs MPI)" OFF)
-if(GADGET_HIP_BUILD_BONSAI_TOOLS)
-  find_package(MPI REQUIRED)
-endif()
 find_package(OpenMP REQUIRED)
 # hipCUB/rocPRIM are header-only here and already live under /usr/include (default search
 # path) -- deliberately NOT using find_package(hipcub)/find_package(rocprim) + their imported
@@ -142,11 +130,30 @@ option(GADGET_HIP_DETERMINISTIC_CIC "Bit-reproducible fixed-point CIC scatter (d
 # hipHostMalloc, so the device copy of a PINNED buffer is a second physical copy of the same bytes.
 # With this on, a pinned allocation takes its device pointer from hipHostGetDevicePointer instead of
 # allocating one, and h2d/d2h become synchronisation points rather than copies.
-# OFF by default: on a discrete GPU the copy is genuinely required.
+# ON by default since T78. It was OFF while its cost was believed to be ~11%; measured, the cost is
+# 0.5-4% (0.5% per step against imba2's pre-aliasing full 512^3 runs at matched epochs, 3.9% from a
+# runtime toggle on one binary at z=0), and with the coarse-grained host allocator that T78 made the
+# default the aliased build is FASTER than keeping two copies: 2.545 s/step against 2.588 at 512^3
+# z=0. So it now saves both memory and time, and the memory it saves is large -- 181.5 B/particle of
+# duplicated particle arrays.
+#
+# Turn it OFF for a discrete GPU, where the device copy is genuinely required.
 # GADGET_HIP_UNIFIED_MEM=0 in the environment turns it off again at runtime, for A/B.
-option(GADGET_HIP_UNIFIED_MEM "Alias pinned host buffers as device memory instead of copying them (APU only)" OFF)
+option(GADGET_HIP_UNIFIED_MEM "Alias pinned host buffers as device memory instead of copying them (APU; off for a discrete GPU)" ON)
 if(GADGET_HIP_UNIFIED_MEM)
   add_definitions(-DGADGET_HIP_UNIFIED_MEM)
+endif()
+# Allocation ledger (include/memlog.h). OFF by default and genuinely absent from the build when
+# off, not merely idle: compiled in but with the env var unset, a 64^3 deterministic run measured
+# 3.2% slower overall and 3.8% slower in the tree walk (five runs each, order balanced), from
+# the eight extra members per dev_mem rather than from any kernel change -- registers, scratch
+# and the whole device image were identical. With this OFF the generated code is the same as
+# from sources without the ledger, bar the one startup banner line that reports the option.
+# Turn it ON to measure memory, then set
+# GADGET_HIP_MEMLOG=<path> at run time to choose where the ledger is written.
+option(GADGET_HIP_MEMLOG "Compile in the allocation ledger (measurement only; costs ~6% in the walk)" OFF)
+if(GADGET_HIP_MEMLOG)
+  add_definitions(-DGADGET_HIP_MEMLOG_BUILD)
 endif()
 if(GADGET_HIP_DETERMINISTIC_CIC)
   add_definitions(-DGADGET_HIP_DETERMINISTIC_CIC)
@@ -191,17 +198,13 @@ if(GADGET_HIP_CB19_NO_RCUT_REJECT)
   add_definitions(-DGADGET_HIP_CB19_NO_RCUT_REJECT)
 endif()
 
-option(GADGET_HIP_QUADRUPOLE "Enable Bonsai's quadrupole moment correction (off = Gadget-2's own monopole-only behavior)" OFF)
-if(GADGET_HIP_QUADRUPOLE)
-  add_definitions(-DGADGET_HIP_QUADRUPOLE)
-endif()
 
 # Ticket 20 (tickets/T20-test-summation-order-sensitivity.md): test-only, opt-in double-precision
 # force accumulator for the warp-cooperative tree walk (acc_i[k] in
 # dev_approximate_gravity_warp_new.cu), to test whether float32 summation-order/precision in that
 # accumulation explains Ticket 17's secular non-cosmological energy drift. Default OFF (identical
 # to every other build) -- only ever set ON in a dedicated test build (build-t20-doubleforce),
-# never in a build another ticket depends on. Same convention as GADGET_HIP_QUADRUPOLE above.
+# never in a build another ticket depends on.
 option(GADGET_HIP_T20_DOUBLE_FORCE_ACCUM "Ticket 20 test-only: accumulate acc_i in double4 instead of float4 in the warp-cooperative tree walk (off = original float4 behavior)" OFF)
 if(GADGET_HIP_T20_DOUBLE_FORCE_ACCUM)
   add_definitions(-DGADGET_HIP_T20_DOUBLE_FORCE_ACCUM)
@@ -210,7 +213,6 @@ endif()
 # Phase 5 ticket 02 (PLAN.md): Gadget-2 snapshot I/O. LONGIDS selects an 8-byte (vs. default
 # 4-byte) on-disk particle-ID block, matching Gadget-2's own LONGIDS compile flag exactly -- a
 # build-time choice there too, not a `.param` value (PHASE5_PARAMS_SNAPSHOT_SPEC.md Sec 1.4/2.4).
-# Same CMake-option convention as GADGET_HIP_QUADRUPOLE above.
 option(GADGET_HIP_LONGIDS "Use 8-byte particle IDs in Gadget-2 snapshot I/O (off = Gadget-2's own default 4-byte IDs)" OFF)
 if(GADGET_HIP_LONGIDS)
   add_definitions(-DGADGET_HIP_LONGIDS)
@@ -263,9 +265,7 @@ endif()
 # Phase 5 ticket 06 (PLAN.md): PLACEHIGHRESREGION zoom dual-grid PM. Requires GADGET_HIP_PMGRID
 # (zoom is a PM refinement, meaningless without PM at all) -- same "refused at configure time
 # rather than silently producing wrong physics" reasoning PERIODIC already applies above. Refused
-# together with GADGET_HIP_QUADRUPOLE too: the tree-side per-type Rcut/Asmth split (Ticket 07)
 # only extends the monopole add_acc() path, and there is no Gadget-2 reference for a
-# quadrupole+zoom combination anyway (same reasoning already applied to PERIODIC+QUADRUPOLE).
 # Works with or without PERIODIC (PHASE5_ZOOM_COMOVING_SPEC.md Sec 1.2 -- both are real Gadget-2
 # modes), so no dependency on that option specifically.
 option(GADGET_HIP_HIGHRES "Enable PLACEHIGHRESREGION zoom dual-grid PM (fine grid refinement)" OFF)
@@ -273,10 +273,6 @@ if(GADGET_HIP_HIGHRES)
   if(NOT GADGET_HIP_PMGRID)
     message(FATAL_ERROR "GADGET_HIP_HIGHRES requires GADGET_HIP_PMGRID: zoom is a refinement of "
       "the PM long-range solve, meaningless without PM compiled in at all.")
-  endif()
-  if(GADGET_HIP_QUADRUPOLE)
-    message(FATAL_ERROR "GADGET_HIP_HIGHRES is refused together with GADGET_HIP_QUADRUPOLE: no "
-      "Gadget-2 reference exists for this combination (same reasoning as PERIODIC+QUADRUPOLE).")
   endif()
   add_definitions(-DGADGET_HIP_HIGHRES)
   list(APPEND PM_EXTRA_CCFILES src/pm_zoom_region.cpp src/pm_solve_zoom.cpp)
@@ -289,15 +285,12 @@ set(CORE_CCFILES
   src/build.cpp
   src/compute_properties.cpp
   src/gpu_iterate.cpp
-  src/libraryInterface.cpp
   src/load_kernels.cpp
   src/anyoption.cpp
   src/octree.cpp
   src/parallel.cpp
   src/sort_bodies_gpu.cpp
   src/log.cpp
-  src/hostConstruction.cpp
-  src/tipsyIO.cpp
   src/gadget_params.cpp
   src/gadget_snapshot.cpp
   src/gadget_softening.cpp
@@ -356,18 +349,3 @@ add_executable(gadget_hip src/main.cpp)
 target_include_directories(gadget_hip PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(gadget_hip PRIVATE -fPIE -Wno-main)
 target_link_libraries(gadget_hip PRIVATE gadget_hip_core hip::host OpenMP::OpenMP_CXX -lrt)
-
-# Legacy Bonsai utilities. Not part of the simulation: bonsai_io/driver/clrshm are the Bonsai-era
-# shared-memory IO plumbing, and src/bonsai_io.cpp and src/driver.cpp `#include <mpi.h>` on line 2
-# with no guard, which is what made MPI a hard build dependency for everyone.
-if(GADGET_HIP_BUILD_BONSAI_TOOLS)
-  add_executable(bonsai_clrshm src/bonsai_clrshm.cpp)
-  target_link_libraries(bonsai_clrshm PRIVATE MPI::MPI_CXX -lrt)
-
-  add_executable(bonsai_io src/bonsai_io.cpp src/anyoption.cpp)
-  target_include_directories(bonsai_io PRIVATE ${CMAKE_SOURCE_DIR}/include)
-  target_link_libraries(bonsai_io PRIVATE MPI::MPI_CXX -lrt)
-
-  add_executable(bonsai_driver src/driver.cpp)
-  target_link_libraries(bonsai_driver PRIVATE MPI::MPI_CXX -ldl -lrt)
-endif()

@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <rocfft/rocfft.h>
 #include "pm.h"
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 static void pm_fft_check(rocfft_status status, const char *what)
 {

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include "memlog.h"
 #include <sstream>
 
 // Phase 5 ticket 02 (PLAN.md) -- see gadget_snapshot.h for design rationale. Implementation
@@ -447,6 +448,10 @@ bool gadget_snapshot_write(const std::string &path, int snapFormat, bool longIds
   // relative order (e.g. particle ID order) is preserved -- a nicety, not a correctness
   // requirement, but costs nothing.
   std::vector<size_t> order(N);
+  // 8 B/particle more of untracked host memory, live at the same time as everything above.
+  if (memlog::on())
+    memlog::record("ALLOC", "ic_sort_permutation", (long long) (order.capacity() * sizeof(size_t)),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(),
                     [&](size_t a, size_t b) { return data.type[a] < data.type[b]; });
@@ -638,6 +643,25 @@ bool readOneFile(const std::string &path, int icFormat, bool longIds,
   data.id.resize(N);
   data.mass.resize(N);
   data.type.resize(N);
+  // These five std::vectors are the IC staging buffers, and they are the one part of the memory
+  // footprint that no allocator wrapper sees -- they go through the default operator new, not
+  // through my_cuda_rt.h. At 512^3 they are 37 B/particle = 4.63 GiB, held while the particle
+  // arrays already exist, which is why resident memory peaks during startup rather than during
+  // gravity. Recorded here so the ledger is complete; a gap in the instrumentation that nobody
+  // can see is worse than a large number that everybody can.
+  if (memlog::on())
+  {
+    memlog::record("ALLOC", "ic_staging_pos",  (long long) (data.pos.capacity()  * sizeof(float)),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
+    memlog::record("ALLOC", "ic_staging_vel",  (long long) (data.vel.capacity()  * sizeof(float)),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
+    memlog::record("ALLOC", "ic_staging_id",   (long long) (data.id.capacity()   * sizeof(data.id[0])),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
+    memlog::record("ALLOC", "ic_staging_mass", (long long) (data.mass.capacity() * sizeof(float)),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
+    memlog::record("ALLOC", "ic_staging_type", (long long) (data.type.capacity() * sizeof(data.type[0])),
+                   "std::vector", 0, 0u, __FILE__, __LINE__);
+  }
   {
     size_t idx = 0;
     for (int t = 0; t < 6; ++t)

@@ -82,17 +82,6 @@ static __device__ void compute_monopole(double &mass, double &posx,
   posz += pos.w*pos.z;
 }
 
-static __device__ void compute_quadropole(double &oct_q11, double &oct_q22, double &oct_q33,
-                                   double &oct_q12, double &oct_q13, double &oct_q23,
-                                   float4 pos)
-{
-  oct_q11 += pos.w * pos.x*pos.x;
-  oct_q22 += pos.w * pos.y*pos.y;
-  oct_q33 += pos.w * pos.z*pos.z;
-  oct_q12 += pos.w * pos.x*pos.y;
-  oct_q13 += pos.w * pos.y*pos.z;
-  oct_q23 += pos.w * pos.z*pos.x;
-}
 
 static __device__ void compute_bounds(float3 &r_min, float3 &r_max,
                                float4 pos)
@@ -118,17 +107,6 @@ static __device__ void compute_monopole_node(double &mass, double &posx,
 }
 
 
-static __device__ void compute_quadropole_node(double &oct_q11, double &oct_q22, double &oct_q33,
-                                        double &oct_q12, double &oct_q13, double &oct_q23,
-                                        double4 Q0, double4 Q1)
-{
-  oct_q11 += Q0.x;
-  oct_q22 += Q0.y;
-  oct_q33 += Q0.z;
-  oct_q12 += Q1.x;
-  oct_q13 += Q1.y;
-  oct_q23 += Q1.z;
-}
 
 static __device__ void compute_bounds_node(float3 &r_min, float3 &r_max,
                                     float4 node_min, float4 node_max)
@@ -190,18 +168,16 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
   double mass, posx, posy, posz;
   mass = posx = posy = posz = 0.0;
 
-  double oct_q11, oct_q22, oct_q33;
-  double oct_q12, oct_q13, oct_q23;
 
-  oct_q11 = oct_q22 = oct_q33 = 0.0;
-  oct_q12 = oct_q13 = oct_q23 = 0.0;
   float3 r_min, r_max;
   r_min = make_float3(+1e10f, +1e10f, +1e10f);
   r_max = make_float3(-1e10f, -1e10f, -1e10f);
 
   //Loop over the children=>particles=>bodys
   //unroll increases register usage #pragma unroll 16
-  float maxEps = -100.0f;
+  // Both are LIVE: they feed the nodeSoftInfo (maxSoft, mixed) summary below. Only maxEps's
+  // former ride in Q0.w was dead, and Q0 is gone.
+  float maxEps = -100.0f;   // T28/C-A-04
   float minEps = 3.4e38f;   // T28/C-A-04
   int count=0;
   for(int i=firstChild; i < lastChild; i++)
@@ -215,7 +191,7 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
     // IS current-order, which is what hides it.
     //
     // Inert on two independent counts, both checked rather than assumed:
-    //  1. The value is dead. maxEps -> Q0.w (:177), propagated by compute_non_leaf (:339), and
+    //  1. The value was dead where it rode in Q0.w, propagated by compute_non_leaf, and
     //     the ONLY consumer -- the quadrupole path in dev_approximate_gravity_warp_new.cu:819 --
     //     rebuilds jQ0 with .w explicitly set to 0.0f. The monopole path (the default) never
     //     reads Q0 at all. This is contract C-A-04's "computed but never consumed", confirmed.
@@ -240,7 +216,6 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
 #endif
     count++;
     compute_monopole(mass, posx, posy, posz, p);
-    compute_quadropole(oct_q11, oct_q22, oct_q33, oct_q12, oct_q13, oct_q23, p);
     compute_bounds(r_min, r_max, p);
   }
 
@@ -251,13 +226,6 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
   mon.x *= im;
   mon.y *= im;
   mon.z *= im;
-
-  //jbedorf, store darkMatterMass in Q1.w
-  //stellar mass is mon.w-darkMatterMass
-
-  double4 Q0, Q1;
-  Q0 = make_double4(oct_q11, oct_q22, oct_q33, maxEps); //Store max softening
-  Q1 = make_double4(oct_q12, oct_q13, oct_q23, 0.0f);
 
   // T28/C-A-04: encode (maxSoft, mixed) into one float. 0.0f = no contributor (Gadget's
   // maxsofttype==7 sentinel -> the walk must force-open). Negative = members differ.
@@ -270,10 +238,9 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
   }
 #endif
 
-  //Store the leaf properties
-  multipole[3*nodeID + 0] = mon;       //Monopole
-  multipole[3*nodeID + 1] = Q0;        //Quadropole
-  multipole[3*nodeID + 2] = Q1;        //Quadropole
+  //Store the leaf properties. One double4 per node: the monopole. maxEps still exists above
+  //because nodeSoftInfo needs it; what is gone is its ride in the departed Q0.w.
+  multipole[nodeID] = mon;             //Monopole
 
   //Store the node boundaries
   nodeLowerBounds[nodeID] = make_float4(r_min.x, r_min.y, r_min.z, 0.0f);
@@ -417,27 +384,20 @@ KERNEL_DECLARE(compute_non_leaf)(const int curLevel,         //Level for which w
   double mass, posx, posy, posz;
   mass = posx = posy = posz = 0.0;
 
-  double oct_q11, oct_q22, oct_q33;
-  double oct_q12, oct_q13, oct_q23;
 
-  oct_q11 = oct_q22 = oct_q33 = 0.0;
-  oct_q12 = oct_q13 = oct_q23 = 0.0;
 
   float3 r_min, r_max;
   r_min = make_float3(+1e10f, +1e10f, +1e10f);
   r_max = make_float3(-1e10f, -1e10f, -1e10f);
 
   //Process the children (1 to 8)
-  float maxEps = -100.0f;
   float childSoftMax = -1.0f, childSoftMin = 3.4e38f;   // T28/C-A-04
   bool  childMixed = false;
   int   nChildSoft = 0;
   for(int i=firstChild; i < firstChild+nChildren; i++)
   {
     //Gogo process this data!
-    double4 tmon = multipole[3*i + 0];
-
-    maxEps = max(multipole[3*i + 1].w, maxEps);
+    double4 tmon = multipole[i];
 
     // T28/C-A-04: combine children's (maxSoft, mixed) summaries. Gadget sets diffsoftflag when a
     // contributor differs from the running max AND ORs in each child's inherited bit
@@ -460,8 +420,6 @@ KERNEL_DECLARE(compute_non_leaf)(const int curLevel,         //Level for which w
 #endif
 
     compute_monopole_node(mass, posx, posy, posz, tmon);
-    compute_quadropole_node(oct_q11, oct_q22, oct_q33, oct_q12, oct_q13, oct_q23,
-                            multipole[3*i + 1], multipole[3*i + 2]);
     compute_bounds_node(r_min, r_max, nodeLowerBounds[i], nodeUpperBounds[i]);
   }
 
@@ -478,10 +436,6 @@ KERNEL_DECLARE(compute_non_leaf)(const int curLevel,         //Level for which w
   mon.y *= im;
   mon.z *= im;
 
-  double4 Q0, Q1;
-  Q0 = make_double4(oct_q11, oct_q22, oct_q33, maxEps); //store max Eps
-  Q1 = make_double4(oct_q12, oct_q13, oct_q23, 0.0f);
-
   // T28/C-A-04: this node is mixed if any child is, or if the children's maxes disagree.
 #ifdef UNEQUALSOFTENINGS
   if (nodeSoftInfo)
@@ -492,9 +446,7 @@ KERNEL_DECLARE(compute_non_leaf)(const int curLevel,         //Level for which w
   }
 #endif
 
-  multipole[3*nodeID + 0] = mon;        //Monopole
-  multipole[3*nodeID + 1] = Q0;         //Quadropole1
-  multipole[3*nodeID + 2] = Q1;         //Quadropole2
+  multipole[nodeID] = mon;              //Monopole
 
   return;
 }
@@ -566,37 +518,29 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
   // domain_fac * 2^(MAXLEVELS-level), with no dependency on occupancy. Computed here (not derived
   // later, at kernel-walk time) since domain_fac/node level are both known up front and this is a
   // one-time O(n_nodes) cost identical in kind to boxSizeInfo/boxCenterInfo's own computation below.
+  // Only the Springel MAC reads cellSizeInfo/cellCenterInfo (dev_approximate_gravity_warp_new.cu
+  // computes nodeCellSize/nodeCellCentre inside `#if defined(_MAC_SPRINGEL_)`), so a geometric-MAC
+  // build allocates both at one element and must not write n_nodes of them. This write used to be
+  // unguarded while the comment in the #else below already claimed the buffer was size 1 -- the
+  // claim was stale, the allocation was full size, and nothing read it.
+#ifdef _MAC_SPRINGEL_
   {
     const uint  bijLevel   =  node_bodies[idx].z;
     const uint  shiftLevel = (bijLevel <= (uint)MAXLEVELS) ? (uint)MAXLEVELS - bijLevel : 0u;
     cellSizeInfo[idx] = domain_fac * (float)(1u << shiftLevel);
   }
+#endif
 
-  double4 monD, Q0, Q1;
-
-  monD = multipole[3*idx + 0];        //Monopole
-  Q0   = multipole[3*idx + 1];        //Quadropole1
-  Q1   = multipole[3*idx + 2];        //Quadropole2
-
-  //Scale the quadropole
-  double im = 1.0 / monD.w;
-  if(monD.w == 0) im = 0;               //Allow tracer/massless particles
-  Q0.x = Q0.x*im - monD.x*monD.x;
-  Q0.y = Q0.y*im - monD.y*monD.y;
-  Q0.z = Q0.z*im - monD.z*monD.z;
-  Q1.x = Q1.x*im - monD.x*monD.y;
-  Q1.y = Q1.y*im - monD.y*monD.z;
-  Q1.z = Q1.z*im - monD.x*monD.z;
-
-  //Switch the y and z parameter
-  double temp = Q1.y;
-  Q1.y = Q1.z; Q1.z = temp;
+  // One double4 per node. The monopole arrives already normalised by mass from compute_leaf /
+  // compute_non_leaf, so there is nothing to scale here -- the `im` reciprocal that used to be
+  // computed at this point existed only to normalise the quadrupole.
+  const double4 monD = multipole[idx];        //Monopole
 
   //Convert the doubles to floats
   float4 mon            = make_float4(monD.x, monD.y, monD.z, monD.w);
-  multipoleF[3*idx + 0] = mon;
-  multipoleF[3*idx + 1] = make_float4(Q0.x, Q0.y, Q0.z, Q0.w);        //Quadropole1
-  multipoleF[3*idx + 2] = make_float4(Q1.x, Q1.y, Q1.z, Q1.w);        //Quadropole2
+  // multipoleF is tree.multipole, the real4 array the walk reads; `multipole` above is
+  // multipoleD, the double4 working copy in the arena. Both now carry one entry per node.
+  multipoleF[idx] = mon;
 
   float4 r_min, r_max;
   r_min = nodeLowerBounds[idx];
@@ -677,7 +621,9 @@ KERNEL_DECLARE(compute_scaling)(const int node_count,
     cellCenterInfo[idx] = make_float4(ccx, ccy, ccz, 0.0f);
   }
 #else
-  (void) corner; (void) cellCenterInfo;   // buffer is size 1 in a geometric-MAC build (build.cpp)
+  // Geometric MAC: nothing reads either fixed-cell array, and build.cpp now allocates both at
+  // one element, so neither is written above.
+  (void) corner; (void) cellCenterInfo; (void) cellSizeInfo; (void) domain_fac;
 #endif
 
   //Calculate distance between center of the box and the center of mass

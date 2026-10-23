@@ -579,7 +579,8 @@ KERNEL_DECLARE(setActiveGroups)(const int n_bodies,
   // hypothesis for the t_current corruption bug (PLAN.md open item). Does not
   // change behavior (write is unguarded exactly as before) -- just reports it.
   if (grpID.v >= (unsigned int) n_groups) {
-    printf("[BUG4-DIAG] OOB grpID write: idx=%u grpID=%u n_groups=%d n_bodies=%d tc=%.9g te=%.9g\n",
+    // tc/te are integer timeline ticks, not times
+    printf("[BUG4-DIAG] OOB grpID write: idx=%u grpID=%u n_groups=%d n_bodies=%d tc=%d te=%d\n",
            idx.v, grpID.v, n_groups, n_bodies, tc, te);
   }
 

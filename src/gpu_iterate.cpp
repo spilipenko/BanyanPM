@@ -4,7 +4,6 @@
 #include "gadget_units.h"          // GFreeAcc / GCarrier (T44 item 1)
 #include "gadget_index_spaces.h"   // CurrentOrder / OriginalOrder / IdSpace (T44 item 1)
 #include "buffer_registry.h"
-#include  "postProcessModules.h"
 #include "pm.h"
 // Phase 5 ticket 08 (PLAN.md): unconditional, unlike pm_zoom.h below -- writeGadgetSnapshot()
 // needs GadgetSnapshotHeader/GadgetParticleData in every --param-capable build, not just
@@ -31,6 +30,7 @@ static float g_t40LastWalkMs = 0.0f;   // set from main.cpp (--debug / GADGET_HI
 #include <string>
 #include <unordered_map>
 #include <unistd.h>   // access(F_OK), for the OutputDir/stop file check
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 using namespace std;
 
@@ -255,9 +255,10 @@ static void traceParticleTrajectory(tree_structure &tree, const char *stage, int
     double amag = sqrt((double)a.x * a.x + (double)a.y * a.y + (double)a.z * a.z);
     fprintf(flog,
             "iter=%d stage=%s t=%.9g id=%llu pos=(%.9g,%.9g,%.9g) vel=(%.9g,%.9g,%.9g) "
-            "amag=%.9g tb=%.9g te=%.9g dt=%.9g\n",
+            // tb/te are INTEGER timeline ticks (bodies_time is int2), not times: %d, not %.9g.
+            "amag=%.9g tb=%d te=%d dt_ticks=%d\n",
             iter, stage, simTime, (unsigned long long) id,
-            p.x, p.y, p.z, v.x, v.y, v.z, amag, bt.x, bt.y, (double)(bt.y - bt.x));
+            p.x, p.y, p.z, v.x, v.y, v.z, amag, bt.x, bt.y, (bt.y - bt.x));
   }
   fclose(flog);
 }
@@ -366,41 +367,6 @@ float runningLETTimeSum, lastTotal, lastLocal;
 
 void octree::makeLET()
 {
-#ifdef USE_MPI
-   //LET code test
-  double t00 = get_time();
-
-  //Start copies, while grpTree info is exchanged
-  localTree.boxSizeInfo.d2h  (  localTree.n_nodes, false, LETDataToHostStream->s());
-  localTree.boxCenterInfo.d2h(  localTree.n_nodes, false, LETDataToHostStream->s());
-  localTree.multipole.d2h    (3*localTree.n_nodes, false, LETDataToHostStream->s());
-  localTree.boxSizeInfo.waitForCopyEvent();
-  localTree.boxCenterInfo.waitForCopyEvent();
-
-  double t10 = get_time();
-  //Exchange domain grpTrees, while memory copies take place
-  this->sendCurrentInfoGrpTree();
-
-  double t20 = get_time();
-
-
-  localTree.multipole.waitForCopyEvent();
-  double t40 = get_time();
-  LOGF(stderr,"MakeLET Preparing data-copy: %lg  sendGroups: %lg Total: %lg \n",
-               t10-t00, t20-t10, t40-t00);
-
-  std::vector<real4> topLevelsBuffer;
-  std::vector<uint2> treeSizeAndOffset;
-  int copyTreeUpToLevel = 0;
-  //Start LET kernels
-  essential_tree_exchangeV2(localTree,
-                            remoteTree,
-                            topLevelsBuffer,
-                            treeSizeAndOffset,
-                            copyTreeUpToLevel);
-
-  letRunning = false;
-#endif
 }
 
 
@@ -423,31 +389,6 @@ void octree::iterate_setup() {
   }
 
   //Setup of the multi-process particle distribution, initially it should be equal
-  #ifdef USE_MPI
-    if(nProcs > 1)
-    {
-      for(int i=0; i < 5; i++)
-      {
-        double notUsed     = 0;
-        int maxN = 0, minN = 0;
-        sort_bodies(localTree, true, true); //Initial sort to get global boundaries to compute keys
-        parallelDataSummary(localTree, 30, 30, notUsed, notUsed, true); //1 for all process, equal part distribution
-
-        //Check if the min/max are within certain percentage
-        MPI_Allreduce(&localTree.n, &maxN, 1, MPI_INT, MPI_MAX, mpiCommWorld);
-        MPI_Allreduce(&localTree.n, &minN, 1, MPI_INT, MPI_MIN, mpiCommWorld);
-
-        //Compute difference in percent
-        int perc = (int)(100*(maxN-minN)/(double)minN);
-
-        if(procId == 0)
-        {
-          LOGF(stderr, "Particle setup iteration: %d Min: %d  Max: %d Diff: %d %%\n", i, minN, maxN, perc);
-        }
-        if(perc < 10) break; //We're happy if difference is less than 10%
-      }
-    }
-  #endif
 
   sort_bodies(localTree, true, true); //Initial sort to get global boundaries to compute keys
   letRunning      = false;
@@ -860,9 +801,12 @@ bool octree::iterate_once(IterationData &idata) {
   static const bool cpuLogOn = haveGadgetParams && !getenv("GADGET_HIP_NO_CPU_LOG");
   const bool phaseTimeOn = cpuLogOn || phaseTimePrint;
   double phT = 0.0;
+  memlog::note("STEP BEGIN");
   double phStepT0 = 0.0;
   if (phaseTimeOn) { execStream->sync(); gravStream->sync(); phStepT0 = get_time(); }
-  #define PHASE_BEGIN() do { if (phaseTimeOn) { execStream->sync(); gravStream->sync(); phT = get_time(); } } while (0)
+  #define PHASE_BEGIN_L(lbl) do { memlog::set_phase(lbl); \
+        if (phaseTimeOn) { execStream->sync(); gravStream->sync(); phT = get_time(); } } while (0)
+  #define PHASE_BEGIN() PHASE_BEGIN_L("(unlabelled)")
   #define PHASE_END(label, bucket) do { if (phaseTimeOn) { execStream->sync(); gravStream->sync(); \
         const double dt_ = get_time() - phT; s_cpuAcc.bucket += dt_; \
         if (phaseTimePrint) fprintf(stderr, "[PHASE] iter=%d %-22s %8.4f s\n", iter, label, dt_); } } while (0)
@@ -897,7 +841,7 @@ bool octree::iterate_once(IterationData &idata) {
 
     //predict local tree
     devContext->startTiming(execStream->s());
-    PHASE_BEGIN();
+    PHASE_BEGIN_L("predict");
     predict(this->localTree);
     PHASE_END("predict", predict);
 
@@ -911,7 +855,7 @@ bool octree::iterate_once(IterationData &idata) {
       static const bool t37Off = (getenv("GADGET_HIP_NO_BOX_WRAP") != NULL);
       if (t37Box > 0.0f && !t37Off && this->localTree.n > 0)
       {
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("box_wrap");
         int t37N = this->localTree.n;
         gadgetBoxWrap.set_args(0, &t37N, &t37Box, this->localTree.bodies_Ppos.p());
         gadgetBoxWrap.setWork(this->localTree.n, 128);
@@ -937,7 +881,7 @@ bool octree::iterate_once(IterationData &idata) {
     //
     // Emitted unconditionally (not behind --log) precisely because Gadget emits it unconditionally;
     // a diagnostic that is off by default is the failure mode this audit keeps finding.
-    if (haveGadgetParams && mpiGetRank() == 0)
+    if (haveGadgetParams)
     {
       static FILE *s_infoFile = NULL;
       if (!s_infoFile && !gadgetParams.OutputDir.empty())
@@ -1044,7 +988,6 @@ bool octree::iterate_once(IterationData &idata) {
         idata.totalDomEx += domEx;
 
         devContext->startTiming(execStream->s());
-        mpiSync();
         devContext->stopTiming("DomainUnbalance", 12, execStream->s());
 
         idata.totalDomWait += get_time()-tZZ;
@@ -1120,17 +1063,17 @@ bool octree::iterate_once(IterationData &idata) {
         //Rebuild the tree
         t1 = get_time();
         STAGE_TRACE("[BUG4-STAGE] before sort_bodies iter=%d\n", iter);
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("sort_bodies");
         this->sort_bodies(this->localTree, needDomainUpdate);
         PHASE_END("sort_bodies", peano);
         STAGE_TRACE("[BUG4-STAGE] after sort_bodies / before build iter=%d\n", iter);
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("build_tree");
         this->build(this->localTree);
         PHASE_END("build_tree", treebuild);
         STAGE_TRACE("[BUG4-STAGE] after build n_groups=%d iter=%d\n", this->localTree.n_groups, iter);
         LOGF(stderr, " done in %g sec : %g Mptcl/sec\n", get_time()-t1, this->localTree.n/1e6/(get_time()-t1));
 
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("allocTreeProp");
         this->allocateTreePropMemory(this->localTree);
         PHASE_END("allocTreeProp", domain);
 
@@ -1146,7 +1089,7 @@ bool octree::iterate_once(IterationData &idata) {
         // wrong-particle read of exactly the kind C-B-13/C-C-18/C-D-08 record.
         // Safe to hoist: recomputeSoftening depends only on bodies_ids (resorted by sort_bodies,
         // which ran above) and get_t_current(). It reads nothing compute_properties produces.
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("recomputeSoftening");
         this->recomputeSoftening(this->localTree);
         PHASE_END("recomputeSoftening", timeline);
 
@@ -1259,7 +1202,7 @@ bool octree::iterate_once(IterationData &idata) {
 
         // Phase 5 ticket 04 (PLAN.md): same tree-rebuild granularity as recomputeSoftening()
         // above -- a real d2h sync, not something to do every timestep.
-        PHASE_BEGIN();
+        PHASE_BEGIN_L("recomputeTimestepGlobals");
         this->recomputeTimestepGlobals(this->localTree);
         PHASE_END("recomputeTimestepGlobals", timeline);
 
@@ -1385,7 +1328,7 @@ bool octree::iterate_once(IterationData &idata) {
       const bool t4On = (t4_lo >= 0 && iter >= t4_lo && iter <= t4_hi);
       if (t4On) { t4_counters_reset(); t4_counters_set(1); }
 
-      PHASE_BEGIN();
+      PHASE_BEGIN_L("approximate_gravity");
       approximate_gravity(this->localTree);
       PHASE_END("approximate_gravity", treewalk);
       STAGE_TRACE("[BUG4-STAGE] after approximate_gravity iter=%d\n", iter);
@@ -2479,7 +2422,7 @@ bool octree::iterate_once(IterationData &idata) {
     double de = 0.0;   // energyDue was hoisted above the PM block -- see there for why
     if (energyDue)
     {
-      PHASE_BEGIN();
+      PHASE_BEGIN_L("compute_energies");
       de = compute_energies(this->localTree, /*usePreKickState=*/true);
       PHASE_END("compute_energies", potential);
     }
@@ -2504,7 +2447,7 @@ bool octree::iterate_once(IterationData &idata) {
     // resets it back to identity at the end of its own kernel.
     dumpUnsortedMapping(this->localTree, iter);
     cd01_stats(this->localTree, "KICK", iter, t_previous, t_current);
-    PHASE_BEGIN();
+    PHASE_BEGIN_L("correct");
     correct(this->localTree);
     PHASE_END("correct", timeline);
     cd01_trace(this->localTree, "POST", iter, t_previous, t_current);
@@ -2524,19 +2467,6 @@ bool octree::iterate_once(IterationData &idata) {
 
     if(nProcs > 1)
     {
-      #ifdef USE_MPI
-      //Wait on all processes and time how long the waiting took
-      t1 = get_time();
-      devContext->startTiming(execStream->s());
-      //Gather info about the load-balance, used to decide if we need to refine the domains
-      MPI_Allreduce(&lastTotal, &maxExecTimePrevStep, 1, MPI_FLOAT, MPI_MAX, mpiCommWorld);
-      MPI_Allreduce(&lastTotal, &avgExecTimePrevStep, 1, MPI_FLOAT, MPI_SUM, mpiCommWorld);
-      avgExecTimePrevStep /= nProcs;
-
-      devContext->stopTiming("Unbalance", 12, execStream->s());
-      idata.lastWaitTime  += get_time() - t1;
-      idata.totalWaitTime += idata.lastWaitTime;
-      #endif
     }
 
     idata.Nact_since_last_tree_rebuild += this->localTree.n_active_particles;
@@ -2544,50 +2474,10 @@ bool octree::iterate_once(IterationData &idata) {
     // T19: production energy diagnostic already computed above, BEFORE correct() -- see that call
     // site's comment for why (Gadget-2 timing match). Not recomputed here.
 
-    if(statisticsIter > 0)
-    {
-      if(t_current >= nextStatsTime)
-      {
-        nextStatsTime += statisticsIter;
-        double tDens0 = get_time();
-        localTree.bodies_Ppos.d2h();
-        localTree.bodies_vel.d2h();
-        localTree.bodies_ids.d2h();
-
-        double tDens1 = get_time();
-        // DENSITY/DISKSTATS each hold two [N_MESH][4*N_MESH] float arrays (32MB total,
-        // see postProcessModules.h) -- heap-allocated rather than stack-constructed so
-        // iterate_once's frame doesn't reserve 32MB on every call even when this
-        // statisticsIter-gated block never runs (it caused a stack-overflow SIGSEGV on
-        // the default 8MB thread stack).
-        const std::unique_ptr<DENSITY> dens(new DENSITY(mpiCommWorld, procId, nProcs, localTree.n,
-                           &localTree.bodies_Ppos[0],
-                           &localTree.bodies_vel[0],
-                           &localTree.bodies_ids[0],
-                           1, 2.33e9, 20, "density", t_current));
-
-        double tDens2 = get_time();
-        if(procId == 0) LOGF(stderr,"Density took: Copy: %lg Create: %lg \n", tDens1-tDens0, tDens2-tDens1);
-
-        double tDisk1 = get_time();
-        const std::unique_ptr<DISKSTATS> diskstats(new DISKSTATS(mpiCommWorld, procId, nProcs, localTree.n,
-                           &localTree.bodies_Ppos[0],
-                           &localTree.bodies_vel[0],
-                           &localTree.bodies_ids[0],
-                           1, 2.33e9, "diskstats", t_current));
-
-        double tDisk2 = get_time();
-        if(procId == 0) LOGF(stderr,"Diskstats took: Create: %lg \n", tDisk2-tDisk1);
-      }
-    }//Statistics dumping
 
 
     if (useMPIIO)
     {
-#ifdef USE_MPI
-      if (mpiRenderMode) dumpDataMPI(); //To renderer process
-      else               dumpData();    //To disk
-#endif
     }
     else if (snapshotIter > 0)
     {
@@ -2706,7 +2596,7 @@ bool octree::iterate_once(IterationData &idata) {
       // Imbalance. CPU_Gravity is the whole gravity pipeline (walk + tree build + Peano sort + PM),
       // matching Gadget's own use of it as the umbrella figure; the columns overlap there in
       // Gadget too, so Total is not the sum of the columns in either code.
-      if (cpuLogOn && mpiGetRank() == 0)
+      if (cpuLogOn)
       {
         static FILE *s_cpuFile = NULL;
         if (!s_cpuFile && !gadgetParams.OutputDir.empty())
@@ -2865,8 +2755,9 @@ void octree::predict(tree_structure &tree)
         static int bug4CallIdx = -1;
         bug4CallIdx++;
         if (gadget_hip_debug_log && bug4CallIdx >= 68 && bug4CallIdx <= 74) {
-          fprintf(stderr, "[BUG4-ITERDUMP] callIdx=%d tree.n=%d t_previous=%.9g t_current=%.9g bodies_time_devptr=%p bodies_time_size=%d\n",
-                  bug4CallIdx, tree.n, t_previous, t_current, tree.bodies_time.get_devMem(), tree.bodies_time.get_size());
+          fprintf(stderr, "[BUG4-ITERDUMP] callIdx=%d tree.n=%d t_previous=%.9g t_current=%.9g bodies_time_devptr=%p bodies_time_size=%zu\n",
+                  bug4CallIdx, tree.n, t_previous, t_current, tree.bodies_time.get_devMem(),
+                  (size_t) tree.bodies_time.get_size());
           #define BUG4_MAP(name, elemsize) \
             fprintf(stderr, "[BUG4-MAP] callIdx=%d %-22s ptr=%p bytes=%ld end=%p\n", bug4CallIdx, #name, \
                     tree.name.get_devMem(), (long)tree.name.get_size()*(elemsize), \
@@ -2906,7 +2797,8 @@ void octree::predict(tree_structure &tree)
             memcpy(&xb, &bt.x, sizeof(xb));
             memcpy(&yb, &bt.y, sizeof(yb));
             uint32_t orderVal = tree.oriParticleOrder[idx];
-            fprintf(stderr, "[BUG4-ITERDUMP] callIdx=%d bodies_time[%d]=(x=0x%08x(%.9g), y=0x%08x(%.9g)) oriParticleOrder[%d]=%u (n=%d)\n",
+            // ticks, not times -- bodies_time is int2
+            fprintf(stderr, "[BUG4-ITERDUMP] callIdx=%d bodies_time[%d]=(x=0x%08x(%d), y=0x%08x(%d)) oriParticleOrder[%d]=%u (n=%d)\n",
                     bug4CallIdx, idx, xb, bt.x, yb, bt.y, idx, orderVal, tree.n);
           }
           // Also scan the ENTIRE oriParticleOrder array for any out-of-range entry.
@@ -3098,7 +2990,10 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
   if (aoldWithPM)
   {
     if (tree.bodies_aoldMag.get_size() < (size_t) tree.n)
-      tree.bodies_aoldMag.cmalloc(tree.n, true);
+    {
+      DMTAG(tree.bodies_aoldMag);
+      tree.bodies_aoldMag.cmalloc(tree.n, true, 0, my_dev::dev_mem<float>::ALIAS_AOLDMAG);
+    }
     // Not const: set_args stores a non-const void* and dereferences it at launch.
     GCarrier aoldG = GCarrier::just_G(
         (!useDirectGravity && haveGadgetParams && gadgetParams.G > 0.0) ? (float) gadgetParams.G : 1.0f);
@@ -3338,10 +3233,18 @@ void octree::computeGroupMaxAccel(tree_structure &tree)
 // tree.bodies_ids every rebuild instead of trusting bodies_type's own (never reordered) index.
 void octree::setGadgetTypeMap(const std::vector<ullong> &ids, const std::vector<int> &types)
 {
+  // T78 item 5. gadgetIdToType used to be built here, unconditionally, before anything knew
+  // whether it would be needed. At 512^3 that is an unordered_map with 134,217,728 entries:
+  // measured at 4.002 GiB of LIVE heap (mallinfo2 uordblks, with fordblks at zero), 32 B/particle,
+  // held for the whole run. And on any dense-id IC -- which is the normal case, and the one the
+  // "[T35] device softening refresh ENABLED" line below reports -- its contents are never read.
+  // recomputeSoftening() reads the flat gadgetTypeById table instead and only falls back to this
+  // map when the table could not be built; the code there already noted the map was "far too slow
+  // per rebuild" at 1e8 particles. Its remaining role was `!empty()` as a "this IC carries
+  // per-particle types" flag, which is now gadgetHaveTypeMap.
+  //
+  // So: decide whether the flat table covers the IC first, and build the map only if it does not.
   gadgetIdToType.clear();
-  gadgetIdToType.reserve(ids.size());
-  for (size_t i = 0; i < ids.size(); ++i)
-    gadgetIdToType[ids[i]] = types[i];
 
   // T35: the same association as a flat table, so the per-rebuild refresh can run on the device.
   // Only built when the id space is dense enough to index directly -- Gadget numbers particles
@@ -3360,6 +3263,12 @@ void octree::setGadgetTypeMap(const std::vector<ullong> &ids, const std::vector<
   for (size_t i = 0; i < types.size(); ++i)
     if (types[i] < 0 || types[i] > 255) { typesFit = false; break; }
 
+  // GADGET_HIP_T78_VERIFY_TYPE_MAP=1 builds the map ALONGSIDE the flat table so the two can be
+  // compared per particle (see recomputeSoftening). Forcing the map by clearing gadgetTypeByIdOk
+  // instead would prove nothing: that flag also gates the device softening refresh, the device
+  // timestep path and the PM id-space store (:1655), so the run would differ for reasons that have
+  // nothing to do with the type lookup. Verified so, on a 64^3 deterministic run.
+  static const bool t78VerifyMap = (getenv("GADGET_HIP_T78_VERIFY_TYPE_MAP") != NULL);
   if (!ids.empty() && maxId <= cap && typesFit)
   {
     gadgetTypeById.assign((size_t) maxId + 1, (unsigned char) 0);
@@ -3369,13 +3278,29 @@ void octree::setGadgetTypeMap(const std::vector<ullong> &ids, const std::vector<
     gadgetTypeByIdOk  = true;
     fprintf(stderr, "[T35] device softening refresh ENABLED (max id %llu, table %.1f MB)\n",
             (unsigned long long) maxId, (double)(maxId + 1) / (1024.0 * 1024.0));
+    if (t78VerifyMap)
+    {
+      gadgetIdToType.reserve(ids.size());
+      for (size_t i = 0; i < ids.size(); ++i) gadgetIdToType[ids[i]] = types[i];
+      fprintf(stderr, "[T78] VERIFY: map built alongside the table (%.3f GiB) for comparison\n",
+              (double) ids.size() * 32.0 / 1073741824.0);
+    }
   }
   else
   {
+    // Only here does anything read the map's contents, so only here is it worth 32 B/particle.
+    gadgetIdToType.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i)
+      gadgetIdToType[ids[i]] = types[i];
     fprintf(stderr, "[T35] device softening refresh DISABLED (max id %llu vs cap %llu, typesFit=%d)"
-                    " -- falling back to the host (id -> type) map, correct but slower\n",
-            (unsigned long long) maxId, (unsigned long long) cap, (int) typesFit);
+                    " -- falling back to the host (id -> type) map, correct but slower.\n"
+                    "[T78] that fallback map costs %.3f GiB on the host at this particle count\n",
+            (unsigned long long) maxId, (unsigned long long) cap, (int) typesFit,
+            (double) ids.size() * 32.0 / 1073741824.0);
   }
+  // "This IC supplied per-particle types", which is what the three `!gadgetIdToType.empty()`
+  // tests were really asking. Keeping it separate from the map is the whole point of this change.
+  gadgetHaveTypeMap = !ids.empty() && !types.empty();
 }
 
 // Phase 5 tickets 03/04 (PLAN.md): see octree.h's declarations for the full rationale.
@@ -3685,7 +3610,7 @@ void octree::recomputeSoftening(tree_structure &tree)
   // compared on the same binary: the device path feeds every force through bodies_forceSoftening,
   // so "the energy line is identical" is a real equivalence test, not a plausibility argument.
   static const bool t35NoDeviceSoft = (getenv("GADGET_HIP_T35_NO_DEVICE_SOFT") != NULL);
-  const bool softeningOnDevice = gadgetTypeByIdOk && !gadgetIdToType.empty() && !t35NoDeviceSoft;
+  const bool softeningOnDevice = gadgetTypeByIdOk && gadgetHaveTypeMap && !t35NoDeviceSoft;
 
   // Host bodies_type must follow the sort for EVERY multi-type IC, not only when the softening
   // itself is computed on the host: the zoom region (recomputeZoomRegion / pm_zoom_region_out_of_
@@ -3695,7 +3620,7 @@ void octree::recomputeSoftening(tree_structure &tree)
   // boundary") and snapshots would have carried the wrong type per particle. Uniform ICs leave
   // gadgetIdToType empty and are unaffected. Use the flat id->type table when it exists (a
   // 1e8-particle zoom IC makes the unordered_map path far too slow per rebuild).
-  if (!gadgetIdToType.empty())
+  if (gadgetHaveTypeMap)
   {
     tree.bodies_ids.d2h();
     const int n = (int) tree.bodies_type.size();
@@ -3703,6 +3628,23 @@ void octree::recomputeSoftening(tree_structure &tree)
     {
       for (int i = 0; i < n; ++i)
         tree.bodies_type[i] = gadgetTypeById[tree.bodies_ids[i]];
+      // T78: with both built, the table and the map must agree for every particle. This is the
+      // whole claim behind not building the map on a dense-id IC.
+      if (!gadgetIdToType.empty())
+      {
+        static bool reported = false;
+        size_t bad = 0;
+        for (int i = 0; i < n; ++i)
+          if ((int) gadgetTypeById[tree.bodies_ids[i]] != gadgetIdToType.at(tree.bodies_ids[i]))
+            ++bad;
+        if (!reported)
+        {
+          fprintf(stderr, "[T78] VERIFY: flat table vs id->type map over %d particles: "
+                          "%zu mismatch(es)\n", n, bad);
+          reported = true;
+        }
+        if (bad) { fprintf(stderr, "\nFATAL: T78 type-table verification failed.\n\n"); exit(1); }
+      }
     }
     else
     {
@@ -3748,6 +3690,7 @@ void octree::recomputeSoftening(tree_structure &tree)
     // Upload the flat (id -> type) table once; it never changes after IC load.
     if (gadgetTypeByIdDev.get_size() == 0)
     {
+      DMTAG(gadgetTypeByIdDev);
       gadgetTypeByIdDev.cmalloc((int) gadgetTypeById.size(), false);
       for (size_t i = 0; i < gadgetTypeById.size(); ++i) gadgetTypeByIdDev[i] = gadgetTypeById[i];
       gadgetTypeByIdDev.h2d();
@@ -3864,7 +3807,7 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
   // method's own call site), not every timestep.
   // T35: these three copies (4.8 GB at 512^3) exist only to feed the host reduction below, which
   // the device path replaces -- so on that path they are skipped entirely.
-  const bool dtOnDevice = !t35NoDeviceDt && gadgetTypeByIdOk && !gadgetIdToType.empty();
+  const bool dtOnDevice = !t35NoDeviceDt && gadgetTypeByIdOk && gadgetHaveTypeMap;
 
   // These three copies (4.8 GB at 512^3) exist ONLY to feed the host reduction below, so
   // they are skipped whenever the device path runs. Both later consumers of the host
@@ -3917,6 +3860,7 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
   {
     if (dtAggVSum.get_size() == 0)
     {
+      DMTAG(dtAggVSum);
       dtAggVSum.cmalloc(6, false); dtAggMinMass.cmalloc(6, false); dtAggCount.cmalloc(6, false);
     }
     for (int t = 0; t < 6; ++t) { dtAggVSum[t] = 0.0; dtAggMinMass[t] = 1.0e30; dtAggCount[t] = 0ull; }
@@ -4069,7 +4013,9 @@ void octree::initComovingTables()
   // predictParticles/correctParticles without a separate null-pointer case; the kernels never
   // dereference these unless comovingIntegrationOn!=0 is also passed, so an all-zero table is
   // inert whenever comoving is off.
+  DMTAG(gadgetDriftTable);
   gadgetDriftTable.cmalloc(GADGET_DRIFT_TABLE_LENGTH, false);
+  DMTAG(gadgetGravKickTable);
   gadgetGravKickTable.cmalloc(GADGET_DRIFT_TABLE_LENGTH, false);
   for (int i = 0; i < GADGET_DRIFT_TABLE_LENGTH; ++i)
     gadgetDriftTable[i] = gadgetGravKickTable[i] = 0.0f;
@@ -4251,7 +4197,7 @@ void octree::approximate_gravity(tree_structure &tree)
         const int i = nidx[k];
         const float4 sz  = tree.boxSizeInfo[i];
         const float4 ctr = tree.boxCenterInfo[i];
-        const float4 com = tree.multipole[3*i];
+        const float4 com = tree.multipole[i];
         const float bJ = 2.0f*std::max(sz.x, std::max(sz.y, sz.z));
         fprintf(stderr, "[T24-NODE-SCAN] iter=%d rank=%d node=%d bJ=%.6g cellSizeT26=%.6g "
                 "boxCenter=(%.6g,%.6g,%.6g) boxHalfSize=(%.6g,%.6g,%.6g) mass=%.6g "
@@ -4263,7 +4209,7 @@ void octree::approximate_gravity(tree_structure &tree)
         const int i = nidxSmall[k];
         const float4 sz  = tree.boxSizeInfo[i];
         const float4 ctr = tree.boxCenterInfo[i];
-        const float4 com = tree.multipole[3*i];
+        const float4 com = tree.multipole[i];
         const float bJ = 2.0f*std::max(sz.x, std::max(sz.y, sz.z));
         fprintf(stderr, "[T26-NODE-SCAN-SMALL] iter=%d rank=%d node=%d bJ=%.6g cellSizeT26=%.6g "
                 "isNode=%d boxCenter=(%.6g,%.6g,%.6g) boxHalfSize=(%.6g,%.6g,%.6g) mass=%.6g "
@@ -4925,14 +4871,13 @@ if(firstIter0 == true || iter == 40){
 //              i, tree.interactions[i].y, tree.interactions[i].x,
 //              tree.body2group_list[i]);
     }
-    cout << "Interaction at (rank= " << mpiGetRank() << " ) iter: " << iter << "\tdirect: " << directSum << "\tappr: " << apprSum << "\t";
+    cout << "Interaction at iter: " << iter << "\tdirect: " << directSum << "\tappr: " << apprSum << "\t";
     cout << "avg dir: " << directSum / tree.n << "\tavg appr: " << apprSum / tree.n << "\tMaxdir: " << maxDir << "\tmaxAppr: " << maxAppr <<  endl;
     cout << "sigma dir: " << sqrt((directSum2  - directSum)/ tree.n) << "\tsigma appr: " << std::sqrt((apprSum2 - apprSum) / tree.n)  <<  endl;
 
   #endif
 
 
-  if(mpiGetNProcs() == 1) //Only do it here if there is only one process
   {
    //#ifdef DO_BLOCK_TIMESTEP
   #if 0 //Demo mode
@@ -5063,7 +5008,7 @@ void octree::approximate_gravity_let(tree_structure &tree, tree_structure &remot
       directSum2   += (tree.interactions[i].y*tree.interactions[i].y);
     }
 
-    cout << "Interaction (LET) at (rank= " << mpiGetRank() << " ) iter: " << iter << "\tdirect: " << directSum << "\tappr: " << apprSum << "\t";
+    cout << "Interaction (LET) at iter: " << iter << "\tdirect: " << directSum << "\tappr: " << apprSum << "\t";
     cout << "avg dir: " << directSum / tree.n << "\tavg appr: " << apprSum / tree.n  << "\tMaxdir: " << maxDir << "\tmaxAppr: " << maxAppr <<  endl;
     cout << "sigma dir: " << sqrt((directSum2  - directSum)/ tree.n) << "\tsigma appr: " << std::sqrt((apprSum2 - apprSum) / tree.n)  <<  endl;
   #endif
@@ -5575,10 +5520,10 @@ void octree::correct(tree_structure &tree)
 
   //Copy the shuffled items back to their original buffers
   if (gadget_hip_debug_log)
-  fprintf(stderr, "[BUG4-COPYBACK] tree.n=%d real4Buffer1.get_size()=%d timeBuffer.get_size()=%d "
-                   "bodies_acc0.get_size()=%d bodies_time.get_size()=%d\n",
-          tree.n, real4Buffer1.get_size(), timeBuffer.get_size(),
-          tree.bodies_acc0.get_size(), tree.bodies_time.get_size());
+  fprintf(stderr, "[BUG4-COPYBACK] tree.n=%d real4Buffer1.get_size()=%zu timeBuffer.get_size()=%zu "
+                   "bodies_acc0.get_size()=%zu bodies_time.get_size()=%zu\n",
+          tree.n, (size_t) real4Buffer1.get_size(), (size_t) timeBuffer.get_size(),
+          (size_t) tree.bodies_acc0.get_size(), (size_t) tree.bodies_time.get_size());
   tree.bodies_acc0.copy_devonly(real4Buffer1, tree.n);
   tree.bodies_time.copy_devonly(timeBuffer, timeBuffer.get_size());
   {
@@ -5592,7 +5537,8 @@ void octree::correct(tree_structure &tree)
         int idx = sIdx[k];
         int2 bt = tree.bodies_time[idx];
         uint32_t xb, yb; memcpy(&xb,&bt.x,sizeof(xb)); memcpy(&yb,&bt.y,sizeof(yb));
-        fprintf(stderr, "[BUG4-BRACKET] correctIdx=%d AFTER_COPYBACK bodies_time[%d]=(0x%08x(%.9g), 0x%08x(%.9g)) active_list[%d]=%u\n",
+        // ticks, not times -- bodies_time is int2
+        fprintf(stderr, "[BUG4-BRACKET] correctIdx=%d AFTER_COPYBACK bodies_time[%d]=(0x%08x(%d), 0x%08x(%d)) active_list[%d]=%u\n",
                 bug4CorrectIdx, idx, xb, bt.x, yb, bt.y, idx, tree.activePartlist[idx]);
       }
       int nActive = 0;
@@ -5658,8 +5604,12 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
 
   //float2 energy: x is kinetic energy, y is potential energy
   int blockSize = NBLOCK_REDUCE ;
-  my_dev::dev_mem<double2>  energy;
-  energy.cmalloc_copy(tree.generalBuffer1, blockSize, 0);
+  // T78 item 2: energy is read on the HOST (energy.d2h() below, then energy[0..blockSize-1]), so
+  // it cannot be an arena child now that generalBuffer1 is device-only. blockSize is the constant
+  // NBLOCK_REDUCE, so this allocates once; `static` because dev_mem frees in its destructor and a
+  // per-call local would hipMalloc/hipFree on every energy sample.
+  static my_dev::dev_mem<double2>  energy;
+  if (energy.get_size() < (size_t) blockSize) energy.cmalloc(blockSize, false);
 
   // T30: coefficients for the self-potential removal and Gadget's comoving+periodic
   // normalisation (potential.c:246-254, scaled by All.G at :261). Computed once here rather than
@@ -5841,7 +5791,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     // compute_scaling decode already relies on, not inferred), raw AABB half-extents (boxSizeInfo,
     // NEVER modified by any runtime bJ floor -- the floor only clamps a kernel-local float variable,
     // so this is always the TRUE unfloored geometry regardless of which floor the running build
-    // ships), the level-derived cell size (cellSizeInfo, Ticket 26), the REAL mass (multipole[3*i].w
+    // ships), the level-derived cell size (cellSizeInfo, Ticket 26), the REAL mass (multipole[i].w
     // -- NOT boxCenterInfo[i].w, which is `cellOp`, a MAC-angle-squared quantity per
     // compute_propertiesD.cu:483-512, negated for leaves as a leaf-vs-node sign flag only; T24/T26's
     // own T24-NODE-SCAN/T26-NODE-SCAN-SMALL diagnostics printed THIS field labeled "mass=", a real
@@ -5904,7 +5854,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
           L.level = bij.z;
           const float4 sz  = tree.boxSizeInfo[n];
           const float4 ctr = tree.boxCenterInfo[n];
-          const real4  com = tree.multipole[3*n];
+          const real4  com = tree.multipole[n];
           L.bJ = 2.0f*std::max(sz.x, std::max(sz.y, sz.z));
           L.cellSize = tree.cellSizeInfo[n];
           L.mass = com.w;
@@ -6015,7 +5965,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
         {
           if (n == infos[a].nodeIdx) continue;
           const float4 sz = tree.boxSizeInfo[n];
-          const real4  com = tree.multipole[3*n];
+          const real4  com = tree.multipole[n];
           const float mJ = fabsf(com.w);
           if (mJ <= 0.0f) continue; // skip massless/empty
           const float bJraw = 2.0f*std::max(sz.x, std::max(sz.y, sz.z));
@@ -6078,7 +6028,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
 
         std::sort(nonzeroWrong.begin(), nonzeroWrong.end(),
                   [](const auto &x, const auto &y) { return std::get<0>(x) < std::get<0>(y); });
-        const int nShow = std::min((size_t)6, nonzeroWrong.size());
+        const int nShow = (int) std::min((size_t) 6, nonzeroWrong.size());  // bounded by 6
         for (int s = 0; s < nShow; s++) {
           const auto &e = nonzeroWrong[s];
           fprintf(stderr, "[T28-SCAN-NONZERO] iter=%d targetIdx=%d group=%d rank=%d node=%d "
@@ -6092,7 +6042,6 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
   }
 
   //Sum the values / energies of the system using MPI
-  AllSum(Epot); AllSum(Ekin);
 
   Etot = Epot + Ekin;
 
@@ -6411,7 +6360,6 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     snprintf(epotStaleTag, sizeof(epotStaleTag), "  EPOT_STALE(active_groups=%d/%d)",
              tree.n_active_groups, tree.n_groups);
 
-  if(mpiGetRank() == 0)
   {
 #if 0
   LOG("iter=%d : time= %lg  Etot= %.10lg  Ekin= %lg   Epot= %lg : de= %lg ( %lg ) d(de)= %lg ( %lg ) t_sim=  %lg sec\n",

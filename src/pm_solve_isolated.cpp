@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "pm.h"
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 // Non-periodic (isolated/vacuum-boundary) PM long-range solver -- mirrors pm_solve.cpp's own
 // periodic solver structure closely (create once, reuse every call), the only real differences

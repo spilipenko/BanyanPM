@@ -20,6 +20,8 @@
 #include <sstream>
 #include <fstream>
 #include <cassert>
+#include "memlog.h"
+#include <type_traits>
 #include <vector>
 #include <map>
 #include <hip/hip_runtime.h>
@@ -97,6 +99,123 @@ static int getNumberOfCUDADevices()
   return temp;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// T78 item 1: which flag hipHostMalloc gets.
+//
+// Flagless hipHostMalloc is hipHostMallocDefault, which is FINE-GRAINED (coherent) host memory,
+// and on gfx1151 fine-grained memory is not cached in the GPU L2 at all. Measured with rocprofv3
+// on a kernel re-reading a 1 MiB array 200 times (probes/t78-memory, audit repo):
+//
+//   allocation                 GL2C_REQ   GL2C_HIT  GL2C_MISS   hit%
+//   hipMalloc                    741031     732834       8197  98.89
+//   hipHostMalloc NonCoherent    733753     725560       8193  98.88
+//   hipHostMalloc default       1817622          3    1817619   0.00
+//
+// Three hits in 1.8 million requests. The misses for the coarse-grained types are exactly one
+// cold fill of the array (8193 lines of 128 B); for the fine-grained ones every access misses.
+// Pointer-chase latency says the same: 33 ns/hop against 169 at a 128 KiB working set.
+//
+// hipHostMallocNonCoherent asks for coarse-grained host memory, still mapped for the device, so
+// the single allocation is kept and the lines become cacheable. The cost is that host and device
+// are no longer automatically coherent: a host read of device-written bytes needs a completed
+// stream sync first. Every such read in this port already has one (the arena energy reduction,
+// the aold lookup, the snapshot writer), which is why this is worth trying rather than assuming.
+//
+// GADGET_HIP_HOST_NONCOHERENT=0|1 selects it at run time so the two can be compared on the same
+// binary, which is how everything else here was established.
+// ---------------------------------------------------------------------------------------------
+namespace my_dev {
+
+// Three allocators for the pinned/aliased host buffers, selectable at run time so they can be
+// compared on one binary. GADGET_HIP_HOST_ALLOC = default | noncoherent | managed.
+//
+//   default       hipHostMalloc with no flags. FINE-GRAINED, and so not cached in GL2 at all on
+//                 gfx1151: 3 hits in 1.8 million requests (rocprofv3 GL2C_*, 1 MiB working set,
+//                 200 passes). 103 ns/hop at a 32 KiB working set against 25 for device memory.
+//   noncoherent   hipHostMalloc + hipHostMallocNonCoherent. Coarse-grained, hence cacheable:
+//                 98.88% GL2 hit. Matches device memory to about 1 MiB and then falls back toward
+//                 the fine-grained level -- 295 ns/hop at 64 MiB, 424 at 1 GiB.
+//   managed       hipMallocManaged + hipMemAdvise(hipMemAdviseSetCoarseGrain). Also 98.88% GL2
+//                 hit, and the only one of the three that ALSO matches device memory at large
+//                 working sets: 238.4 ns/hop at 1 GiB against hipMalloc's 237.8, where
+//                 noncoherent is 424. That second gap is TLB or snoop rather than cache, which is
+//                 why no flag on hipHostMalloc can close it.
+//
+// Data and method: probes/t78-memory in the audit repo.
+//
+// Managed memory must be released with hipFree, NOT hipHostFree. The kind is read once per run so
+// every buffer is allocated and freed through the same branch.
+enum HostAllocKind { HA_DEFAULT = 0, HA_NONCOHERENT = 1, HA_MANAGED = 2 };
+
+inline HostAllocKind host_alloc_kind()
+{
+  static const HostAllocKind k = []() -> HostAllocKind {
+    if (const char *e = getenv("GADGET_HIP_HOST_ALLOC"))
+    {
+      if (!strcmp(e, "managed"))     return HA_MANAGED;
+      if (!strcmp(e, "noncoherent")) return HA_NONCOHERENT;
+      if (!strcmp(e, "default"))     return HA_DEFAULT;
+      fprintf(stderr, "\nFATAL: GADGET_HIP_HOST_ALLOC='%s' is not one of "
+                      "default|noncoherent|managed.\n\n", e);
+      exit(1);
+    }
+    if (const char *n = getenv("GADGET_HIP_HOST_NONCOHERENT"))   // the switch this replaces
+      if (atoi(n) != 0) return HA_NONCOHERENT;
+#ifdef GADGET_HIP_UNIFIED_MEM
+    // Default since T78, but ONLY where aliasing is compiled in. That is the configuration the
+    // evidence covers: validated on an APU through snapshot/restart byte-identity, a multi-type
+    // zoom, and a full 512^3 run to z=0 matching the CPU reference to +0.016% sigma / +0.074% Ekin.
+    // A build with UNIFIED_MEM off is the discrete-GPU case, where managed memory MIGRATES pages
+    // between host and device rather than sharing one physical pool, and that has never been
+    // tried here -- so it keeps the old allocator rather than inheriting an untested one.
+    return HA_MANAGED;
+#else
+    return HA_DEFAULT;
+#endif
+  }();
+  return k;
+}
+
+inline const char *host_alloc_name()
+{
+  switch (host_alloc_kind()) {
+    case HA_MANAGED:     return "hipMallocManaged + SetCoarseGrain (coarse-grained)";
+    case HA_NONCOHERENT: return "hipHostMalloc + NonCoherent (coarse-grained)";
+    default:             return "hipHostMalloc, no flags (fine-grained, NOT cached in GL2)";
+  }
+}
+
+inline hipError_t host_alloc(void **p, size_t bytes)
+{
+  switch (host_alloc_kind()) {
+    case HA_MANAGED: {
+      hipError_t e = hipMallocManaged(p, bytes);
+      if (e == hipSuccess && bytes > 0)
+      {
+        hipError_t a = hipMemAdvise(*p, bytes, hipMemAdviseSetCoarseGrain, 0);
+        if (a != hipSuccess)
+        {
+          // Without the advice this is fine-grained managed memory, which measured the same
+          // 0.00% GL2 hit rate as the default. Failing loudly beats running slower silently.
+          fprintf(stderr, "\nFATAL: hipMemAdviseSetCoarseGrain failed (%s); "
+                          "GADGET_HIP_HOST_ALLOC=managed cannot be honoured.\n\n",
+                  hipGetErrorString(a));
+          exit(1);
+        }
+      }
+      return e;
+    }
+    case HA_NONCOHERENT: return hipHostMalloc(p, bytes, hipHostMallocNonCoherent);
+    default:             return hipHostMalloc(p, bytes, 0u);
+  }
+}
+
+inline hipError_t host_free(void *p)
+{
+  return (host_alloc_kind() == HA_MANAGED) ? hipFree(p) : hipHostFree(p);
+}
+}
 
 namespace my_dev {
 
@@ -406,6 +525,8 @@ namespace my_dev {
     // T65 item 3: hDeviceMem points AT host_ptr -- one physical buffer, no device copy, nothing to
     // transfer. Only ever true for pinned memory in a GADGET_HIP_UNIFIED_MEM build.
     bool aliased = false;
+    // T78 item 2: no HOST allocation exists for this buffer (generalBuffer1 and its children).
+    bool devOnly = false;
     bool hDeviceMem_flag;
     bool childMemory; //Indicates that this is a shared buffer that will be freed by a parent
 
@@ -424,11 +545,12 @@ namespace my_dev {
     	  // host_ptr, and hipHostFree below releases it. hipFree on it would be a double free.
     	  if (!aliased) (hipFree(hDeviceMem));
     	  decreaseMemUsage(size*sizeof(T));
+    	  memlog_free();
 
     	  if(pinned_mem){
-    		  (hipHostFree((void*)host_ptr));
+    		  (my_dev::host_free((void*)host_ptr));
     	  } else {
-    		  free(host_ptr);
+    		  if (host_ptr) free(host_ptr);   // T78 item 2: device-only buffers have none
     	  }
           hDeviceMem_flag = false;
           aliased = false;
@@ -501,6 +623,19 @@ namespace my_dev {
     // Bug 9 widened `n`, `tempSize` and dev_mem::size to size_t and stopped one level short.
     size_t cmalloc_copy(dev_mem<uint> &sourcemem, const size_t n, const size_t offset)
     {
+      // VIEW, not an allocation: a range of the shared arena. The reader must not add these to
+      // any total -- they already sit inside generalBuffer1 -- but the size and the offset are
+      // what let the phase model answer how much of the arena is actually in use, which is a
+      // different question from how big the arena was made. The byte offset goes in the flags
+      // slot, so max(offset + bytes) over a phase is the true high-water mark of the arena.
+#ifdef GADGET_HIP_MEMLOG_BUILD
+      // #ifdef, not just the on() guard: ml_label/ml_file/ml_line do not exist in the
+      // default build, and unreachable code still has to compile.
+      if (memlog::on())
+        memlog::record("VIEW", ml_label(), (size_t)(n * sizeof(T)), "arena",
+                       0, (unsigned) (offset * sizeof(uint)), ml_file, ml_line);
+#endif
+
       //The properties
       this->pinned_mem  = sourcemem.get_pinned();
       this->flags       = sourcemem.get_flags();
@@ -511,8 +646,16 @@ namespace my_dev {
       this->size 		= n;
 
 
-      void* ParentHost_ptr = &sourcemem[(ptrdiff_t)offset];
-      host_ptr = (T*) ((char*)ParentHost_ptr);
+      // T78 item 2: a device-only parent has no host pages, so &sourcemem[offset] would be
+      // pointer arithmetic on null. The child inherits both the null pointer and the flag.
+      this->devOnly = sourcemem.is_devonly();
+      if (this->devOnly)
+        host_ptr = NULL;
+      else
+      {
+        void* ParentHost_ptr = &sourcemem[(ptrdiff_t)offset];
+        host_ptr = (T*) ((char*)ParentHost_ptr);
+      }
 
 
       /* jbedorf: fixed so address is correct, casting before adding gives a different
@@ -635,6 +778,72 @@ namespace my_dev {
     // So each call site states whether its array has been audited, and the bitmask below selects
     // which of the audited ones actually alias -- which is what makes bisecting possible at all.
     // GADGET_HIP_UNIFIED_ARRAYS is a bitmask over AliasId; default all-ones.
+#ifdef GADGET_HIP_MEMLOG_BUILD
+    // ---- allocation ledger (measurement only; see include/memlog.h) ----------------------
+    // Host and device are recorded as SEPARATE entries, because the question this instrument
+    // exists to answer is how much of the footprint is the same particle data held twice.
+    const char *ml_name = nullptr;
+    const char *ml_file = nullptr;
+    int         ml_line = 0;
+    unsigned    ml_alias = 0;
+    long long   ml_host_bytes = 0;   // what was last recorded, so FREE balances exactly
+    long long   ml_dev_bytes  = 0;
+    bool        ml_zeroed = false;
+    int         ml_id = 0;
+
+    void memlog_tag(const char *n, const char *f, int l) { ml_name = n; ml_file = f; ml_line = l; }
+    void memlog_mark(bool zeroed, unsigned alias) { ml_zeroed = zeroed; ml_alias = alias; }
+
+    const char *ml_label()
+    {
+      if (ml_name) return ml_name;
+      // Untagged allocations are NAMED, not dropped: a gap in the instrumentation must be visible
+      // in the report, or the totals cannot be trusted.
+      if (!ml_id) { static int c = 0; ml_id = ++c; }
+      static char buf[64];
+      snprintf(buf, sizeof buf, "(untagged#%d)", ml_id);
+      return buf;
+    }
+
+    void memlog_alloc()
+    {
+      const long long b = (long long)(size * sizeof(T));
+      // T78 item 2: a device-only buffer has no host allocation, so recording one would put back
+      // into the ledger exactly the 5.010 GiB this change removes.
+      ml_host_bytes = devOnly ? 0 : b;
+      if (!devOnly)
+        memlog::record("ALLOC", ml_label(), b,
+                       pinned_mem ? "hipHostMalloc" : (ml_zeroed ? "calloc" : "malloc"),
+                       flags ? 1 : 0, ml_alias, ml_file, ml_line);
+      // An aliased buffer has no device allocation of its own -- the host pages ARE the device
+      // pages. A device entry for it would double-count exactly the saving aliasing produces.
+      ml_dev_bytes = aliased ? 0 : b;
+      if (!aliased)
+        memlog::record("ALLOC", ml_label(), b, "hipMalloc", flags ? 1 : 0, ml_alias, ml_file, ml_line);
+    }
+
+    void memlog_free()
+    {
+      if (ml_host_bytes)
+        memlog::record("FREE", ml_label(), ml_host_bytes,
+                       pinned_mem ? "hipHostMalloc" : "malloc", 0, ml_alias, ml_file, ml_line);
+      if (ml_dev_bytes)
+        memlog::record("FREE", ml_label(), ml_dev_bytes, "hipMalloc", 0, ml_alias, ml_file, ml_line);
+      ml_host_bytes = ml_dev_bytes = 0;
+    }
+#else
+    // Ledger compiled out (the default). These are no-ops rather than #ifdefs at every
+    // call site, and the eight ml_* members do not exist, so dev_mem keeps the size and
+    // layout it had before the ledger was added. That matters: the ledger cost 5.9% in
+    // approximate_gravity with identical kernel registers, i.e. purely from the larger
+    // tree struct and the extra host-side code in the launch path. Build with
+    // -DGADGET_HIP_MEMLOG=ON to get it back.
+    void memlog_tag(const char *, const char *, int) {}
+    void memlog_mark(bool, unsigned) {}
+    void memlog_alloc() {}
+    void memlog_free() {}
+#endif
+
     enum AliasId
     {
       ALIAS_NONE        = 0,
@@ -654,7 +863,13 @@ namespace my_dev {
       ALIAS_ORIORDER    = 1u << 12,
       ALIAS_ACTIVEPART  = 1u << 13,
       ALIAS_BODY2GROUP  = 1u << 14,
-      ALIAS_TREESCRATCH = 1u << 15   // n_children, node_bodies
+      ALIAS_TREESCRATCH = 1u << 15,  // n_children, node_bodies
+      // T78: bodies_aoldMag was the last PARTICLE array still held in two copies under
+      // UNIFIED_MEM, 4 B/particle each side. Safe to alias: the only host read
+      // (gpu_iterate.cpp, the Springel-MAC aold lookup) is preceded by an explicit
+      // execStream->sync(), so it does not rely on d2h() for ordering -- which matters,
+      // because on an aliased buffer d2h() is a no-op and provides none.
+      ALIAS_AOLDMAG     = 1u << 16
     };
     static unsigned unifiedArrays()
     {
@@ -707,8 +922,39 @@ namespace my_dev {
     void ccalloc_unified(size_t n, unsigned aliasId, int flags = 0)
     { ccalloc(n, aliasWanted(aliasId), flags, aliasId); }
 
+    // T78 item 2: allocate the DEVICE side only, leaving host_ptr null.
+    //
+    // generalBuffer1 is the buffer that wants this. It is the largest allocation in the run --
+    // 5.010 GiB at 512^3 -- and it was allocated on BOTH sides, the host side a plain malloc that
+    // measurement showed is never faulted in: Rss = 0 at 262k, 16.7M and 134M particles. So the
+    // host copy cost address space rather than pages, but the accounting still had to explain a
+    // 5 GiB allocation nothing reads, and it would have become real memory the moment any future
+    // code touched it.
+    //
+    // Children carved out by cmalloc_copy inherit the null host pointer, and d2h/h2d on such a
+    // buffer aborts by name rather than copying to address zero. That is the safe failure mode: a
+    // missed consumer stops the run with a message instead of corrupting results quietly.
+    void cmalloc_devonly(size_t n)
+    {
+      memlog_mark(false, ALIAS_NONE);
+      this->pinned_mem = false;
+      this->flags      = false;
+      if (size > 0) cuda_free();
+      size     = n;
+      aliased  = false;
+      devOnly  = true;
+      host_ptr = NULL;
+      CU_SAFE_CALL(hipMalloc((T**)&hDeviceMem, size*sizeof(T)));
+      increaseMemUsage(size*sizeof(T));
+      DeviceMemPtr    = (void*)(size_t)hDeviceMem;
+      hDeviceMem_flag = true;
+      poisonDeviceRange(0, (size_t) size);
+      memlog_alloc();
+    }
+
     void cmalloc(size_t n, bool pinned = false, int flags = 0, unsigned aliasId = ALIAS_NONE)
     {
+      memlog_mark(false, aliasId);
       this->pinned_mem = pinned;
       this->flags = (flags == 0) ? false : true;
       if (size > 0) cuda_free();
@@ -716,7 +962,7 @@ namespace my_dev {
 
       aliased = false;
       if(pinned_mem){
-        CU_SAFE_CALL(hipHostMalloc((T**)&host_ptr, size*sizeof(T)));
+        CU_SAFE_CALL(my_dev::host_alloc((void**)&host_ptr, size*sizeof(T)));
         if (unifiedMem() && aliasId && (unifiedArrays() & aliasId) && size > 0)
           tryAliasHostAsDevice();   // T65 item 3
       }
@@ -735,9 +981,11 @@ namespace my_dev {
 
       hDeviceMem_flag = true;
       poisonDeviceRange(0, (size_t) size);
+      memlog_alloc();
     }
 
     void ccalloc(size_t n, bool pinned = false, int flags = 0, unsigned aliasId = ALIAS_NONE) {
+      memlog_mark(true,  aliasId);
       this->pinned_mem = pinned;
       this->flags = (flags == 0) ? false : true;
       if (size > 0) cuda_free();
@@ -746,7 +994,11 @@ namespace my_dev {
       aliased = false;
       if(pinned_mem)
       {
-        hipHostMalloc((T**)&host_ptr, size*sizeof(T));
+        // CHECKED, because this is the allocation that actually fails. Large runs OOM here first
+        // -- the host side is the bigger half at 333 B/particle -- and an unchecked failure left
+        // host_ptr undefined and then handed it straight to tryAliasHostAsDevice() below. The
+        // other 170 allocation sites in this file go through CU_SAFE_CALL; this one did not.
+        CU_SAFE_CALL(my_dev::host_alloc((void**)&host_ptr, size*sizeof(T)));
         if (unifiedMem() && aliasId && (unifiedArrays() & aliasId) && size > 0)
           tryAliasHostAsDevice();   // T65 item 3
       }
@@ -765,6 +1017,7 @@ namespace my_dev {
 
       hDeviceMem_flag = true;
           if (poisonZeroInit()) poisonDeviceRange(0, (size_t) size);
+      memlog_alloc();
 }
 
      //Set reduce to false to not reduce the size, to speed up pinned memory buffers
@@ -784,13 +1037,13 @@ namespace my_dev {
       {
         //No realloc function so do it by hand
         T *tmp_ptr;
-        CU_SAFE_CALL(hipHostMalloc((T**)&tmp_ptr, n*sizeof(T)));
+        CU_SAFE_CALL(my_dev::host_alloc((void**)&tmp_ptr, n*sizeof(T)));
         //Copy old content to newly allocated mem
         size_t tmpSize = std::min(size,n);
 
         //Copy the old data to the new pointer and free the old location
         memcpy (((void*) tmp_ptr), ((void*) host_ptr), tmpSize*sizeof(T));
-        CU_SAFE_CALL(hipHostFree((void*)host_ptr));
+        CU_SAFE_CALL(my_dev::host_free((void*)host_ptr));
         host_ptr = tmp_ptr;
       }
       else
@@ -804,7 +1057,11 @@ namespace my_dev {
         while(host_ptr == nullptr)
         {
             usleep(10); count++;
-            fprintf(stderr,"Realloc failed, try again, size-old: %d new: %d attempt: %d\n", size,n, count);
+            // %zu: size and n are size_t. With %d a failure above 2^31 elements -- which is the
+            // scale at which a realloc plausibly fails -- printed a wrong or negative number in
+            // the one message that says what went wrong.
+            fprintf(stderr,"Realloc failed, try again, size-old: %zu new: %zu attempt: %d\n",
+                    (size_t) size, (size_t) n, count);
             host_ptr = (T*)realloc(host_ptr, n*sizeof(T));
             if(host_ptr == nullptr && count > 10) {fprintf(stderr,"Realloc failed too often, exit\n"); exit(0); }
         }
@@ -858,11 +1115,17 @@ namespace my_dev {
        return;
      }
 
-     if(pinned_mem)
+     if(devOnly)
+     {
+       // T78 item 2: there is no host side, and creating one here would put back exactly the
+       // 5.010 GiB that making generalBuffer1 device-only removes. The arena is resized by
+       // build() and compute_properties(), so this branch is on the live path, not a corner.
+     }
+     else if(pinned_mem)
      {
        //No realloc function so do it by hand
-       CU_SAFE_CALL(hipHostFree((void*)host_ptr));
-       CU_SAFE_CALL(hipHostMalloc((T**)&host_ptr, n*sizeof(T)));
+       CU_SAFE_CALL(my_dev::host_free((void*)host_ptr));
+       CU_SAFE_CALL(my_dev::host_alloc((void**)&host_ptr, n*sizeof(T)));
      }
      else
      {
@@ -954,7 +1217,26 @@ namespace my_dev {
     }
 
     //D2h that only copies a certain number of items to the host
-    void d2h(int number, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
+    // Any integral count -- bool deliberately excluded so d2h(true) still means "whole
+    // buffer" -- is widened to size_t here rather than at the call site.
+    template <typename N,
+              typename = typename std::enable_if<std::is_integral<N>::value &&
+                                                 !std::is_same<N, bool>::value>::type>
+    void d2h(N number, bool OCL_BLOCKING = true, hipStream_t stream = 0)
+    { d2h_n((size_t) number, OCL_BLOCKING, stream); }
+
+    void d2h_n(size_t number, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
+      // T78 item 2: no host side exists. Abort by name rather than copy to address zero.
+      if (devOnly || host_ptr == NULL)
+      {
+        // The buffer name is only available in a GADGET_HIP_MEMLOG build, so the message names
+        // the operation and the cause instead; the backtrace names the caller.
+        fprintf(stderr, "\nFATAL: d2h on a device-only buffer. generalBuffer1 and its "
+                        "cmalloc_copy children have had no host allocation since T78 item 2; give "
+                        "this consumer its own buffer instead of carving it out of the arena.\n\n");
+        exit(1);
+      }
+
       assert(hDeviceMem_flag);
 
       if(number == 0) return;
@@ -980,7 +1262,13 @@ namespace my_dev {
     // Deliberately NOT short-circuited for aliasing: `dst` is a caller-supplied buffer somewhere
     // else entirely (parallel.cpp's extraBodyBuffer), so this is a real copy whether or not
     // hDeviceMem happens to be the same memory as host_ptr.
-    void d2h(int number, void* dst, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
+    template <typename N,
+              typename = typename std::enable_if<std::is_integral<N>::value &&
+                                                 !std::is_same<N, bool>::value>::type>
+    void d2h(N number, void* dst, bool OCL_BLOCKING = true, hipStream_t stream = 0)
+    { d2h_n_dst((size_t) number, dst, OCL_BLOCKING, stream); }
+
+    void d2h_n_dst(size_t number, void* dst, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
       assert(hDeviceMem_flag);
 
       if(number == 0) return;
@@ -1021,7 +1309,26 @@ namespace my_dev {
     }
 
     //D2h that only copies a certain number of items to the host
-    void h2d(int number, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
+    // Any integral count -- bool deliberately excluded so h2d(true) still means "whole
+    // buffer" -- is widened to size_t here rather than at the call site.
+    template <typename N,
+              typename = typename std::enable_if<std::is_integral<N>::value &&
+                                                 !std::is_same<N, bool>::value>::type>
+    void h2d(N number, bool OCL_BLOCKING = true, hipStream_t stream = 0)
+    { h2d_n((size_t) number, OCL_BLOCKING, stream); }
+
+    void h2d_n(size_t number, bool OCL_BLOCKING = true, hipStream_t stream = 0)   {
+      // T78 item 2: no host side exists. Abort by name rather than copy to address zero.
+      if (devOnly || host_ptr == NULL)
+      {
+        // The buffer name is only available in a GADGET_HIP_MEMLOG build, so the message names
+        // the operation and the cause instead; the backtrace names the caller.
+        fprintf(stderr, "\nFATAL: h2d on a device-only buffer. generalBuffer1 and its "
+                        "cmalloc_copy children have had no host allocation since T78 item 2; give "
+                        "this consumer its own buffer instead of carving it out of the arena.\n\n");
+        exit(1);
+      }
+
       assert(hDeviceMem_flag);
       assert(size > 0);
 
@@ -1053,7 +1360,7 @@ namespace my_dev {
 
     //JB: Modified this so that it copies a device buffer to an other device
     //buffer, and the host buffer to the other host buffer
-    void copy(dev_mem &src_buffer, int n, bool OCL_BLOCKING = true)   {
+    void copy(dev_mem &src_buffer, size_t n, bool OCL_BLOCKING = true)   {
       assert(hDeviceMem_flag);
       if (size < n) {
         cuda_free();
@@ -1067,12 +1374,12 @@ namespace my_dev {
       memcpy (((void*) &host_ptr[0]), ((void*) &src_buffer[0]), n*sizeof(T));
     }
 
-    void copy_devonly(dev_mem &src_buffer, int n, int offset = 0)
+    void copy_devonly(dev_mem &src_buffer, size_t n, size_t offset = 0)
     {
       //Copy data from src_buffer in our own device buffer
       CU_SAFE_CALL(hipMemcpy((void*)(size_t)(hDeviceMem + offset), src_buffer.d(), n*sizeof(T), hipMemcpyDeviceToDevice));
     }
-    void copy_devonly(T* src, const int n, int offset = 0)
+    void copy_devonly(T* src, const size_t n, size_t offset = 0)
     {
       CU_SAFE_CALL(hipMemcpy((void*)(size_t)(hDeviceMem + offset), src, sizeof(T)*n, hipMemcpyDeviceToDevice));
     }
@@ -1126,6 +1433,7 @@ namespace my_dev {
 
     size_t get_size(){return size;}
     bool get_pinned(){return pinned_mem;}
+    bool is_devonly(){return devOnly;}   // T78 item 2: no HOST copy exists
     bool is_aliased(){return aliased;}   // T65 item 3: no device copy exists
     bool get_flags(){return flags;}
   };     // end of class dev_mem

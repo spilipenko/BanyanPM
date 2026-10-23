@@ -103,10 +103,10 @@ make -C build -j12 gadget_hip
 | `MAC_SPRINGEL` | Enables the Springel (2005) opening criterion, `TypeOfOpeningCriterion 1`. |
 | `UNEQUAL_SOFTENINGS` | Required whenever particle types do not share a softening. |
 | `GADGET_HIP_HIGHRES` | The second, non-periodic mesh for zoom runs. |
-| `GADGET_HIP_UNIFIED_MEM` | Host-buffer aliasing for large runs — see [Memory](#memory-and-problem-size). |
+| `GADGET_HIP_UNIFIED_MEM` | Host-buffer aliasing, **on by default**; turn it off for a discrete GPU — see [Memory](#memory-and-problem-size). |
 | `GADGET_HIP_LONGIDS` | 64-bit particle IDs. Matched against the IC's `ID` block width, not sniffed. |
 
-Fifteen options and four sizing constants exist in total; the table above is the set that matters
+Ten options and four sizing constants exist in total; the table above is the set that matters
 for a first build. **[`docs/COMPILE_OPTIONS.md`](docs/COMPILE_OPTIONS.md)** documents every one,
 including the header constants that set the tree and group sizes, and which combinations are
 refused at configure time.
@@ -153,30 +153,87 @@ first run:
 
 ## Memory and problem size
 
-Resident footprint, measured with an allocation ledger rather than estimated, at 512³
-(134,217,728 particles):
+The footprint is measured with an allocation ledger — every allocation is logged with its size,
+allocator and call site — rather than estimated. It is not a single bytes-per-particle number,
+because three different things scale differently:
 
-| build | bytes/particle | 512³ |
+```
+bytes  =  C(PMGRID)                                  fixed, plus a mesh set by PMGRID
+        +  Npart · (a + c · TreeAllocFactor)          the particle arrays and the tree scratch
+        +  Nnodes · b  +  Nleaves · d  +  Ngroups · e  the tree itself
+```
+
+Measured coefficients, default build (`GADGET_HIP_UNIFIED_MEM=ON`, the coarse-grained host
+allocator):
+
+| term | value | what it is |
 |---|---|---|
-| default | 440 | 55.0 GiB |
-| `-DGADGET_HIP_UNIFIED_MEM=ON` | **333** | **41.7 GiB** |
+| `C` | **5.010 GiB** + `2·2·(PMGRID/2+1)·PMGRID²·4 B` | the shared scratch arena, plus two FFT-padded PM meshes (1.004 GiB at `PMGRID=512`) |
+| `a` | **170 B/particle** | the per-particle arrays: positions, velocities, keys, ids, timebins, softening, type, the PM force scratch |
+| `c` | **20 B/particle** per unit `TreeAllocFactor` | the node-build scratch, sized `TreeAllocFactor · Npart` by design, since nodes-per-particle grows as the box clusters |
+| `b` | **68 B/node** | multipole, bounding box size and centre, octree-cell centre and size |
+| `d` | **8 B/leaf** | the leaf indirection |
+| `e` | **72 B/group** | per-group centre, size and MAC inputs |
 
-**`GADGET_HIP_UNIFIED_MEM`** aliases pinned host buffers as device memory, so seventeen large
-arrays exist once instead of as a host/device pair. On an APU, where host and device memory are the
-same silicon, the device copy is pure overhead. It is what raises the largest problem that fits in
-128 GB to roughly **770³**.
+The arena is the larger of the tree-walk stack (a launch-geometry constant) and what the Peano
+sort needs, which is `9·Npart` 32-bit words; the stack term wins below roughly 1.4×10⁸ particles,
+which is why `C` is flat across the sizes most runs use.
 
-It is a trade. Writes through the alias are slower, and the cost grows over a run as the
-write-heavy phases take a larger share of each step — about **6% per step early, about 11% by
-z ≈ 1**. So it is worth it when a run would not otherwise fit, and not otherwise:
+Tree shape is a property of the particle distribution, not of the code: a cosmological box starts
+near `Nnodes ≈ 0.157·Npart` and clusters to `≈ 0.251·Npart` by z = 0, with
+`Nleaves ≈ 0.143·Npart` and `Ngroups ≈ 0.031·Npart`. **The footprint therefore grows during a run**
+— the `b` term roughly doubles between the initial conditions and z = 0.
 
-* `GADGET_HIP_UNIFIED_MEM=0` disables it at runtime, with no rebuild, on a binary built with it.
-* `GADGET_HIP_UNIFIED_ARRAYS=<bitmask>` selects individual arrays.
+### Worked example, 512³
 
-Aliasing does not change results. The dynamics are bit-identical with it on and off, including the
+134,217,728 particles, `PMGRID=512`, `TreeAllocFactor 1.2`, at the initial conditions:
+
+| term | GiB |
+|---|---|
+| `C` — arena 5.010 + PM mesh 1.004 | 6.014 |
+| `Npart · (170 + 20·1.2)` = 194 B/particle | 24.250 |
+| `Nnodes · 68` | 1.339 |
+| `Nleaves · 8` + `Ngroups · 72` | 0.424 |
+| **total** | **32.03 GiB = 256 B/particle** |
+
+Which is what the ledger reports: **32.0269 GiB**. With aliasing disabled
+(`GADGET_HIP_UNIFIED_MEM=0`) the same run measures **53.52 GiB = 428 B/particle**, because the
+large host-visible arrays then exist as a host/device pair instead of once.
+
+### Two controls worth knowing
+
+**`GADGET_HIP_UNIFIED_MEM`** (default **ON**) aliases the pinned host buffers as device memory, so
+each large array exists once rather than as a host/device pair. On an APU, where host and device
+memory are the same silicon, the second copy is pure overhead — it is worth **172 B/particle**,
+21.5 GiB at 512³. Turn it **off for a discrete GPU**, where the device copy is genuinely required.
+`GADGET_HIP_UNIFIED_MEM=0` disables it at runtime without a rebuild, and
+`GADGET_HIP_UNIFIED_ARRAYS=<bitmask>` selects individual arrays.
+
+Aliasing does not change results: the dynamics are bit-identical with it on and off, including the
 timestep sequence.
 
+**`GADGET_HIP_HOST_ALLOC`** (default `managed`) chooses how those host-visible buffers are
+allocated. The default uses `hipMallocManaged` with `hipMemAdvise(hipMemAdviseSetCoarseGrain)`,
+because a flagless `hipHostMalloc` returns *fine-grained* memory, which on this hardware is not
+cached in the GPU L2 at all — measured with hardware counters on a kernel re-reading a 1 MiB array:
+3 hits in 1.8 million requests, against 98.9% for coarse-grained memory. With the coarse-grained
+allocator the aliased build is **faster than keeping two copies** (2.545 against 2.588 s/step at
+512³, z = 0), so aliasing costs neither memory nor time. `default` and `noncoherent` select the
+other two allocators for comparison on the same binary.
+
+**`TreeAllocFactor`** multiplies the `c` term directly, so it is the one parameter-file knob that
+moves the footprint. It must exceed the largest `Nnodes/Npart` the run reaches: measured over a full
+512³ run that maximum is **0.253**, and a uniform (unclustered) box is higher at **0.32**, so a
+value of **0.6** keeps a comfortable margin while costing 12 B/particle instead of 24. See
+[`examples/annotated.param`](examples/annotated.param).
+
 **`PartAllocFactor` is parsed and ignored.** Allocation is sized from the actual particle count.
+
+### What limits problem size
+
+Memory is no longer the binding constraint. At the hard particle ceiling of 2²⁸ the footprint is
+about **58 GiB**, so on a 128 GB machine the **index limit below is what caps the problem size**,
+not RAM.
 
 ### The particle ceiling is 2²⁸ = 268,435,456, and the build enforces it
 
@@ -380,8 +437,8 @@ path at one much smaller resolution. Nothing else has been tested.
 
 **6×** on the cadence. The gain is concentrated at late times, where clustering makes the mesh
 assignment expensive; the earliest steps are roughly at parity. Read the two BanyanPM rows as
-configurations rather than as a clean measurement of the cadence alone — the second also pays the
-aliasing cost described under [Memory](#memory-and-problem-size).
+configurations rather than as a clean measurement of the cadence alone — they differ in more than
+the cadence.
 
 The step counts agree with GADGET to **0.2–1.3%**, which is the sharper of the two comparisons: the
 timestep criterion is built from the same force GADGET builds it from, so the two codes subdivide

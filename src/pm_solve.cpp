@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include "pm.h"
 #include <ctime>
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 // T36 sub-phase timing, gated on the same GADGET_HIP_PHASE_TIME as the step-level timers in
 // gpu_iterate.cpp and using the same convention: sync the stream on both sides so a sub-phase

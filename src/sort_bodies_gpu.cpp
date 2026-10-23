@@ -126,7 +126,6 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
   {
     getBoundaries(tree, r_min, r_max);  
     //Sync the boundary over the various processes
-    if(this->mpiGetNProcs() > 1) { this->sendCurrentRadiusInfo(r_min, r_max); }
     rMinGlobal = r_min;    rMaxGlobal = r_max;
   }
   

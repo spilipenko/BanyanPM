@@ -46,10 +46,6 @@ http://github.com/treecode/Bonsai
 #endif
 
 
-#ifdef USE_MPI
-  #include <omp.h>
-  #include <mpi.h>
-#endif
 
 #include <iostream>
 #include <stdlib.h>
@@ -148,11 +144,21 @@ static void gadget_hip_report_configuration()
 #endif
 
 #ifdef GADGET_HIP_UNIFIED_MEM
-  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: compiled in (host-buffer aliasing available; "
+  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: compiled in, the default (host-buffer aliasing; "
                   "GADGET_HIP_UNIFIED_MEM=0 disables it at run time)\n");
 #else
-  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: not compiled in (every device buffer has a "
-                  "separate host copy)\n");
+  fprintf(stderr, "[BUILD] GADGET_HIP_UNIFIED_MEM: NOT compiled in (every device buffer has a "
+                  "separate host copy; this is the discrete-GPU configuration and costs "
+                  "181.5 B/particle)\n");
+#endif
+
+#ifdef GADGET_HIP_MEMLOG_BUILD
+  fprintf(stderr, "[BUILD] GADGET_HIP_MEMLOG: compiled in (allocation ledger available; measured "
+                  "3.2%% slower overall and 3.8%% in the tree walk even when idle -- set "
+                  "GADGET_HIP_MEMLOG=<path> to write it, and do NOT use this build for timings)\n");
+#else
+  fprintf(stderr, "[BUILD] GADGET_HIP_MEMLOG: not compiled in (no allocation ledger; this is the "
+                  "configuration to use for timings)\n");
 #endif
 
 #ifdef GADGET_HIP_DETERMINISTIC_CIC
@@ -163,10 +169,6 @@ static void gadget_hip_report_configuration()
                   "runs are NOT bit-reproducible)\n");
 #endif
 
-#ifdef _QUADRUPOLE_
-  fprintf(stderr, "[BUILD] GADGET_HIP_QUADRUPOLE: ON  (quadrupole tree corrections; GADGET-2 is "
-                  "monopole-only)\n");
-#endif
 #ifdef GADGET_HIP_T20_DOUBLE_FORCE_ACCUM
   fprintf(stderr, "[BUILD] GADGET_HIP_T20_DOUBLE_FORCE_ACCUM: ON (double-precision force "
                   "accumulator)\n");
@@ -175,11 +177,7 @@ static void gadget_hip_report_configuration()
   fprintf(stderr, "[BUILD] GADGET_HIP_CB19_NO_RCUT_REJECT: ON (short-range Rcut node rejection "
                   "DISABLED)\n");
 #endif
-#ifdef USE_MPI
-  fprintf(stderr, "[BUILD] MPI               : ON\n");
-#else
   fprintf(stderr, "[BUILD] MPI               : OFF (single process)\n");
-#endif
 
   // Sizing constants. These are header #defines rather than CMake options, and they set real
   // limits -- the addressable particle count follows from NLEAF.
@@ -264,6 +262,7 @@ extern void displayTimers()
 }
 
 #include "octree.h"
+#include "memlog.h"
 #include "gadget_timeline.h"
 #include "pm.h"
 #include "timestep_test.h"
@@ -278,10 +277,6 @@ extern void displayTimers()
 #include "ewald_ref.h"
 #endif
 
-#ifdef USE_OPENGL
-#include "renderloop.h"
-#include <cuda_gl_interop.h>
-#endif
 
 
 
@@ -298,31 +293,6 @@ double get_time_main()
 }
 
 
-/*
- * This thread watches if the simulation progresses or if it 'hangs'
- * this sometime happens (for unknown) reasons on large runs with file writing.
- * To prevent usage of precious compute cycles this thread kills the program 
- * after 360 seconds of no progress.
- */
-void watchThread(octree *bonsai)
-{
-	double tCurrent = 0;
-	do 
-	{
-	  std::this_thread::sleep_for(std::chrono::seconds(360));
-	  double tNew = bonsai->getTime();
-	  if(tNew != tCurrent)
-	  {
-		tCurrent = tNew;
-	  }
-	  else
-	  {
-		fprintf(stderr,"No progress detected for 360 seconds, the program will now exit!\n");
-		::exit(0);
-	  }
-	}
-	while(true);
-}
 
 
 
@@ -450,10 +420,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   PREPEND_RANK       = false;
 #endif
 
-#ifdef USE_OPENGL
-	TstartGlow = 0.0;
-	dTstartGlow = 1.0;
-#endif
         
   double tStartupStart = get_time_main();       
   double tStartModel   = 0;
@@ -585,7 +551,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
  		ADDUSAGE("Bonsai command line usage:");
  		ADDUSAGE("                  ");
 		ADDUSAGE(" -h  --help             Prints this help ");
-		ADDUSAGE(" -i  --infile #         Input snapshot filename in Tipsy format");
 		ADDUSAGE("     --param #          Gadget-2 .param file (PLAN.md Phase 5 ticket 01) -- parsed "
 		         "and validated; overrides --theta/--erracc/--boxsize/--tend when given");
 		ADDUSAGE("     --snapshot-test #  Phase 5 ticket 02: one-shot Gadget-2 snapshot format "
@@ -613,7 +578,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		         "Green's-function-kernel self-test (value unused, just needs to be nonzero); "
 		         "exits after printing PASS/FAIL per case [requires a GADGET_HIP_HIGHRES build]");
 		ADDUSAGE(" -f  --bonsaifile #     Input snapshot filename in Bonsai format [muse be used with --usempiio]");
-		ADDUSAGE("     --restart          Let each process restart from a snapshot as specified by 'infile'");
 		ADDUSAGE("     --logfile #        Log filename [" << logFileName << "]");
 		ADDUSAGE("     --dev #            Device ID [" << devID << "]");
 		ADDUSAGE("     --renderdev #      Rendering Device ID [" << renderDevID << "]");
@@ -636,9 +600,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		ADDUSAGE("     --timeline-test    one-shot integer-timeline self-check; exits after printing");
 		ADDUSAGE("     --debug            per-step developer probes (device pointers, buffer\n                        sizes, group-max traces); also GADGET_HIP_DEBUG=1");
 		ADDUSAGE("     --reducebodies #   cut down bodies dataset by # factor ");
-#ifdef USE_DUST
-        ADDUSAGE("     --reducedust #     cut down dust dataset by # factor ");
-#endif
 #if ENABLE_LOG
     ADDUSAGE("     --log              enable logging ");
     ADDUSAGE("     --prepend-rank     prepend the MPI rank in front of the log-lines ");
@@ -672,19 +633,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     ADDUSAGE("     --zoom-treepm-force-test #  Phase 5 ticket 07: combined tree(Rcut[1]/Asmth[1]) + coarse-PM + fine(zoom)-PM force vs. exact Newtonian G*m/r^2, # log-spaced separations; exits after printing the result");
 #endif
 #endif
-#endif
-#ifdef USE_OPENGL
-		ADDUSAGE("     --fullscreen #     set fullscreen mode string");
-    ADDUSAGE("     --displayfps       enable on-screen FPS display");
-		ADDUSAGE("     --Tglow  #         enable glow @ # Myr [" << TstartGlow << "]");
-		ADDUSAGE("     --dTglow  #        reach full brightness in @ # Myr [" << dTstartGlow << "]");
-		ADDUSAGE("     --stereo           enable stereo rendering");
-#endif
-#ifdef GALACTICS
-		ADDUSAGE("     --milkyway #       use Milky Way model with # particles per proc");
-		ADDUSAGE("     --mwfork   #       fork Milky Way generator into # processes [" << nMWfork << "]");
-		ADDUSAGE("     --seed     #       seed to use for the Milky Way  [" << galSeed  << "]");
-    ADDUSAGE("     --taskvar  #       variable name to obtain task id [for randoms seed] before MPI_Init. \n");
 #endif
     ADDUSAGE("     --plummer  #       use Plummer model with # particles per proc");
 		ADDUSAGE("     --sphere   #       use spherical model with # particles per proc");
@@ -724,12 +672,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 		opt.setFlag  ( "debug" );
 		opt.setFlag  ( "timeline-test" );
     opt.setOption( "plummer");
-#ifdef GALACTICS
-    opt.setOption( "milkyway");
-    opt.setOption( "mwfork");
-    opt.setOption( "taskvar");
-    opt.setOption( "seed");
-#endif
     opt.setOption( "sphere");
     opt.setOption( "cube");
     opt.setOption( "dev" );
@@ -786,13 +728,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     // coarse grid's own Rcut/Asmth explicitly below, so it does not inherit periodic constants.
     opt.setOption("zoom-treepm-force-test");
 #endif
-#endif
-#ifdef USE_OPENGL
-    opt.setOption( "fullscreen");
-    opt.setOption( "Tglow");
-    opt.setOption( "dTglow");
-    opt.setFlag("displayfps");
-    opt.setFlag("stereo");
 #endif
 
     opt.processCommandArgs( argc, argv );
@@ -980,6 +915,10 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     // Record the configuration BEFORE the parameter file is read, so a run that is then refused
     // still leaves behind what it was built as -- which is usually the thing you need to know.
     gadget_hip_report_configuration();
+    // T78: which allocator the pinned host buffers used. It moves measured step time by a
+    // few percent, so a timing run has to state which one it was. Printed here rather than
+    // inside the banner because that function is defined before my_cuda_rt.h is included.
+    fprintf(stderr, "[BUILD] host buffer allocator: %s\n", my_dev::host_alloc_name());
 
     // Phase 5 ticket 01 (PLAN.md): --param is additive, parsed here (after every CLI value above
     // is already extracted, before anything downstream consumes theta/errTolForceAcc/boxSize/
@@ -1169,17 +1108,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     assert(argVal != NULL);
     const int procId = atoi(argVal);
     //    fprintf(stderr, " taskVar= %s , value= %d\n", taskVar.c_str(), procId);
-    #ifdef GALACTICS
-        tStartModel = get_time_main();
-        //Use 32768*7 for nProcs to create independent seeds for all processes we use
-        //do not scale until we know the number of processors
-        generateGalacticsModel(procId, 32768*7, galSeed, nMilkyWay, nMWfork,
-                               false, bodyPositions, bodyVelocities,
-                               bodyIDs);
-        tEndModel   = get_time_main();
-    #else
         assert(0);
-    #endif
   }
 
   /*********************************/
@@ -1193,11 +1122,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   /* End overrule */
 
 
-#ifdef USE_OPENGL
-  // create OpenGL context first, and register for interop
-  initGL(argc, argv, fullScreenMode.c_str(), stereo);
-//  cudaGLSetGLDevice(devID); //TODO should this not be renderDev?
-#endif
 
   initTimers();
 
@@ -1228,33 +1152,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   int procId         = -1;
   int nProcs         = -1;
   
-#ifdef USE_MPI  
-      MPI_Initialized(&mpiInitialized);
-      MPI_Comm mpiCommWorld = MPI_COMM_WORLD;
-      if (!mpiInitialized)
-      {
-        #ifdef _MPIMT
-            int provided;
-            MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-            assert(MPI_THREAD_MULTIPLE == provided);
-        #else
-            MPI_Init(&argc, &argv);
-        #endif
-        shrMemPID = 0;
-      }
-      else
-      {
-        //MPI environment initialized by the driver program
-        mpiCommWorld = comm;
-      }
-
-      MPI_Comm_size(mpiCommWorld, &nProcs);
-      MPI_Comm_rank(mpiCommWorld, &procId);
-#else
     MPI_Comm mpiCommWorld = 0;
     procId                = 0;
     nProcs                = 1;
-#endif
 #if ENABLE_LOG
   PREPEND_RANK_PROCID = procId;
   PREPEND_RANK_NPROCS = nProcs;
@@ -1281,9 +1181,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
         "merely slow.\n"
         "Run on a single rank (no mpirun, or `mpirun -np 1`).\n\n", nProcs);
       fflush(stderr);
-#ifdef USE_MPI
-      MPI_Abort(MPI_COMM_WORLD, 1);
-#endif
       return 1;
     }
 
@@ -1679,80 +1576,10 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     cerr << "[INIT]\tdTglow = " << dTstartGlow << endl;
     cerr << "[INIT]\tstereo = " << stereo << endl;
 #endif
-#ifdef USE_MPI                
-    cerr << "[INIT]\tCode is built WITH MPI Support \n";
-#else
     cerr << "[INIT]\tCode is built WITHOUT MPI Support \n";
-#endif
   }
   assert(quickRatio > 0 && quickRatio <= 1);
 
-#ifdef USE_MPI
-
-  //Used on Titan and Piz Daint
-  #if 1
-    omp_set_num_threads(16);
-  #pragma omp parallel
-    {
-      int tid = omp_get_thread_num();
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      pthread_getaffinity_np(pthread_self()  , sizeof( cpu_set_t ), &cpuset );
-
-      int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-
-      int i, set=-1;
-      for (i = 0; i < CPU_SETSIZE; i++)
-        if (CPU_ISSET(i, &cpuset))
-          set = i;
-      //    fprintf(stderr,"[Proc: %d ] Thread %d bound to: %d Total cores: %d\n",
-      //        procId, tid,  set, num_cores);
-    }
-  #endif
-
-
-  #if 0
-    omp_set_num_threads(4);
-    //default
-    // int cpulist[] = {0,1,2,3,8,9,10,11};
-    int cpulist[] = {0,1,2,3, 8,9,10,11, 4,5,6,7, 12,13,14,15}; //HA-PACS
-    //int cpulist[] = {0,1,2,3,4,5,6,7};
-    //int cpulist[] = {0,2,4,6, 8,10,12,14};
-    //int cpulist[] = {1,3,5,7, 9,11,13,15};
-    //int cpulist[] = {1,9,5,11, 3,7,13,15};
-    //int cpulist[] = {1,15,3,13, 2,4,6,8};
-    //int cpulist[] = {1,1,1,1, 1,1,1,1};
-
-
-  #pragma omp parallel
-    {
-      int tid = omp_get_thread_num();
-      //int core_id = procId*4+tid;
-      int core_id = (procId%4)*4+tid;
-      core_id     = cpulist[core_id];
-
-      int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(core_id, &cpuset);
-      pthread_t current_thread = pthread_self();
-      int return_val = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-
-      CPU_ZERO(&cpuset);
-      pthread_getaffinity_np(pthread_self()  , sizeof( cpu_set_t ), &cpuset );
-
-      int i, set=-1;
-      for (i = 0; i < CPU_SETSIZE; i++)
-        if (CPU_ISSET(i, &cpuset))
-          set = i;
-      //printf("CPU2: CPU %d\n", i);
-
-      fprintf(stderr,"Binding thread: %d of rank: %d to cpu: %d CHECK: %d Total cores: %d\n",
-          tid, procId, core_id, set, num_cores);
-    }
-  #endif
-#endif
 
 
 
@@ -1760,24 +1587,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 
   if (!bonsaiFileName.empty() && useMPIIO)
   {
-#ifdef USE_MPI        
-    //Read a BonsaiIO file
-    const MPI_Comm &comm = mpiCommWorld;
-    float tCurrent = 0;
-    tree->lReadBonsaiFile(
-        bodyPositions, 
-        bodyVelocities,
-        bodyIDs,
-        tCurrent,
-        bonsaiFileName,
-        procId, nProcs, comm,
-        restartSim,
-        reduce_bodies_factor);
-    tree->set_t_current(tCurrent);
-    if (snapshotIter > 0) tree->set_nextSnapTime(tCurrent + snapshotIter);
-#else
     fprintf(stderr,"Usage of these options requires to code to be built with MPI support!\n"); exit(0);
-#endif      
   }
   else if (haveGadgetIC)
   {
@@ -1817,23 +1627,51 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     for (size_t i = 0; i < n; ++i)
       bodyPositions[i] = make_float4(snapData.pos[3 * i + 0], snapData.pos[3 * i + 1],
                                       snapData.pos[3 * i + 2], snapData.mass[i]);
+    // The matching FREE for the ALLOC recorded in gadget_snapshot.cpp. Taken before the
+    // swap, while the capacity is still readable.
+    if (memlog::on())
+      memlog::record("FREE", "ic_staging_pos",
+                     (long long) (snapData.pos.capacity() * sizeof(float)),
+                     "std::vector", 0, 0u, __FILE__, __LINE__);
     std::vector<float>().swap(snapData.pos);
+    // The matching FREE for the ALLOC recorded in gadget_snapshot.cpp. Taken before the
+    // swap, while the capacity is still readable.
+    if (memlog::on())
+      memlog::record("FREE", "ic_staging_mass",
+                     (long long) (snapData.mass.capacity() * sizeof(float)),
+                     "std::vector", 0, 0u, __FILE__, __LINE__);
     std::vector<float>().swap(snapData.mass);
 
     bodyVelocities.resize(n);
     for (size_t i = 0; i < n; ++i)
       bodyVelocities[i] = make_float4(snapData.vel[3 * i + 0], snapData.vel[3 * i + 1],
                                        snapData.vel[3 * i + 2], 0.0f);
+    // The matching FREE for the ALLOC recorded in gadget_snapshot.cpp. Taken before the
+    // swap, while the capacity is still readable.
+    if (memlog::on())
+      memlog::record("FREE", "ic_staging_vel",
+                     (long long) (snapData.vel.capacity() * sizeof(float)),
+                     "std::vector", 0, 0u, __FILE__, __LINE__);
     std::vector<float>().swap(snapData.vel);
 
     bodyIDs.resize(n);
     for (size_t i = 0; i < n; ++i) bodyIDs[i] = snapData.id[i];
+    // The matching FREE for the ALLOC recorded in gadget_snapshot.cpp. Taken before the
+    // swap, while the capacity is still readable.
+    if (memlog::on())
+      memlog::record("FREE", "ic_staging_id",
+                     (long long) (snapData.id.capacity() * sizeof(uint64_t)),
+                     "std::vector", 0, 0u, __FILE__, __LINE__);
     std::vector<uint64_t>().swap(snapData.id);
 
     // Phase 5 ticket 03 (PLAN.md): captured here, applied to tree->localTree.bodies_type once it
     // exists (right after allocateParticleMemory(), further below) -- per-type softening is the
     // first real consumer of snapData.type; tickets 06/07's zoom work will read it too.
     // Moved, not copied: snapData is dead from here on.
+    if (memlog::on())
+      memlog::record("FREE", "ic_staging_type",
+                     (long long) (snapData.type.capacity() * sizeof(snapData.type[0])),
+                     "std::vector", 0, 0u, __FILE__, __LINE__);
     bodyTypes = std::move(snapData.type);
 
 #ifdef GADGET_HIP_HIGHRES
@@ -1942,40 +1780,23 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
       tree->initTimeline(gadgetParams.TimeBegin, gadgetParams.TimeMax,
                          gadgetParams.ComovingIntegrationOn);
   }
-  else if ((nPlummer == -1 && nSphere == -1  && nCube == -1 && !diskmode && nMilkyWay == -1 && !haveGadgetIC) || restartSim)
+  else if (nPlummer == -1 && nSphere == -1 && nCube == -1 && !diskmode && nMilkyWay == -1 &&
+           !haveGadgetIC)
   {
-    float sTime = 0;
-    tree->fileIO->readFile(mpiCommWorld, bodyPositions, bodyVelocities, bodyIDs, fileName,
-                           procId, nProcs, sTime, reduce_bodies_factor, restartSim);
-    tree->set_t_current((float) sTime);
-    #if USE_MPI
-        float tCurrent = tree->get_t_current();
-        MPI_Bcast(&tCurrent, 1, MPI_FLOAT, 0,mpiCommWorld);
-        tree->set_t_current(tCurrent);
-    #endif
-    if (snapshotIter > 0) tree->set_nextSnapTime(tree->get_t_current() + snapshotIter);
+    // There is no input. This used to fall through to a Tipsy-format reader, which has been
+    // removed along with the rest of the Bonsai-era I/O; a GADGET-2 initial-conditions file via
+    // --param, or one of the built-in generators, is now the only way to start a run.
+    fprintf(stderr,
+      "\nFATAL: no initial conditions given.\n"
+      "  Use --param <file> with InitCondFile pointing at a GADGET-2 snapshot, or one of the\n"
+      "  built-in generators (--plummer/--sphere/--cube/--diskmode) for a run without an IC file.\n"
+      "  Note: -i/--infile no longer reads initial conditions -- the Tipsy reader it fed has been\n"
+      "  removed. The flag survives only to name the input file for --diskmode.\n");
+    ::exit(1);
   }
   else if(nMilkyWay >= 0)
   {
-    #ifdef GALACTICS
-        if (taskVar.empty())
-        {
-          tStartModel   = get_time_main();
-
-          generateGalacticsModel(procId, nProcs, galSeed, nMilkyWay, nMWfork,
-                                 true, bodyPositions, bodyVelocities, bodyIDs);
-          tEndModel   = get_time_main();
-        }
-        else
-        {
-          //Scale mass of previously generated model
-          const int ntot = bodyPositions.size();
-          for (int i= 0; i < ntot; i++)
-            bodyPositions[i].w *= 1.0/(double)nProcs;
-        }
-    #else
           assert(0);
-    #endif
   }
   else if(nPlummer >= 0)
   {
@@ -1996,7 +1817,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   else
     assert(0);
 
-  tree->mpiSync();
 
 #if defined(PMGRID) && !defined(PERIODIC)
   // Isolated TreePM's own required convention (pm.h's PMIsolatedSolver doc comment, LOG.md §34):
@@ -2033,7 +1853,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   //Sanity check
   double mass = 0;
   for(unsigned int i=0; i < bodyPositions.size(); i++) { mass += bodyPositions[i].w; }
-  double totalMass = tree->SumOnRootRank(mass);
+  double totalMass = mass;   // single process: the sum over ranks is the local sum
 
   tree->mpiSumParticleCount((int)bodyPositions.size());
 
@@ -3278,18 +3098,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 #endif // GADGET_HIP_HIGHRES
 #endif // PMGRID
 
-  #ifdef USE_MPI
-    omp_set_num_threads(4); //Startup the OMP threads to be used during LET phase
-  #endif
 
 
   //Start the integration
-#ifdef USE_OPENGL
-  octree::IterationData idata;
-  initAppRenderer(argc, argv, tree, idata, displayFPS, stereo);
-  LOG("Finished!!! Took in total: %lg sec\n", tree->get_time()-t0);
-#else
-  tree->mpiSync();
   if (procId==0) fprintf(stderr, " Start iterating\n");
 
 
@@ -3298,7 +3109,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 
   //Uncomment this to have a monitor thread that can kill the 
   //program when no activity is detected
-  //std::thread watcher(watchThread, tree);
   //watcher.detach();
 
 
@@ -3349,10 +3159,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
 //              sprintf(&fileName[0], "%s_%010.4f", snapshotFile.c_str(), t_current);
           }
 
-          tree->fileIO->writeFile(ioSharedData.Pos, ioSharedData.Vel,
-                                  ioSharedData.IDs, ioSharedData.nBodies,
-                                  fileName.c_str(), t_current,
-                                  procId, nProcs, mpiCommWorld, distributed) ;
 
           ioSharedData.free();
           assert(ioSharedData.writingFinished == false);
@@ -3392,14 +3198,9 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   delete tree;
   tree = NULL;
 
-#endif
 
   displayTimers();
 
-#ifdef USE_MPI
-  //Finalize MPI if we initialized it ourselves, otherwise the driver will do it.
-  if (!mpiInitialized) MPI_Finalize();
-#endif
   return 0;
 }
 
@@ -3415,10 +3216,6 @@ int main(int argc, char *argv[])
   // check one feature while appearing to check two. Line buffering costs a flush per line on a
   // stream that already carries one line per step, and makes the log mean what it looks like.
   setvbuf(stdout, NULL, _IOLBF, 0);
-#ifdef USE_MPI
-  return bonsai_main(argc, argv, MPI_COMM_WORLD, 0);
-#else
   // Matches the !USE_MPI branch inside bonsai_main, which already sets mpiCommWorld = 0.
   return bonsai_main(argc, argv, 0, 0);
-#endif
 }

@@ -1,6 +1,7 @@
 #include "hip/hip_runtime.h"
 #include "gadget_index_spaces.h"   // CurrentOrder / OriginalOrder (T44 item 1)
 #include "octree.h"
+#include "memlog.h"
 
 
 
@@ -9,7 +10,7 @@ void octree::compute_properties(tree_structure &tree) {
     Assign the memory buffers, note that we check the size first
     and if needed we increase the size of the generalBuffer1
     Size required:
-      - multipoleD -> double4*3_n_nodes -> 6*n_nodes*uint4 
+      - multipoleD -> double4*n_nodes -> 2*n_nodes*uint4 
       - lower/upperbounds ->               2*n_nodes*uint4
       - node lower/upper  ->               2*n_nodes*uint4
       - SUM: 10*n_nodes*uint4 
@@ -37,6 +38,7 @@ void octree::compute_properties(tree_structure &tree) {
     // distribution-dependent -- measured 0.143 for a 512^3 IC at z=100 but 0.354 for a uniform
     // random cube, where the 5.010 GiB arena was observed being replaced by a 5.280 GiB one. A run
     // that fits at z=100 can therefore die later as clustering changes the node count.
+    DMTAG(tree.generalBuffer1);
     tree.generalBuffer1.cresize_nocpy((size_t)10 * (size_t)tree.n_nodes * 4, false);
   }
   
@@ -44,7 +46,7 @@ void octree::compute_properties(tree_structure &tree) {
   my_dev::dev_mem<real4>   nodeLowerBounds; //Lower bounds used for computing box sizes
   my_dev::dev_mem<real4>   nodeUpperBounds; //Upper bounds used for computing box sizes
   
-  size_t memBufOffset = multipoleD.cmalloc_copy  (tree.generalBuffer1, (size_t)3*tree.n_nodes, 0);  // T72: size_t
+  size_t memBufOffset = multipoleD.cmalloc_copy  (tree.generalBuffer1, (size_t)tree.n_nodes, 0);  // T72: size_t; one double4/node since the quadrupole went
       memBufOffset = nodeLowerBounds.cmalloc_copy(tree.generalBuffer1,   tree.n_nodes, memBufOffset);
       memBufOffset = nodeUpperBounds.cmalloc_copy(tree.generalBuffer1,   tree.n_nodes, memBufOffset);
 
@@ -156,7 +158,7 @@ void octree::compute_properties(tree_structure &tree) {
 if(iter == 20)
 {
    char fileName[256];
-    sprintf(fileName, "groups-%d.bin", mpiGetRank());
+    sprintf(fileName, "groups-0.bin");
     ofstream nodeFile;
     nodeFile.open(fileName, ios::out | ios::binary);
     if(nodeFile.is_open())
@@ -180,7 +182,7 @@ if(iter == 20)
   tree.bodies_Ppos.d2h();
 
     char fileName[256];
-    sprintf(fileName, "fullTreeStructure-%d.bin", mpiGetRank());
+    sprintf(fileName, "fullTreeStructure-0.bin");
     ofstream nodeFile;
     //nodeFile.open(nodeFileName.c_str());
     nodeFile.open(fileName, ios::out | ios::binary);
@@ -203,9 +205,8 @@ if(iter == 20)
 
       for(int i=0; i < tree.n_nodes; i++)
       {
-        nodeFile.write((char*)&tree.multipole[3*i+0], sizeof(real4));
-        nodeFile.write((char*)&tree.multipole[3*i+1], sizeof(real4));
-        nodeFile.write((char*)&tree.multipole[3*i+2], sizeof(real4));;
+        // One real4 per node since T78 item 4. Writing a fixed 3, as this did, read past the end.
+        nodeFile.write((char*)&tree.multipole[i], sizeof(real4));
       }
 
       for(int i=0; i < tree.n_nodes; i++)

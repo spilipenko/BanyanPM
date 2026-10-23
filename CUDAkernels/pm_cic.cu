@@ -3,6 +3,7 @@
 #include "gadget_units.h"
 #include "gadget_index_spaces.h"   // CurrentOrder / IdSpace (T44 item 1)   // GFreeAcc: PM output carries no G until someone applies it
 #include <cstdlib>
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 // Flattened index into the padded density grid (row-major x,y,z with z the fastest/padded axis).
 __device__ __forceinline__ int pm_grid_index(int x, int y, int z, int gridSize, int gridPitch)

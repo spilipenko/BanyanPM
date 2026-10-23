@@ -135,25 +135,14 @@ void traceY_read(double &approxY, double &directY, int &approxN, int &directN)
 
 // Gadget-2 is monopole-only by deliberate design, not simplification (GADGET2_NOTES.md: avoids a
 // time-asymmetry/secular-integration-error problem under dynamic tree updates between rebuilds).
-// This was Bonsai's own inherited default (hardcoded `#if 1` here, not a build flag at all) --
-// found 2026-08-28 while auditing this file for periodic-tree work, and left ON, unnoticed,
-// through all of Phase 3's validation (Springel MAC, N^2 comparisons, NCRIT experiments all ran
-// with quadrupole active). Default flipped OFF per explicit user decision ("we will not use
-// quadrupole") -- kept available via -DGADGET_HIP_QUADRUPOLE=ON for anyone wanting to experiment
-// with it later, matching this project's own convention of keeping prior defaults reachable
-// (e.g. NCRIT=64 via build-ncrit64/) rather than deleting the code path.
-#ifdef GADGET_HIP_QUADRUPOLE
-#define _QUADRUPOLE_
-#endif
+// Gadget-2 is monopole-only, and so is this port. Bonsai's inherited quadrupole path was
+// hardcoded on (`#if 1`, not even a build flag), was left on unnoticed through all of
+// Phase 3's validation, was then put behind GADGET_HIP_QUADRUPOLE and defaulted off, and
+// is now removed outright at the user's instruction ("I don't need it at all"). It had
+// also stopped compiling: its approxAcc overload still took 7 arguments after T28 gave
+// the monopole one an eighth (nodeSoftInfo), so -DGADGET_HIP_QUADRUPOLE=ON had been
+// broken since then and nothing noticed -- the second-copy-of-a-kernel failure again.
 
-#if defined(PMGRID) && defined(_QUADRUPOLE_)
-#error "GADGET_HIP_PMGRID + GADGET_HIP_QUADRUPOLE together is not implemented: Gadget-2 has no \
-quadrupole moments to reference for how its TreePM short-range erfc suppression (shortrange_table) \
-should apply to a quadrupole force term, and periodic minimum-image wrapping has NOT been added to \
-the quadrupole add_acc() below -- silently building this combination would give wrong (unsuppressed, \
-non-minimum-image) forces without any error. Build without one of the two flags, or implement \
-this combination deliberately (derive the quadrupole short-range split) before removing this guard."
-#endif
 
 // Phase 4 (PLAN.md): TreePM short-range/long-range split, matching Gadget-2's own
 // force_treeevaluate_shortrange exactly (forcetree.c:1420-1729, GADGET2_NOTES.md). **Gated behind
@@ -899,120 +888,11 @@ static __device__ __forceinline__ void directAcc(
 }
 
 
-#ifdef _QUADRUPOLE_
-
-static __device__ __forceinline__ float4 add_acc(
-    float4 acc,
-    const float4 pos,
-    const float mass, const float3 com,
-    const float4 Q0,  const float4 Q1, float eps2,
-    float2 &density)
-{
-#if 1
-  const float3 dr = make_float3(pos.x - com.x, pos.y - com.y, pos.z - com.z);
-  const float  r2 = dr.x*dr.x + dr.y*dr.y + dr.z*dr.z + eps2;
-
-  const float rinv  = rsqrtf(r2);
-  const float rinv2 = rinv *rinv;
-  const float mrinv  =  mass*rinv;
-  const float mrinv3 = rinv2*mrinv;
-  const float mrinv5 = rinv2*mrinv3;
-  const float mrinv7 = rinv2*mrinv5;   // 16
-
-  float  D0  =  mrinv;
-  float  D1  = -mrinv3;
-  float  D2  =  mrinv5*(  3.0f);
-  float  D3  =  mrinv7*(-15.0f); // 3
-
-  const float q11 = Q0.x;
-  const float q22 = Q0.y;
-  const float q33 = Q0.z;
-  const float q12 = Q1.x;
-  const float q13 = Q1.y;
-  const float q23 = Q1.z;
-
-  const float  q  = q11 + q22 + q33;
-  const float3 qR = make_float3(
-      q11*dr.x + q12*dr.y + q13*dr.z,
-      q12*dr.x + q22*dr.y + q23*dr.z,
-      q13*dr.x + q23*dr.y + q33*dr.z);
-  const float qRR = qR.x*dr.x + qR.y*dr.y + qR.z*dr.z;  // 22
-
-  acc.w  -= D0 + 0.5f*(D1*q + D2*qRR);
-  float C = D1 + 0.5f*(D2*q + D3*qRR);
-  acc.x  += C*dr.x + D2*qR.x;
-  acc.y  += C*dr.y + D2*qR.y;
-  acc.z  += C*dr.z + D2*qR.z;               // 23
-
-// total: 16 + 3 + 22 + 23 = 64 flops
-
-  return acc;
-#endif
-}
-
-// Phase 5 ticket 03 (PLAN.md): quadrupole node interactions keep their OWN pre-existing flat
-// squared-softening ("eps2") behavior unchanged internally -- deliberately NOT re-derived for
-// Gadget-2's spline kernel. Gadget-2 itself has no quadrupole option at all (monopole-only by
-// design, GADGET2_NOTES.md), the user has separately decided against using this port's own
-// optional quadrupole correction, and re-deriving a quadrupole force/potential expansion around a
-// spline-softened (rather than Plummer-softened) kernel is a nontrivial physics derivation with
-// no reference to check it against -- out of scope here, same "no Gadget-2 reference for this
-// combination" reasoning already applied elsewhere in this project (e.g. PERIODIC+QUADRUPOLE
-// refused at configure time). This overload still takes `h_i[NI]` (not a scalar) purely so its
-// call site in approximate_gravity() below stays uniform between the quadrupole and
-// non-quadrupole builds -- it locally squares the target's own resolved h back into an `eps2`
-// before calling the unchanged quadrupole add_acc() above, i.e. target-only Plummer softening at
-// the node level, matching this same file's own non-quadrupole approxAcc() below in spirit
-// (target-only, no per-node "type" to combine with).
-// `type_i[NI]` is unused here (kept only so this overload's call site in approximate_gravity()
-// stays uniform between quadrupole and non-quadrupole builds, exactly like `h_i[NI]`'s own
-// existing doc comment above explains) -- the quadrupole add_acc() has no PMGRID/erfc suppression
-// at all (PMGRID+QUADRUPOLE is refused at compile time), so there is no Rcut/Asmth selection to
-// make here.
-template<int NI, bool FULL>
-static __device__ __forceinline__ void approxAcc(
-    float4 acc_i[NI],
-    const float4 pos_i[NI],
-    float2 dens_i[NI],
-    const int cellIdx,
-    const float h_i[NI],
-    const int type_i[NI],
-    const real4 *multipole_data)
-{
-  (void) type_i;
-  const int cellAddr = cellIdx + cellIdx + cellIdx;
-  float4 M0, Q0, Q1;
-  if (FULL || cellIdx >= 0)
-  {
-    M0 = multipole_data[cellAddr];
-    Q0 = multipole_data[cellAddr + 1];
-    Q1 = multipole_data[cellAddr + 2];
-  }
-  else
-    M0 = Q0 = Q1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-
-  for (int j = 0; j < WARP_SIZE; j++)
-  {
-    const float4 jM0 = make_float4(__shfl_sync(FULL_MASK, M0.x, j), __shfl_sync(FULL_MASK, M0.y, j),
-                                   __shfl_sync(FULL_MASK, M0.z, j), __shfl_sync(FULL_MASK, M0.w,j));
-    const float4 jQ0 = make_float4(__shfl_sync(FULL_MASK, Q0.x, j), __shfl_sync(FULL_MASK, Q0.y, j),
-                                   __shfl_sync(FULL_MASK, Q0.z, j), 0.0f);
-    const float4 jQ1 = make_float4(__shfl_sync(FULL_MASK, Q1.x, j), __shfl_sync(FULL_MASK, Q1.y, j),
-                                   __shfl_sync(FULL_MASK, Q1.z, j), 0.0f);
-    const float  jmass = jM0.w;
-    const float3 jpos  = make_float3(jM0.x, jM0.y, jM0.z);
-#pragma unroll
-      for (int k = 0; k < NI; k++)
-        acc_i[k] = add_acc(acc_i[k], pos_i[k], jmass, jpos, jQ0, jQ1, h_i[k]*h_i[k], dens_i[k]);
-
-  }
-}
-
-#else
 
 // Monopole-only counterpart of the above -- found missing entirely 2026-08-28 when
-// GADGET_HIP_QUADRUPOLE was added and defaulted OFF: Bonsai's inherited kernel had no
-// approxAcc() at all for the non-quadrupole case, meaning `_QUADRUPOLE_` was never actually an
+// This monopole approxAcc() was added when the quadrupole default was flipped off: Bonsai's
+// inherited kernel had no approxAcc() for the non-quadrupole case at all, meaning the old guard
+// was never actually an
 // optional toggle in practice despite looking like one (the `#if 1` compiled it unconditionally,
 // so this gap was never exercised). Reuses the monopole add_acc() already defined above (the same
 // one directAcc() uses for leaf particles), reading only mass+COM (M0) from multipole_data and
@@ -1038,7 +918,7 @@ static __device__ __forceinline__ void approxAcc(
     const real4 *multipole_data,
     const float *nodeSoftInfo)     // T28/C-C-08 (nullptr when UNEQUALSOFTENINGS is off)
 {
-  const int cellAddr = cellIdx + cellIdx + cellIdx;
+  const int cellAddr = cellIdx;   // T78 item 4: one real4 per node; was a literal x3
   float4 M0;
   if (FULL || cellIdx >= 0)
     M0 = multipole_data[cellAddr];
@@ -1091,12 +971,11 @@ static __device__ __forceinline__ void approxAcc(
   }
 }
 
-#endif
 
 // Ticket 20 (tickets/T20-test-summation-order-sensitivity.md): test-only, opt-in double-precision
 // force accumulator. Exact duplicates of add_acc()/directAcc()/approxAcc() (the monopole,
 // non-quadrupole variants above -- the only ones this ticket's build compiles,
-// GADGET_HIP_QUADRUPOLE stays OFF), with ONLY the accumulator's type changed from float4 to
+// the monopole path), with ONLY the accumulator's type changed from float4 to
 // double4. Per-interaction terms (r, r2, u, mrinv, mrinv3, wp...) are still computed in float32
 // exactly as in the original -- this deliberately isolates precision/order-of-summation of the
 // RUNNING TOTAL, matching this ticket's method (test double-precision ACCUMULATION, not a
@@ -1219,7 +1098,7 @@ static __device__ __forceinline__ void approxAcc_d(
     const int type_i[NI],
     const real4 *multipole_data)
 {
-  const int cellAddr = cellIdx + cellIdx + cellIdx;
+  const int cellAddr = cellIdx;   // T78 item 4: one real4 per node; was a literal x3
   float4 M0;
   if (FULL || cellIdx >= 0)
     M0 = multipole_data[cellAddr];
@@ -1798,7 +1677,8 @@ uint2 approximate_gravity(
     const float4 cellSize = boxSizeInfo[cellIdx*useCell];
     const float4 cellPos  = boxCenterInfo[cellIdx*useCell];
 #if 1
-    const float4 cellCOM = multipole_data[useCell*(cellIdx+cellIdx+cellIdx)];
+    // T78 item 4: one real4 per node, so the stride is 1. This was a hand-written x3.
+    const float4 cellCOM = multipole_data[useCell*cellIdx];
 
     /* check if cell opening condition is satisfied */
 // T31 BISECT: -DGADGET_HIP_T31_BISECT compiles the _MAC_SPRINGEL_ build with this block replaced

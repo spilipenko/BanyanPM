@@ -45,7 +45,6 @@
 #include <sys/types.h>
 #include "logFileWriter.h"
 #include "SharedMemory.h"
-#include "tipsyIO.h"
 #include "log.h"
 #include "FileIO.h"
 
@@ -163,20 +162,31 @@ public:
     {
     	if(n_bodies <= 0) n_bodies = n;
 		//Particle properties
+		DMTAG(pos);
 		pos.cmalloc(n_bodies+1, true);   //+1 to set end pos, host mapped? TODO mapped not needed right since we use Ppos?
+		DMTAG(vel);
 		vel.cmalloc(n_bodies,   false);
+		DMTAG(key);
 		key.cmalloc(n_bodies+1, false);  //+1 to set end key
+		DMTAG(ids);
 		ids.cmalloc(n_bodies+1, false);  //+1 to set end key
 
+		DMTAG(Ppos);
 		Ppos.cmalloc(n_bodies+1, true);  //Memory to store predicted positions, host mapped
+		DMTAG(Pvel);
 		Pvel.cmalloc(n_bodies+1, true);  //Memory to store predicted velocities, host mapped
 
 
+		DMTAG(acc0);
 		acc0.ccalloc(n_bodies, false);   //ccalloc -> init to 0
+		DMTAG(acc1);
 		acc1.ccalloc(n_bodies, false);   //ccalloc -> init to 0
+		DMTAG(time);
 		time.ccalloc(n_bodies, false);   //ccalloc -> init to 0
 
+		DMTAG(h);
 		h.cmalloc   (n_bodies, true);
+		DMTAG(dens);
 		dens.cmalloc(n_bodies, true);
 
 		//Initialize to -1
@@ -188,20 +198,31 @@ public:
     {
     	if(n_bodies <= 0) n_bodies = n;
 		//Particle properties
+		DMTAG(pos);
 		pos.cresize(n_bodies+1, true);   //+1 to set end pos, host mapped? TODO not needed right since we use Ppos
+		DMTAG(vel);
 		vel.cresize(n_bodies, false);
+		DMTAG(key);
 		key.cresize(n_bodies+1, false);  //+1 to set end key
+		DMTAG(ids);
 		ids.cresize(n_bodies+1, false);  //+1 to set end key
 
+		DMTAG(Ppos);
 		Ppos.cresize(n_bodies+1, true);  //Memory to store predicted positions, host mapped
+		DMTAG(Pvel);
 		Pvel.cresize(n_bodies+1, true);  //Memory to store predicted velocities, host mapped
 
 
+		DMTAG(acc0);
 		acc0.cresize(n_bodies, false);   //ccalloc -> init to 0
+		DMTAG(acc1);
 		acc1.cresize(n_bodies, false);   //ccalloc -> init to 0
+		DMTAG(time);
 		time.cresize(n_bodies, false);   //ccalloc -> init to 0
 
+		DMTAG(h);
 		h.cresize   (n_bodies, true);
+		DMTAG(dens);
 		dens.cresize(n_bodies, true);
     }
 
@@ -404,7 +425,6 @@ protected:
   float         nextSnapTime;
   float         nextQuickDump;
 
-  float         statisticsIter;
   float         nextStatsTime;
   int 			rebuild_tree_rate;
 
@@ -604,7 +624,6 @@ public:
    tree_structure localTree;
    tree_structure remoteTree;
 
-   tipsyIO *fileIO;
 
    double get_time();
    void resetEnergy() {store_energy_flag = true;}
@@ -745,7 +764,13 @@ public:
   // `recomputeSoftening()` then rebuilds tree.bodies_type from the CURRENT (always correctly
   // reordered) tree.bodies_ids through this map every tree rebuild, before using it for anything.
   void   setGadgetTypeMap(const std::vector<ullong> &ids, const std::vector<int> &types);
+  // Built ONLY when the flat gadgetTypeById table cannot cover the IC (sparse or huge ids).
+  // On a dense-id IC this stays empty: at 512^3 it would be 32 B/particle of live host
+  // memory that nothing reads. See setGadgetTypeMap() and T78 item 5.
   std::unordered_map<ullong, int> gadgetIdToType;
+  // Whether the IC supplied per-particle types at all -- the question the code used to ask
+  // by testing gadgetIdToType.empty(), which forced the map to exist to answer it.
+  bool gadgetHaveTypeMap = false;
 
   // T35 performance: the (id -> type) association as a FLAT table indexed by particle id, plus its
   // device copy. Semantically identical to gadgetIdToType above -- same rule, same source -- but it
@@ -936,13 +961,6 @@ inline bool gadget_hip_stage_trace()
 
 
   //Utility
-  void      mpiSync();
-  int       mpiGetRank();
-  int       mpiGetNProcs();
-  void      AllSum(double &value);
-  int       SumOnRootRank(int value);
-  double    SumOnRootRank(double value);
-
   //Main MPI functions
 
   //Functions for domain division
@@ -1037,18 +1055,9 @@ inline bool gadget_hip_stage_trace()
 
 
   //Library interface functions  
-  void  setEps(float eps);
-  float getEps();
   void  setDt(float dt);
-  float getDt();
   void  setTheta(float theta);
-  float getTheta();
   void  setTEnd(float tEnd);
-  float getTEnd();
-  void  setTime(float);
-  float getTime();
-  float getPot();
-  float getKin();
 
   //End library functions
 
@@ -1152,7 +1161,6 @@ inline bool gadget_hip_stage_trace()
     mpiSetup();
 
 
-    statisticsIter = 0; //0=disabled, 1 = Every N-body unit, 2= every 2nd n-body unit, etc..
     nextStatsTime  = 0;
     nextSnapTime   = 0;
 
@@ -1209,7 +1217,6 @@ inline bool gadget_hip_stage_trace()
 #endif
 
 
-    fileIO = new tipsyIO();
 
 
 #ifdef WIN32
@@ -1224,7 +1231,6 @@ inline bool gadget_hip_stage_trace()
     delete[] curSysState;
 
     delete logFileWriter;
-    delete fileIO;
 
     if(globalGrpTreeCntSize) delete[] globalGrpTreeCntSize;
     if(globalGrpTreeCount)   delete[] globalGrpTreeCount;

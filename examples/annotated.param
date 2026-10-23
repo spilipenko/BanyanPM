@@ -382,12 +382,24 @@ SofteningBndryMaxPhys    0
 % docs/COMPILE_OPTIONS.md.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-% [HONOURED] Tree node storage, as a multiple of the particle count. 0.8 is ample for a
-% uniform cosmological box; a highly refined zoom region, or a build with a small leaf size,
-% can need several times that. If the arena runs out the run stops with a message naming the
-% node count it reached and this parameter. 0 selects the 0.8 default, and values below 0.05
-% are raised to 0.05. It can also be overridden at runtime (see docs/ENVIRONMENT.md), which is
-% the only way to set it for the built-in particle generators, which use no parameter file.
+% [HONOURED] Tree node storage, as a multiple of the particle count, and the one parameter-file
+% key that moves the memory footprint: it costs 20 bytes per particle per unit, so 0.8 is
+% 16 B/particle and 1.2 is 24.
+%
+% It must exceed the largest nodes-per-particle the run reaches. Measured over a full 512^3
+% cosmological run, that maximum is 0.253 -- it rises from about 0.157 at the initial conditions,
+% peaks near z = 0.9 and then flattens. A UNIFORM (unclustered) box is higher, about 0.32, which
+% is the case that actually binds: clustering fills leaves rather than splitting them, so the
+% early, smooth configuration is the demanding one, not z = 0.
+%
+% 0.8 therefore carries a 2.5x margin over the uniform case and is a safe default. 0.6 keeps
+% 1.9x and saves 4 B/particle. Below about 0.4 the margin is too thin to recommend. A highly
+% refined zoom region, or a build with a small leaf size, can need more than 0.8.
+%
+% If the node arrays run out the run stops with a message naming the node count it reached and
+% this parameter. 0 selects the 0.8 default, and values below 0.05 are raised to 0.05. It can
+% also be overridden at runtime (see docs/ENVIRONMENT.md), which is the only way to set it for
+% the built-in particle generators, which use no parameter file.
 TreeAllocFactor          0.8
 
 % [IGNORED] Particle storage slack. Particle arrays are sized from the actual count, with no

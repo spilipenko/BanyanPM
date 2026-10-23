@@ -188,6 +188,13 @@ inline int getTreeWalkBlocksPerSM(int devMajor, int devMinor)
 //
 #ifndef NCRIT
 #define NCRIT 32
+
+// T78 item 4: tree.multipole carries exactly ONE real4 per node -- the monopole, which is
+// all Gadget-2 defines and all this port's walk reads. It used to carry three, the extra
+// two holding a quadrupole that nothing consumed; the one value riding in Q0.w (maxEps)
+// was documented dead at compute_propertiesD.cu's own comment. 5.04 B/particle,
+// 0.63 GiB at 512^3.
+
 #endif
 #ifndef NTHREAD
 #define NTHREAD 128

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "pm_zoom.h"
+#include "memlog_wrap.h"   // LAST: redirects raw hipMalloc to the ledger
 
 // Phase 5 ticket 06 (PLAN.md): the fine ("grid 1") zoom PM solver. Mirrors
 // pm_solve_isolated.cpp's own PMIsolatedSolver create/compute structure almost exactly -- the
