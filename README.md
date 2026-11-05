@@ -169,7 +169,7 @@ allocator):
 | term | value | what it is |
 |---|---|---|
 | `C` | **5.010 GiB** + `2·2·(PMGRID/2+1)·PMGRID²·4 B` | the shared scratch arena, plus two FFT-padded PM meshes (1.004 GiB at `PMGRID=512`) |
-| `a` | **154 B/particle** | the per-particle arrays: positions, velocities, keys, ids, timebins, softening, type, the PM force scratch |
+| `a` | **150 B/particle** | the per-particle arrays: positions, velocities, keys, ids, timebins, softening, type, the PM force scratch |
 | `c` | **20 B/particle** per unit `TreeAllocFactor` | the node-build scratch, sized `TreeAllocFactor · Npart` by design, since nodes-per-particle grows as the box clusters |
 | `b` | **68 B/node** | multipole, bounding box size and centre, octree-cell centre and size |
 | `d` | **8 B/leaf** | the leaf indirection |
@@ -191,13 +191,13 @@ near `Nnodes ≈ 0.157·Npart` and clusters to `≈ 0.251·Npart` by z = 0, with
 | term | GiB |
 |---|---|
 | `C` — arena 5.010 + PM mesh 1.004 | 6.014 |
-| `Npart · (154 + 20·1.2)` = 178 B/particle | 22.250 |
+| `Npart · (150 + 20·1.2)` = 174 B/particle | 21.750 |
 | `Nnodes · 68` | 1.339 |
 | `Nleaves · 8` + `Ngroups · 72` | 0.424 |
-| **total** | **30.03 GiB = 240 B/particle** |
+| **total** | **29.53 GiB = 236 B/particle** |
 
-Which is what the ledger reports: **30.0269 GiB**. With aliasing disabled
-(`GADGET_HIP_UNIFIED_MEM=0`) the same run measures **49.52 GiB = 396 B/particle**, because the
+Which is what the ledger reports: **29.5269 GiB**. With aliasing disabled
+(`GADGET_HIP_UNIFIED_MEM=0`) the same run measures **49.02 GiB = 392 B/particle**, because the
 large host-visible arrays then exist as a host/device pair instead of once.
 
 ### Two controls worth knowing
@@ -232,7 +232,7 @@ value of **0.6** keeps a comfortable margin while costing 12 B/particle instead 
 ### What limits problem size
 
 Memory is no longer the binding constraint. At the hard particle ceiling of 2²⁸ the footprint is
-about **54 GiB**, so on a 128 GB machine the **index limit below is what caps the problem size**,
+about **53 GiB**, so on a 128 GB machine the **index limit below is what caps the problem size**,
 not RAM.
 
 ### The particle ceiling is 2²⁸ = 268,435,456, and the build enforces it
