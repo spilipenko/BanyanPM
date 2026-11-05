@@ -93,9 +93,8 @@ static const BufferSpec kBufferRegistry[] =
 
   // --- particle buffers NOT permuted: translate in Phase 2 ----------------------------------
   {"bodies_pos",            SPACE_ORIGINAL, EV_VERIFIED, "T12; rewritten at NEW idx by correct_particles"},
-  {"bodies_vel",            SPACE_ORIGINAL, EV_VERIFIED, "T12; rewritten at NEW idx by correct_particles"},
+  {"bodies_vel",            SPACE_CURRENT,  EV_VERIFIED, "T81: permuted by sort_bodies; correct_particles updates it in place"},
   {"bodies_acc0",           SPACE_ORIGINAL, EV_VERIFIED, "T23 Bug 2 -- computeGroupMaxAccel must translate"},
-  {"bodies_Pvel",           SPACE_ORIGINAL, EV_VERIFIED, "correct_particles reads pVel[unsortedIdx]"},
   {"bodies_time",           SPACE_ORIGINAL, EV_VERIFIED, "C-D-03b -- setActiveGroups must translate"},
   {"bodies_forceSoftening", SPACE_CURRENT,  EV_VERIFIED, "written AFTER the sort by recomputeSoftening (gpu_iterate.cpp:592); bodies_type is rebuilt from the resorted bodies_ids at :2120, so CURRENT order. T27 said ORIGINAL and was wrong; I copied that claim into this registry without checking it."},
   {"bodies_dens",           SPACE_CURRENT,  EV_VERIFIED, "DISABLED (BONSAI_DENSITY=0 in node_specs.h): allocated at 1 element. When on, written by the walk at `addr`, the same index it writes acc_out/active_inout with. Carries no gravity: softening comes from bodies_forceSoftening, not bodies_h"},

@@ -352,9 +352,8 @@ bool gadget_snapshot_write_streaming(const std::string &basePath, int snapFormat
         for (size_t k = 0; k < m; ++k)
         {
           const size_t i  = at(base + k);
-          const size_t vi = src.velPerm ? (size_t) src.velPerm[i] : i;
           for (int c = 0; c < 3; ++c)
-            bufF[3 * k + c] = (float) ((double) src.vel4[4 * vi + c] / velScale);
+            bufF[3 * k + c] = (float) ((double) src.vel4[4 * i + c] / velScale);
         }
         f.write(reinterpret_cast<const char *>(bufF.data()), (std::streamsize) (3 * m * sizeof(float)));
         if (!f) { error = "write failed (VEL)"; return false; }

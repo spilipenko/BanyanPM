@@ -1902,7 +1902,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     // clearest statement that they were always the same thing.
     tree->localTree.bodies_Ppos[i] = bodyPositions[i];
     tree->localTree.bodies_vel[i]  = bodyVelocities[i];
-    tree->localTree.bodies_Pvel[i] = bodyVelocities[i];
     tree->localTree.bodies_ids[i]  = bodyIDs[i];
     // Phase 2: GADGET-2 starts every particle at Ti_begstep == Ti_endstep == Ti_current
     // (timestep.c), which makes the first step's synchronisation trivially exact.
@@ -1912,7 +1911,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
   tree->localTree.bodies_time.h2d();
   tree->localTree.bodies_vel. h2d();
   tree->localTree.bodies_Ppos.h2d();
-  tree->localTree.bodies_Pvel.h2d();
   tree->localTree.bodies_ids. h2d();
 
   // T65 item 6: release the host IC staging now that every byte of it is on the device.

@@ -10,7 +10,8 @@
 //                  and bodies_h on its default per-step path; anything produced after the sort is
 //                  also in this space.
 //   OriginalOrder  NOT permuted by the per-step sort, so it must be reached through
-//                  oriParticleOrder: bodies_vel, bodies_Pvel, bodies_acc0, bodies_time.
+//                  oriParticleOrder: bodies_acc0, bodies_time. (bodies_vel left this list in
+//                  T81, which also removed bodies_Pvel.)
 //   IdSpace        indexed by the particle id. GravPM is stored here precisely so it survives the
 //                  re-sort between PM steps.
 //

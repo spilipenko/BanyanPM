@@ -97,7 +97,6 @@ void octree::compute_properties(tree_structure &tree) {
   //start the kernel for the leaf-type nodes
   propsLeafD.set_args(0, &tree.n_leafs, tree.leafNodeIdx.p(), tree.node_bodies.p(), tree.bodies_Ppos.p(),
                          multipoleD.p(), nodeLowerBounds.p(), nodeUpperBounds.p(),
-                         tree.bodies_Pvel.p(), //Velocity to get max eps
                          tree.bodies_ids.p(),  //Ids to distinguish DM and stars
                          tree.bodies_h.p(),    //Density search radius
                          &h_min,               //minimum size of search radius)

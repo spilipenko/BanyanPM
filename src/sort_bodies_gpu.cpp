@@ -221,6 +221,14 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
     realBuffer.  cmalloc_copy(tree.generalBuffer1, tree.n, 0);
 
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Ppos, real4Buffer1, true, true);
+    // T81: bodies_vel joined this list, which is what retired bodies_Pvel. With the velocity in
+    // CURRENT order, correct_particles reads and writes it at the same slot -- an in-place
+    // read-modify-write -- instead of reading a separate unpermuted snapshot at the old slot and
+    // writing the real array at the new one. gadget_pm_kick and the pre-kick energy sum likewise
+    // index it directly. Measured cost of this one line at 512^3: +47 ms/step of gather, against
+    // 16 B/particle (2.00 GiB) of buffer and 16 B/particle/step of predict writes removed. See
+    // tickets/T81; the shared scratch argument below applies unchanged.
+    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_vel,  real4Buffer1, true, true);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_ids,  ullBuffer,    true, true);
 #if BONSAI_DENSITY
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_h,    realBuffer,   true, true);          //Density values
@@ -254,7 +262,7 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
     //Acc1, Predicted position and velocity
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_acc1, real4Buffer1);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Ppos, real4Buffer1);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Pvel, real4Buffer1);
+    // bodies_Pvel was reordered here until T81 removed the buffer.
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_time, timeBuffer);
     dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_ids, ullBuffer);
 

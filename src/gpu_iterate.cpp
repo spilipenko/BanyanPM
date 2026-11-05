@@ -469,35 +469,22 @@ void octree::invariant_probe(tree_structure &tree, int iter)
   static const bool on = (getenv("GADGET_HIP_INVARIANTS") != NULL);
   if (!on) return;
 
-  // Buffer-duplication check (memory work, PLAN 4.1). Two candidates for removal:
-  //   bodies_Pvel -- predict_particles does `pVel[idx] = v` with NO transformation (Gadget-2 does
-  //     not predict DM velocities at all; its VelPred is gas-only, predict.c:56-65), so this
-  //     should be an exact copy of bodies_vel.
+  // Buffer-duplication check (memory work, PLAN 4.1). One candidate remains:
   //   bodies_pos  -- correct_particles commits `pos[idx] = pPos[idx]` on BOTH the active and the
   //     inactive branch, and since the T6/C-D-01 fix the drift anchor is the GLOBAL previous sync
   //     time rather than the particle's own Ti_begstep. That makes the pair algebraically an
   //     in-place drift (Gadget-2's move_particles), so pos should equal pPos at every step
-  //     boundary.
-  // Both claims are checked here rather than assumed -- this is the area that produced four
-  // index-space bugs, so "it looks redundant" is not sufficient grounds to delete 4 GB.
-  {
-    // Only the velocity pair is comparable HERE: bodies_vel and bodies_Pvel are both
-    // SPACE_ORIGINAL, so element-wise is valid. bodies_pos (ORIGINAL) against bodies_Ppos
-    // (CURRENT) is NOT -- after the sort those indices name different particles, and comparing
-    // them straight gives a meaningless "everything differs". That check lives at the top of the
-    // iteration instead (see dup_check_pos), before the sort, where the spaces coincide.
-    tree.bodies_vel.d2h();  tree.bodies_Pvel.d2h();
-    long long velDiff = 0;
-    double velMax = 0.0;
-    for (int i = 0; i < tree.n; i++)
-    {
-      const real4 v = tree.bodies_vel[i],  pv = tree.bodies_Pvel[i];
-      const double dv = std::max(std::max(fabs(v.x-pv.x), fabs(v.y-pv.y)), fabs(v.z-pv.z));
-      if (dv != 0.0) { velDiff++; velMax = std::max(velMax, dv); }
-    }
-    fprintf(stderr, "[INVARIANT] dup-check iter=%d  bodies_Pvel vs bodies_vel: %lld/%d differ "
-                    "(max %.3e)\n", iter, velDiff, tree.n, velMax);
-  }
+  //     boundary. Checked at the top of the iteration (see dup_check_pos), BEFORE the sort, where
+  //     the two spaces coincide -- comparing ORIGINAL against CURRENT after the sort would give a
+  //     meaningless "everything differs".
+  //
+  // The second candidate, bodies_Pvel, is gone: T81 removed the buffer. The check that lived here
+  // compared it element-wise against bodies_vel (valid because both were SPACE_ORIGINAL) and
+  // reported 0/262144 differing, max 0.000e+00, at every one of 21 iterations at 64^3 -- which is
+  // what licensed the removal. predict_particles wrote `pVel[idx] = v` with no transformation,
+  // because Gadget-2 does not predict DM velocity at all (VelPred is gas-only, predict.c:56-65),
+  // so the copy was always exact. It is recorded here rather than in the deleted code so the
+  // evidence outlives the buffer.
 
   tree.node_bodies.d2h();
   tree.leafNodeIdx.d2h();
@@ -773,7 +760,6 @@ static bool   s_gadgetTablesOk = false;
 static unsigned char *s_pmKickAudit = nullptr;   // validation rung 1; NULL unless audited
 static void  *s_nullDevPtr = nullptr;            // set_args dereferences its arguments
 static long   s_pmKickCount = 0;
-static int    s_pmKickNoPerm = 0;   // write-target A/B, see gadget_pm_kick                 // long-range kicks applied, for the banner
 
 void pmstale_reset(void);
 void pmstale_read(double *num, double *den);
@@ -2764,7 +2750,7 @@ void octree::predict(tree_structure &tree)
                     (char*)tree.name.get_devMem() + (long)tree.name.get_size()*(elemsize))
           BUG4_MAP(bodies_pos, 16); BUG4_MAP(bodies_key, 16); BUG4_MAP(bodies_vel, 16);
           BUG4_MAP(bodies_acc0, 16); BUG4_MAP(bodies_acc1, 16); BUG4_MAP(bodies_time, 8);
-          BUG4_MAP(bodies_ids, 8); BUG4_MAP(bodies_Ppos, 16); BUG4_MAP(bodies_Pvel, 16);
+          BUG4_MAP(bodies_ids, 8); BUG4_MAP(bodies_Ppos, 16);
           BUG4_MAP(bodies_h, 4); BUG4_MAP(bodies_dens, 8); BUG4_MAP(bodies_forceSoftening, 4);
           BUG4_MAP(bodies_typeDevice, 4); BUG4_MAP(oriParticleOrder, 4);
           BUG4_MAP(level_list, 8); BUG4_MAP(n_children, 4); BUG4_MAP(node_bodies, 16);
@@ -2895,11 +2881,17 @@ void octree::predict(tree_structure &tree)
   // Ti_begstep-anchored drift the un-drifted anchor position was load-bearing and this would have
   // been wrong.
   //
-  // NOTE bodies_Pvel is NOT removable the same way: correct_particles reads pVel[unsortedIdx] (a
-  // TRANSLATED index) while writing vel[idx], so a read-only snapshot is what keeps that race-free,
-  // and computeEnergyPreKick needs the pre-kick velocity after vel has been overwritten.
+  // bodies_Pvel was removed the same way, by T81, once the premise behind "NOT removable" was
+  // re-examined. The two reasons it recorded were: correct_particles reads pVel at a TRANSLATED
+  // index while writing vel[idx], so a read-only snapshot kept that race-free; and
+  // computeEnergyPreKick needs the pre-kick velocity after vel has been overwritten. The first
+  // dissolved by permuting bodies_vel in sort_bodies -- the two indices became the same slot. The
+  // second was never true in execution order: compute_energies(usePreKickState=true) is called
+  // BEFORE correct() in iterate_once, so bodies_vel still holds the pre-kick velocity when the
+  // energy sum reads it; the "after vel has been overwritten" referred to the PREVIOUS step's
+  // correct(), whose output is exactly the pre-kick velocity for this one.
     predictParticles.set_args(0, &tree.n, &t_current, &t_previous, tree.bodies_Ppos.p(), tree.bodies_vel.p(),
-                    tree.bodies_acc0.p(), tree.bodies_time.p(), tree.bodies_Ppos.p(), tree.bodies_Pvel.p(),
+                    tree.bodies_acc0.p(), tree.bodies_time.p(), tree.bodies_Ppos.p(),
                     &predictComovingFlag, gadgetDriftTable.p(), gadgetGravKickTable.p(),
                     &gadgetLogTimeBegin, &gadgetDPerTick, &Ti_previous, &gadgetLogTimeMax);
     predictParticles.setWork(tree.n, 128);
@@ -3329,9 +3321,9 @@ void octree::setGadgetParams(const GadgetParams &params)
 // own snapshot_000 are both exactly 0.
 //
 // preKick=true reads the same buffer pair the pre-kick energy diagnostic already uses:
-// bodies_Ppos (drifted to t_current, current sorted order) and bodies_Pvel (never resorted, so
-// reached through oriParticleOrder). This must be called BEFORE correct(), which resets
-// oriParticleOrder to identity and so destroys that translation.
+// bodies_Ppos (drifted to t_current) and bodies_vel, both in the current sorted order since T81.
+// This must still be called BEFORE correct(), because that is what makes the velocity pre-kick --
+// no longer because of any index translation.
 // Deliverable 1 of PLAN section 4.1: device-buffer inventory.
 //
 // The production target is 512^3 (1.34e8 particles) minimum and ideally ~3e8, in 128 GB shared.
@@ -3369,7 +3361,6 @@ void octree::reportDeviceMemory(const char *stage)
   MEMREP(bodies_time);
   MEMREP(bodies_ids);
   MEMREP(bodies_Ppos);
-  MEMREP(bodies_Pvel);
   MEMREP(bodies_h);
   MEMREP(bodies_dens);
   MEMREP(bodies_forceSoftening);
@@ -3515,12 +3506,6 @@ void octree::writeGadgetSnapshot(bool preKick)
 
   if (!haveGadgetParams) return;
 
-  if (preKick)
-  {
-    localTree.bodies_Ppos.d2h();
-    localTree.bodies_Pvel.d2h();
-    localTree.oriParticleOrder.d2h();
-  }
   localTree.bodies_Ppos.d2h();
   localTree.bodies_vel.d2h();
   localTree.bodies_ids.d2h();
@@ -3541,12 +3526,11 @@ void octree::writeGadgetSnapshot(bool preKick)
   GadgetSnapshotSource src;
   src.n    = (size_t) n;
   src.pos4 = (const float *) &localTree.bodies_Ppos[0];
-  // preKick: the velocity of record is bodies_Pvel in ORIGINAL order, reached through
-  // oriParticleOrder -- the same indirection the old staging loop did per particle, handed to the
-  // writer as a permutation instead of being materialised.
-  src.vel4    = preKick ? (const float *) &localTree.bodies_Pvel[0]
-                        : (const float *) &localTree.bodies_vel[0];
-  src.velPerm = preKick ? (const unsigned int *) &localTree.oriParticleOrder[0] : nullptr;
+  // T81: one velocity buffer, in the same CURRENT order as the positions beside it, so preKick and
+  // post-kick differ only in WHEN this is called -- not in which array or which index space. The
+  // `velPerm` permutation the writer used to need for the preKick path went with bodies_Pvel, and
+  // the field no longer exists on GadgetSnapshotSource.
+  src.vel4    = (const float *) &localTree.bodies_vel[0];
   src.id      = (const unsigned long long *) &localTree.bodies_ids[0];
   src.type    = ((int) localTree.bodies_type.size() == n) ? localTree.bodies_type.data() : nullptr;
   // Undo the load-time translation so the snapshot is in the IC's own frame. Applies to the zoom
@@ -4584,7 +4568,6 @@ void octree::approximate_gravity(tree_structure &tree)
                          tree.groupSizeInfo.p(),
                          tree.boxCenterInfo.p(),
                          tree.groupCenterInfo.p(),
-                         tree.bodies_Pvel.p(),
                          tree.generalBuffer1.p(),  //The buffer to store the tree walks
                          tree.bodies_h.p(),        //Per particle search radius
                          tree.bodies_dens.p(),     //Per particle density (x) and nnb (y)
@@ -4954,7 +4937,6 @@ void octree::approximate_gravity_let(tree_structure &tree, tree_structure &remot
                          tree.groupSizeInfo.p(),
                          &boxCILoc,
                          tree.groupCenterInfo.p(),
-                         tree.bodies_Pvel.p(),      //<- Predicted local body velocity
                          tree.generalBuffer1.p(),  //The buffer to store the tree walks
                          tree.bodies_h.p(),        //Per particle search radius
                          tree.bodies_dens.p());    //Per particle density (x) and nnb (y)
@@ -5335,55 +5317,48 @@ void octree::correct(tree_structure &tree)
     // interval. Every entry must be exactly 1. This is the assertion that would have caught the
     // retracted T36 outright -- there, inactive particles scored 0.
     static const bool kickAudit = (getenv("GADGET_HIP_PM_KICK_AUDIT") != NULL);
-    s_pmKickNoPerm = (getenv("GADGET_HIP_PM_KICK_NOPERM") != NULL) ? 1 : 0;
     if (kickAudit && !s_pmKickAudit)
       CU_SAFE_CALL(hipMalloc((void **) &s_pmKickAudit, (size_t) tree.n * sizeof(unsigned char)));
 
-    // bodies_Pvel, NOT bodies_vel. bodies_vel is a pure OUTPUT of correct_particles, which
-    // reconstructs it wholesale from pVel every step:
-    //     vel[idx] = pVel[unsortedIdx];            (inactive branch)
-    //     float4 v = pVel[unsortedIdx]; ... kick    (active branch)
-    // so an impulse written into bodies_vel here is overwritten a few microseconds later and has
-    // no effect whatsoever. Measured exactly that way: quartering the PM interval changed the
-    // final state only in the 7th significant digit, because the long-range kick was being
-    // applied and then discarded. The index expression is unchanged -- pVel uses the same
-    // unsorted[] space bodies_vel did -- only the array is wrong.
-    static const bool kickBoth = (getenv("GADGET_HIP_PM_KICK_BOTH") != NULL);
-    // Each buffer now NAMES the space it is being used in, at the point where the author decides
-    // it. bodies_Pvel is not permuted by the per-step sort, so it is OriginalOrder here; bodies_ids
-    // is permuted, so CurrentOrder; the GravPM store is id-indexed. See buffer_registry.h.
+    // There is ONE velocity array, so the kick cannot be written into the wrong one. That was a
+    // real bug while there were two: the kick landed in bodies_vel, which correct_particles then
+    // reconstructed wholesale from bodies_Pvel, so the impulse was overwritten a few microseconds
+    // later and had no effect at all -- quartering the PM interval moved the final state only in
+    // the 7th significant digit. T81 removed bodies_Pvel, and with it both probes that existed to
+    // chase this (GADGET_HIP_PM_KICK_BOTH, GADGET_HIP_PM_KICK_NOPERM): the array kicked here is
+    // now, by construction, the array correct_particles reads and updates in place.
+    //
+    // Each buffer NAMES the space it is used in. bodies_vel is permuted by the per-step sort since
+    // T81, so it is CurrentOrder here, as is bodies_ids; the GravPM store stays id-indexed because
+    // it must survive the re-sort BETWEEN PM steps. See buffer_registry.h.
     gadgetPMKick.set_args(0, &tree.n,
-                          (void *) tree.bodies_Pvel.as<OriginalOrder>(),
-                          kickBoth ? (void *) tree.bodies_vel.as<OriginalOrder>()
-                                   : (void *) &s_nullDevPtr,
-                          (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
+                          (void *) tree.bodies_vel.as<CurrentOrder>(),
                           (void *) tree.bodies_ids.as_const<CurrentOrder>(),
                           (void *) &s_gravPMx, (void *) &s_gravPMy,
                           (void *) &s_gravPMz, &dtGravKickG,
-                          kickAudit ? (void *) &s_pmKickAudit : &s_nullDevPtr,
-                          &s_pmKickNoPerm);
+                          kickAudit ? (void *) &s_pmKickAudit : &s_nullDevPtr);
     // Phase 3 probe (GADGET_HIP_PM_DV_PROBE=1): observe the velocity change the kick ACTUALLY
     // produces, instead of inferring it. Three probes were spent reasoning about an impulse that
-    // every indirect check said was correct; this reads bodies_Pvel immediately before and after
+    // every indirect check said was correct; this reads bodies_vel immediately before and after
     // the kernel and reports the rms difference. Expected |dv| = rms|GravPM| * dtGravKick.
     static const bool dvProbe = (getenv("GADGET_HIP_PM_DV_PROBE") != NULL);
     std::vector<real4> vBefore;
     if (dvProbe && s_pmKickCount < 3)
     {
       execStream->sync();
-      tree.bodies_Pvel.d2h();
-      vBefore.assign(&tree.bodies_Pvel[0], &tree.bodies_Pvel[0] + tree.n);
+      tree.bodies_vel.d2h();
+      vBefore.assign(&tree.bodies_vel[0], &tree.bodies_vel[0] + tree.n);
     }
     gadgetPMKick.setWork(tree.n, 128);
     gadgetPMKick.execute2(execStream->s());
     if (dvProbe && s_pmKickCount < 3)
     {
       execStream->sync();
-      tree.bodies_Pvel.d2h();
+      tree.bodies_vel.d2h();
       double sdv = 0.0, sv = 0.0; long changed = 0;
       for (int i = 0; i < tree.n; ++i)
       {
-        const real4 a = vBefore[i], b = tree.bodies_Pvel[i];
+        const real4 a = vBefore[i], b = tree.bodies_vel[i];
         const double dx = (double)b.x-a.x, dy = (double)b.y-a.y, dz = (double)b.z-a.z;
         if (dx || dy || dz) changed++;
         sdv += dx*dx + dy*dy + dz*dz;
@@ -5452,7 +5427,8 @@ void octree::correct(tree_structure &tree)
   int correctComovingFlag = haveGadgetComovingTables ? 1 : 0;
   // Spaces per include/buffer_registry.h. This is the Phase 3 kernel, so the buffers it WRITES are
   // named in the current space -- that write is what re-unifies the two -- while everything it reads
-  // from the previous step's layout (bodies_acc0, bodies_Pvel, bodies_time) is original-space.
+  // from the previous step's layout (bodies_acc0, bodies_time) is original-space. bodies_vel is
+  // CURRENT on both sides since T81 -- read and written at the same slot.
   // `pos` and `pPos` are deliberately the same buffer: bodies_pos is no longer a distinct array, so
   // `pos[idx] = pPos[idx]` inside the kernel is a self-copy.
   correctParticles.set_args(0, &tree.n, &t_current,
@@ -5465,7 +5441,6 @@ void octree::correct(tree_structure &tree)
                             (void *) tree.bodies_dens.as_const<CurrentOrder>(),
                             (void *) tree.bodies_Ppos.as<CurrentOrder>(),
                             (void *) tree.bodies_Ppos.as_const<CurrentOrder>(),
-                            (void *) tree.bodies_Pvel.as_const<OriginalOrder>(),
                             (void *) tree.oriParticleOrder.as<CurrentOrder>(),
                             (void *) real4Buffer1.as<CurrentOrder>(),
                             (void *) timeBuffer.as<CurrentOrder>(),
@@ -5499,8 +5474,8 @@ void octree::correct(tree_structure &tree)
   correctParticles.setWork(tree.n, 128);
   correctParticles.execute2(execStream->s());
   // Phase 3 probe (GADGET_HIP_PM_VEL_PROBE=1): the LAST unverified link. The kick is measured
-  // landing in bodies_Pvel, but bodies_vel is what the drift reads, and correct_particles
-  // rebuilds it from pVel. Report rms|bodies_vel| right after that rebuild; comparing this
+  // landing in bodies_vel, which since T81 is also what the drift reads and what
+  // correct_particles updates in place. Report rms|bodies_vel| right after it; comparing this
   // between GADGET_HIP_PM_KICK_SCALE=0 and =1 shows directly whether the impulse survives.
   {
     static const bool velProbe = (getenv("GADGET_HIP_PM_VEL_PROBE") != NULL);
@@ -5636,10 +5611,11 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
   }
   if (usePreKickState)
   {
-    // pos/acc come from THIS step's fresh, already-sorted-into-tree-order buffers (pPos/acc1);
-    // vel must go through the same oriParticleOrder ("unsorted[]") indirection correct_particles()
-    // itself uses, since bodies_Pvel (unlike bodies_Ppos) is never resorted -- see
-    // compute_energy_double_prekick's own comment (timestep.cu) for the full mechanism.
+    // pos/acc/vel all come from THIS step's fresh, already-sorted-into-tree-order buffers
+    // (pPos/acc1/bodies_vel -- the last of those since T81 permuted it). Only bodies_time still
+    // needs the oriParticleOrder ("unsorted[]") indirection. This call site is what makes the
+    // velocity pre-kick: it runs before correct(), so bodies_vel is still the previous step's
+    // corrected value. See compute_energy_double_prekick's own comment (timestep.cu).
     int energyComovingFlag = haveGadgetComovingTables ? 1 : 0;
     // The long-range term of Gadget's energy synchronisation (global.c:79-87). Gadget calls
     // energy_statistics() BEFORE advance_and_find_timesteps() (run.c), so PM_Ti_begstep/endstep
@@ -5673,7 +5649,7 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
     GCarrier dtGravKickPMG = GCarrier::gravkick_times_G(dtGravKickPM);
     computeEnergyPreKick.set_args(sizeof(double)*128*2, &tree.n,
                                    (void *) tree.bodies_Ppos.as_const<CurrentOrder>(),
-                                   (void *) tree.bodies_Pvel.as_const<OriginalOrder>(),
+                                   (void *) tree.bodies_vel.as_const<CurrentOrder>(),
                                    (void *) tree.bodies_acc1.as_const<CurrentOrder>(),
                                    (void *) tree.oriParticleOrder.as_const<CurrentOrder>(),
                                    (void *) tree.bodies_time.as_const<OriginalOrder>(),
@@ -6435,7 +6411,9 @@ double octree::compute_energies(tree_structure &tree, bool usePreKickState)
 // v2: bodies_time holds (Ti_begstep, Ti_endstep) as int2 ticks rather than float2 scale factors.
 // The record is the same WIDTH, so a v1 file would deserialise without error and be interpreted as
 // ticks -- every particle's schedule silently wrong. Refusing on version is the only guard.
-#define GADGET_HIP_RESTART_VERSION 2
+// Version 3 (T81): bodies_Pvel is no longer part of the state, so the per-particle section
+// lost one real4 block, and bodies_vel moved into the un-permuted group with Ppos/ids.
+#define GADGET_HIP_RESTART_VERSION 3
 
 struct GadgetHipRestartHeader
 {
@@ -6470,11 +6448,11 @@ bool octree::writeRestartFile(const char *path)
   const int n = tree.n;
 
   tree.bodies_Ppos.d2h();  tree.bodies_ids.d2h();   tree.oriParticleOrder.d2h();
-  tree.bodies_vel.d2h();   tree.bodies_Pvel.d2h();
+  tree.bodies_vel.d2h();
   tree.bodies_time.d2h();  tree.bodies_acc0.d2h();
 
-  // Un-permute the two arrays the per-iteration reorder touches, so the whole file is in one
-  // (original) order. oriParticleOrder[i] is the ORIGINAL index of the particle now at i.
+  // Un-permute the THREE arrays the per-iteration reorder touches -- bodies_Ppos, bodies_ids and,
+  // since T81, bodies_vel -- so the whole file is in one (original) order. oriParticleOrder[i] is the ORIGINAL index of the particle now at i.
   //
   // T65 item 6b: this used to materialise the whole un-permuted result -- std::vector<real4>
   // pos(n) plus std::vector<ullong> ids(n), 24 B/particle, 3.2 GiB at 512^3 and 10.9 GB at
@@ -6572,8 +6550,15 @@ bool octree::writeRestartFile(const char *path)
     for (int k = 0; k < m; k++) bufIds[k] = tree.bodies_ids[inv[a + k]];
     ok = fwrite(bufIds.data(), sizeof(ullong), m, f) == (size_t) m;
   }
-  ok = ok && fwrite(&tree.bodies_vel[0],      sizeof(real4),  n, f) == (size_t) n;
-  ok = ok && fwrite(&tree.bodies_Pvel[0],     sizeof(real4),  n, f) == (size_t) n;
+  // T81: bodies_vel is permuted by the per-step sort now, so it goes through inv[] exactly like
+  // bodies_Ppos above. Writing it straight would pair each particle's position with another's
+  // velocity -- the C-B-13/C-C-18/C-D-08 defect class, and invisible until the run diverged.
+  for (int a = 0; ok && a < n; a += CHUNK)
+  {
+    const int m = ((n - a) < CHUNK) ? (n - a) : CHUNK;
+    for (int k = 0; k < m; k++) bufPos[k] = tree.bodies_vel[inv[a + k]];
+    ok = fwrite(bufPos.data(), sizeof(real4), m, f) == (size_t) m;
+  }
   ok = ok && fwrite(&tree.bodies_time[0],     sizeof(int2), n, f) == (size_t) n;
   ok = ok && fwrite(&tree.bodies_acc0[0],     sizeof(real4),  n, f) == (size_t) n;
   if (fclose(f) != 0) ok = false;
@@ -6648,7 +6633,6 @@ bool octree::readRestartFile(const char *path)
   ok = ok && fread(&tree.bodies_Ppos[0], sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_ids[0],  sizeof(ullong), n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_vel[0],  sizeof(real4),  n, f) == (size_t) n;
-  ok = ok && fread(&tree.bodies_Pvel[0], sizeof(real4),  n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_time[0], sizeof(int2), n, f) == (size_t) n;
   ok = ok && fread(&tree.bodies_acc0[0], sizeof(real4),  n, f) == (size_t) n;
   fclose(f);
@@ -6657,7 +6641,7 @@ bool octree::readRestartFile(const char *path)
   // The file is in original order, so this IS the load order now; sort_bodies rebuilds
   // oriParticleOrder from it on the first iteration exactly as it does for a fresh IC.
   tree.bodies_Ppos.h2d(); tree.bodies_ids.h2d();
-  tree.bodies_vel.h2d();  tree.bodies_Pvel.h2d();
+  tree.bodies_vel.h2d();
   tree.bodies_time.h2d(); tree.bodies_acc0.h2d();
   // bodies_pos is bound to bodies_Ppos (C-A-22 memory fold), so it needs no separate restore.
 

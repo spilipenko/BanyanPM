@@ -848,7 +848,9 @@ namespace my_dev {
     {
       ALIAS_NONE        = 0,
       ALIAS_PPOS        = 1u << 0,
-      ALIAS_PVEL        = 1u << 1,
+      // Bit 1 was ALIAS_PVEL, retired with bodies_Pvel in T81. Deliberately NOT reused: the
+      // whole word is settable as a bitmask via GADGET_HIP_UNIFIED_ARRAYS, so renumbering the
+      // remaining bits would silently change the meaning of every value recorded in a ticket.
       ALIAS_FSOFTEN     = 1u << 2,
       ALIAS_TREEPROPS   = 1u << 3,   // multipole, boxSize/boxCenter/cellSize/cellCenter
       ALIAS_GROUPPROPS  = 1u << 4,   // groupSize/groupCenter/groupMaxAcc/groupMaxSoftening

@@ -450,7 +450,6 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
 										real4 	*acc,
 										int2 	*time,
 										real4 	*pPos,
-										real4 	*pVel,
 										int     comovingIntegrationOn,
 										const float *driftTable,
 										const float *gravKickTable,
@@ -526,7 +525,11 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
   p.z += v.z*dt_drift;
 
   pPos[idx] = p;
-  pVel[idx] = v;
+  // T81: no predicted-velocity buffer any more. Gadget-2 does not predict DM velocity (VelPred is
+  // gas-only, predict.c:56-65), so this used to write `v` back unchanged into bodies_Pvel. The one
+  // thing that copy really provided was a read-only source that let correct_particles permute the
+  // velocity -- read at the old slot, write at the new one -- and sort_bodies now permutes
+  // bodies_vel itself, so correct_particles reads and writes the same slot and needs no snapshot.
 }
 
 
@@ -618,31 +621,34 @@ static __device__ __forceinline__ float tiMidpointD(const float a1, const float 
 KERNEL_DECLARE(correct_particles)(const int n_bodies,
                                   /*  1 */   float tc,
 // THIS KERNEL IS WHERE THE TWO SPACES RE-UNIFY, which is why its parameter list mixes them more
-// than any other. buffer_registry.h classifies bodies_pos and bodies_vel as SPACE_ORIGINAL with the
-// note "rewritten at NEW idx by correct_particles" -- that is this kernel, and it is why `pos` and
-// `vel` below are CurrentOrder: they are WRITTEN at the current slot, which is what establishes the
-// order the next Phase 1 treats as original. Everything read from the previous step's layout
-// (acc0, pVel, time) is OriginalOrder and goes through unsorted[].
+// than any other. `pos` is CurrentOrder because it is WRITTEN at the current slot, which is what
+// establishes the order the next Phase 1 treats as original. What is still read from the previous
+// step's layout (acc0, time) is OriginalOrder and goes through unsorted[].
+//
+// T81: `vel` is now CurrentOrder on BOTH sides. sort_bodies permutes bodies_vel along with
+// bodies_Ppos/bodies_ids, so this kernel reads and writes the velocity at the SAME slot -- an
+// in-place read-modify-write, race-free because each thread touches only its own idx. That is what
+// retired bodies_Pvel: the snapshot existed only to make the read-at-old / write-at-new pairing
+// safe.
                                   /*  2 */   OriginalOrder<int2> time,        // ticks
                                   /*  3 */   CurrentOrder<const uint> active_list,
-                                  /*  4 */   CurrentOrder<real4> vel,         // written at the new slot
+                                  /*  4 */   CurrentOrder<real4> vel,         // read AND written, same slot
                                   /*  5 */   OriginalOrder<const real4> acc0,
                                   /*  6 */   CurrentOrder<const real4> acc1,
                                   /*  7 */   CurrentOrder<float> body_h,
                                   /*  8 */   CurrentOrder<const float2> body_dens,
                                   /*  9 */   CurrentOrder<real4> pos,         // written at the new slot
                                   /* 10 */   CurrentOrder<const real4> pPos,
-                                  /* 11 */   OriginalOrder<const real4> pVel,
-                                  /* 12 */   CurrentOrder<uint> unsorted,     // read, then reset to identity
-                                  /* 13 */   CurrentOrder<real4> acc0_new,
-                                  /* 14 */   CurrentOrder<int2> time_new,     // ticks
-                                  /* 15 */   int    comovingIntegrationOn,
-                                  /* 16 */   const float *gravKickTable,
-                                  /* 17 */   double logTimeBegin,   // T29: double
-                                  /* 18 */   double logTimeMax,
-                                  /* 19 */   CurrentOrder<const int> newEnd, // ticks
-                                  /* 20 */   double dPerTick,
-                                  /* 21 */   int    Ti_current)
+                                  /* 11 */   CurrentOrder<uint> unsorted,     // read, then reset to identity
+                                  /* 12 */   CurrentOrder<real4> acc0_new,
+                                  /* 13 */   CurrentOrder<int2> time_new,     // ticks
+                                  /* 14 */   int    comovingIntegrationOn,
+                                  /* 15 */   const float *gravKickTable,
+                                  /* 16 */   double logTimeBegin,   // T29: double
+                                  /* 17 */   double logTimeMax,
+                                  /* 18 */   CurrentOrder<const int> newEnd, // ticks
+                                  /* 19 */   double dPerTick,
+                                  /* 20 */   int    Ti_current)
 {
   const int bid =  blockIdx.y *  gridDim.x +  blockIdx.x;
   const int tid =  threadIdx.y * blockDim.x + threadIdx.x;
@@ -701,17 +707,18 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
       //    real Gadget-2 semantics directly: an inactive particle's true position between its own
       //    sync points genuinely is just its drift prediction (see predict_particles()'s own
       //    comment above on Gadget-2's KDK integrator).
-      //  - pVel[unsortedIdx] (bodies_Pvel) is NOT reordered (same default-branch omission as
-      //    acc0/time just above), so the unsortedIdx translation the active path already relies
-      //    on below is equally valid here to fetch this particle's own correct pre-resort
-      //    velocity (inactive particles are never kicked, so no kick term is applied, matching
-      //    Gadget-2: velocity only changes at a particle's own sync event).
-      // Neither pPos nor pVel is ever WRITTEN by this kernel (only read), and pos/vel are only
-      // ever written at each thread's own idx (never read by this kernel at all) -- so unlike
-      // acc0/time above, this needs no separate scratch+copyback buffer; writing directly into
-      // pos[idx]/vel[idx] here is race-free.
+      // pPos is never WRITTEN by this kernel (only read), and pos is only ever written at each
+      // thread's own idx -- so unlike acc0/time above, this needs no separate scratch+copyback
+      // buffer; writing directly into pos[idx] here is race-free.
+      //
+      // T81: there is no longer anything to do for the velocity. This branch used to carry the
+      // particle's own velocity forward explicitly -- `vel[idx] = pVel[unsortedIdx]` -- because
+      // bodies_vel was not permuted by the sort, so slot idx held some OTHER particle's velocity
+      // and leaving it alone was the T12 bug (an inactive particle inheriting whatever last
+      // occupied its slot). sort_bodies now permutes bodies_vel, so vel[idx] already holds exactly
+      // this particle's velocity, and an inactive particle is correct by doing nothing -- which is
+      // also what Gadget-2 does, since velocity only changes at a particle's own sync event.
       pos[idx] = pPos[idx];
-      vel[idx] = pVel[unsortedIdx];
 
       unsorted[idx] = idx.v;
       return;
@@ -719,16 +726,18 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
   #endif
 
 
-  // An `#if 0` block here preserved the pre-T12 spelling -- time[idx] and pVel[idx], reading the
-  // unpermuted buffers with the current slot index. It is removed rather than left in place,
-  // because with these parameter types it would no longer compile if anyone enabled it, and dead
-  // code that cannot be built is a trap for the next reader. The bug it recorded is in ticket T12
-  // and in buffer_registry.h, and the types below now make that spelling impossible to write.
+  // The bug T12 root-caused here was reading an unpermuted buffer with the current slot index.
+  // For the velocity that spelling is no longer merely rejected by the types -- it is now the
+  // CORRECT one, because sort_bodies permutes bodies_vel (T81). For bodies_time and bodies_acc0 it
+  // is still wrong, and still a compile error: they remain OriginalOrder and need unsorted[].
   const OriginalIdx unsortedIdx = to_original(idx, unsorted);
 
   float4 a1 = acc1[idx];
   float  tb = gadget_ti_to_a(time[unsortedIdx].x, logTimeBegin, dPerTick, comovingIntegrationOn); // old Ti_begstep
-  float4 v  = pVel[unsortedIdx];
+  // T81: the particle's own velocity, at its own slot -- bodies_vel is permuted by sort_bodies, so
+  // this is both the pre-kick velocity (including any long-range kick gadget_pm_kick applied to
+  // this same slot earlier in correct()) and the slot that is written back below.
+  float4 v  = vel[idx];
 
   //Store the predicted position as the one to use
   pos[idx] = pPos[idx];
@@ -909,60 +918,46 @@ unsigned int pmkick_read_launches(void)
   return v;
 }
 
+// T81: `vel` is bodies_vel in CURRENT order, kicked in place at the particle's own slot.
+//
+// Two probes were deleted here along with bodies_Pvel, because the change makes the questions they
+// asked unaskable. GADGET_HIP_PM_KICK_NOPERM tested whether the kick's write target should be
+// vel[unsorted[idx]] or vel[idx] -- there is now only one slot, idx. GADGET_HIP_PM_KICK_BOTH
+// kicked a second velocity buffer, to test whether a single-buffer write was being regenerated
+// away before it was consumed; there is no second buffer left to regenerate from. The bug that
+// motivated both (the kick landing in bodies_vel, which correct_particles then overwrote
+// wholesale from bodies_Pvel, so quartering the PM interval moved the final state only in the 7th
+// significant digit) is structurally impossible now: the buffer this kicks is the same buffer
+// correct_particles reads.
 extern "C" __global__ void gadget_pm_kick(const int    n_bodies,
-                                          OriginalOrder<real4> vel,
-                                          OriginalOrder<real4> vel2,   /* probe: 2nd velocity buffer */
-                                          CurrentOrder<const uint> unsorted,   /* oriParticleOrder */
+                                          CurrentOrder<real4> vel,             /* bodies_vel */
                                           CurrentOrder<const unsigned long long> ids,
                                           IdSpace<const GFreeAcc> gpmx,
                                           IdSpace<const GFreeAcc> gpmy,
                                           IdSpace<const GFreeAcc> gpmz,
                                           const GCarrier  dtGravKick,  /* dt_gravkick * G */
-                                          unsigned char *kickAudit,
-                                          const int    noPerm)
+                                          unsigned char *kickAudit)
 {
   const int bid = blockIdx.y * gridDim.x + blockIdx.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
   const CurrentIdx idx = { bid * (blockDim.x * blockDim.y) + tid };
   if (idx.v >= (unsigned int) n_bodies) return;
 
-  // Direct write-target test (GADGET_HIP_PM_KICK_NOPERM=1 sets noPerm): is the velocity of the
-  // particle at CURRENT slot idx stored at pVel[unsorted[idx]] (what correct_particles assumes)
-  // or at pVel[idx]? The staleness probe validates only the gpm[ids[idx]] LOOKUP; it says nothing
-  // about this write target. Applying the right force to the wrong particle's velocity slot would
-  // give correct rms|dv|, correct per-particle counts, and incoherent dynamics -- exactly the
-  // observed failure. Running both spellings settles it empirically.
-  // Three different index spaces in three lines, all uint-shaped, so every wrong pairing used to
-  // be in range and silent. `vel[idx]` now does not compile: vel is OriginalOrder and idx is a
-  // CurrentIdx. See include/gadget_index_spaces.h.
-  // Kept as a ternary, not an unconditional load followed by an overwrite: the original avoids the
-  // unsorted[] fetch entirely when noPerm is set, and rewriting it cost 16 bytes of code and broke
-  // the binary-comparison proof that this conversion is free.
-  const OriginalIdx o = noPerm ? OriginalIdx{ idx.v }
-                               : to_original(idx, unsorted);
+  // The GravPM store is still id-keyed -- it has to survive the re-sort BETWEEN PM steps, and
+  // nothing in T81 changes that (see T81 item C for the change that would). So this kernel pairs
+  // two index spaces rather than three: the velocity at the particle's own CURRENT slot, and its
+  // long-range force looked up by particle id.
   const ParticleId id = id_at(idx, ids);
-  if (o.v >= (uint) n_bodies || id.v >= (unsigned long long) n_bodies) return;  // no barrier here
+  if (id.v >= (unsigned long long) n_bodies) return;  // no barrier here
 
   // `gpmx[id] * dtGravKick` compiles only because dtGravKick is a GCarrier -- a scalar that
   // already includes G. With a plain float it does not compile at all, which is exactly the bug
   // T42 spent a day on. See include/gadget_units.h.
-  real4 v = vel[o];
+  real4 v = vel[idx];
   v.x += gpmx[id] * dtGravKick;
   v.y += gpmy[id] * dtGravKick;
   v.z += gpmz[id] * dtGravKick;
-  vel[o] = v;
-  // Probe (GADGET_HIP_PM_KICK_BOTH=1 supplies a non-NULL vel2): this port carries the velocity in
-  // TWO buffers -- bodies_vel and bodies_Pvel -- regenerated from each other by predict/correct
-  // every step. GADGET has one, P[i].Vel, so its long-range kick cannot be lost. Kicking both here
-  // tests whether a single-buffer write is being regenerated away before it is consumed.
-  if (!vel2.is_null())
-  {
-    real4 w = vel2[o];
-    w.x += gpmx[id] * dtGravKick;
-    w.y += gpmy[id] * dtGravKick;
-    w.z += gpmz[id] * dtGravKick;
-    vel2[o] = w;
-  }
+  vel[idx] = v;
 
   if (kickAudit) kickAudit[id.v] += (unsigned char) 1;
 }
@@ -1361,12 +1356,12 @@ KERNEL_DECLARE(compute_energy_double)(const int n_bodies,
 // i.e. it uses the PRE-kick velocity (valid at the midpoint of the OLD step) paired with the
 // freshly-drifted position and freshly-computed potential. This kernel reproduces Gadget-2's
 // actual sampling point: `pos`/`acc` are this step's already-fresh (pPos/acc1) values (in the
-// current, possibly-just-resorted tree order), but `vel` must be looked up via the SAME
-// `unsorted[]` (oriParticleOrder) indirection correct_particles() itself uses just below
-// (`pVel[unsortedIdx]`) -- because bodies_Ppos/bodies_acc1 are in this iteration's freshly-sorted
-// tree order while bodies_Pvel (unlike bodies_Ppos) is NOT resorted, the exact asymmetry Ticket 12
-// already root-caused for correct_particles(). Getting this indirection wrong would silently pair
-// the wrong particle's velocity with the wrong particle's position/potential.
+// current, possibly-just-resorted tree order), and since T81 so is `vel`: sort_bodies permutes
+// bodies_vel, so all three are indexed directly and the asymmetry Ticket 12 root-caused for
+// correct_particles() is gone for the velocity. Only bodies_time still needs the `unsorted[]`
+// (oriParticleOrder) indirection. Note this kernel is called BEFORE correct() in iterate_once
+// (gpu_iterate.cpp: compute_energies at the energy sample, correct() after it), which is what
+// makes bodies_vel the PRE-kick velocity here without any snapshot being kept.
 // T14/energy: Gadget-2 extrapolates each particle's velocity to the CURRENT sync time before
 // summing kinetic energy (global.c:60-72):
 //     dt_gravkick = gravkick(Ti_begstep, Ti_Current) - gravkick(Ti_begstep, mid(Ti_beg,Ti_end))
@@ -1436,7 +1431,7 @@ extern "C" __global__ void gadget_aold_mag(const int    n_bodies,
 
 static __device__ void compute_energy_double_prekickD(const int n_bodies,
                                             CurrentOrder<const real4> pos,
-                                            OriginalOrder<const real4> vel,   /* bodies_Pvel */
+                                            CurrentOrder<const real4> vel,    /* bodies_vel, pre-kick: correct() has not run yet */
                                             CurrentOrder<const real4> acc,    /* acc1 */
                                             CurrentOrder<const uint> unsorted,
                                             OriginalOrder<const int2> time,   // Phase 2: ticks
@@ -1471,10 +1466,11 @@ static __device__ void compute_energy_double_prekickD(const int n_bodies,
     {
       const CurrentIdx j = { i + (half ? blockSize : 0) };
       if (j.v >= (unsigned int) n_bodies) continue;
-      // pos and acc are post-sort (CurrentOrder); bodies_Pvel and bodies_time are not permuted, so
-      // both go through unsorted[] -- one translation, now in the types rather than in prose.
+      // T81: pos, acc and now vel are all post-sort (CurrentOrder) and indexed directly. Only
+      // bodies_time is still unpermuted, so it alone goes through unsorted[] -- one translation,
+      // expressed in the types rather than in prose.
       const OriginalIdx u = to_original(j, unsorted);
-      real4 temp = vel[u];
+      real4 temp = vel[j];
       if (g_energy_extrap)
       {
         const int2   t    = time[u];
@@ -1555,7 +1551,7 @@ static __device__ void compute_energy_double_prekickD(const int n_bodies,
 
 KERNEL_DECLARE(compute_energy_double_prekick)(const int n_bodies,
                                             CurrentOrder<const real4> pos,
-                                            OriginalOrder<const real4> vel,   /* bodies_Pvel */
+                                            CurrentOrder<const real4> vel,    /* bodies_vel, pre-kick: correct() has not run yet */
                                             CurrentOrder<const real4> acc,    /* acc1 */
                                             CurrentOrder<const uint> unsorted,
                                             OriginalOrder<const int2> time,   // Phase 2: ticks

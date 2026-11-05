@@ -128,7 +128,6 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
                               double4 *multipole,
                               real4 *nodeLowerBounds,
                               real4 *nodeUpperBounds,
-                              real4  *body_vel,
                               ulonglong1 *body_id,
 			      ::real  *body_h, 
 			      const float h_min,
@@ -185,10 +184,11 @@ KERNEL_DECLARE(compute_leaf)( const int n_leafs,
     p      = body_pos[i];
     // INDEX-SPACE MISMATCH, verified and currently inert -- see buffer_registry.h.
     // `i` runs over node_bodies, which is built AFTER sort_bodies, so it is a CURRENT-order
-    // particle index. body_vel is tree.bodies_Pvel (compute_properties.cpp:77), which the
-    // default per-step sort does NOT permute, so it is ORIGINAL-order: this reads a DIFFERENT
-    // particle's eps. Every other array in this kernel (body_pos=bodies_Ppos, body_id, body_h)
-    // IS current-order, which is what hides it.
+    // particle index. The legacy source was tree.bodies_Pvel, which the default per-step sort did
+    // not permute, so it was ORIGINAL-order and read a DIFFERENT particle's eps while every other
+    // array in this kernel (body_pos=bodies_Ppos, body_id, body_h) was current-order. T81 deleted
+    // the parameter outright: it had not been dereferenced since T28/C-A-04, and the buffer it
+    // pointed at no longer exists.
     //
     // Inert on two independent counts, both checked rather than assumed:
     //  1. The value was dead where it rode in Q0.w, propagated by compute_non_leaf, and

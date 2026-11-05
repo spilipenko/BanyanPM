@@ -262,7 +262,6 @@ class tree_structure
     my_dev::dev_mem<int2>   bodies_time;    //The timestep details (.x=Ti_beg, .y=Ti_end
     my_dev::dev_mem<ullong> bodies_ids;
     my_dev::dev_mem<real4>  bodies_Ppos;    //Predicted position
-    my_dev::dev_mem<real4>  bodies_Pvel;    //Predicted velocity
     
     //Density related buffers
     my_dev::dev_mem<real>  bodies_h;       //The particles search radius
@@ -490,12 +489,19 @@ protected:
   //     t_current / t_previous / iter / the snapshot counter / the snapshot and statistics
   //     cadence cursors / the displacement ceiling
   //
-  // INDEX SPACE: the file is written entirely in ORIGINAL (load) order, so reading it back is
+  // INDEX SPACE: the file is written entirely in ONE order, so reading it back is
   // indistinguishable from a fresh IC load and sort_bodies rebuilds the permutation from scratch.
-  // The default per-iteration reorder leaves bodies_vel/Pvel/time/acc0 in original order but
-  // permutes bodies_Ppos/bodies_ids, so those two are un-permuted through oriParticleOrder on the
-  // way out. Getting this wrong would pair each particle's position with another's velocity -- the
-  // same defect class as C-B-13/C-C-18/C-D-08, and invisible until the run diverged.
+  // That order is NOT the IC load order, despite what this comment said until T81: the per-step
+  // permutation is reset to the identity by correct_particles every step, so "original" here means
+  // the order as of the PREVIOUS step's correct_particles. Nothing depends on which it is, because
+  // the reader re-sorts, but the distinction matters if anyone tries to match this file against
+  // the IC by slot.
+  //
+  // The default per-iteration reorder permutes bodies_Ppos, bodies_ids and (since T81) bodies_vel,
+  // so those three are un-permuted through oriParticleOrder on the way out; bodies_time and
+  // bodies_acc0 are already in that order and are written straight. Getting this wrong would pair
+  // each particle's position with another's velocity -- the same defect class as
+  // C-B-13/C-C-18/C-D-08, and invisible until the run diverged.
 public:  // main() configures the restart from the CLI/parameterfile, so these are not protected.
   bool   writeRestartFile(const char *path);
   bool   readRestartFile(const char *path);
@@ -657,7 +663,7 @@ public:
    // scratch buffer on the DEVICE and then separately memcpy's it on the HOST. The scratch buffer
    // is always a view carved out of generalBuffer1, whose host side is never written by anything
    // -- so that host memcpy copied UNINITIALISED bytes over the host side of bodies_vel,
-   // bodies_acc0, bodies_acc1, bodies_Ppos, bodies_Pvel, bodies_time and bodies_ids on every full
+   // bodies_acc0, bodies_acc1, bodies_Ppos, bodies_time and bodies_ids on every full
    // shuffle. Harmless until now only because every reader of those host sides does a d2h first,
    // which overwrites the garbage before it can be seen.
    //
@@ -665,9 +671,11 @@ public:
    // device memory and the garbage lands on the live data. That is exactly how it was found:
    // aliasing bodies_Ppos alone made the 64^3 run die in its first tree build with
    // "box size 0.000000" -- the boundary reduction over positions that had just been overwritten
-   // with arena contents. bodies_Pvel survived the same treatment only because predict()
-   // recomputes it from bodies_vel every step; bodies_Ppos is the position of record (it is what
-   // bodies_pos was folded into), so corrupting it destroys the run.
+   // with arena contents. bodies_Ppos is the position of record (it is what bodies_pos was folded
+   // into), so corrupting it destroys the run. The now-removed bodies_Pvel survived the same
+   // treatment only because predict() recomputed it from bodies_vel every step -- bodies_vel
+   // itself has no such regenerator, so it must keep devOnly true now that the per-step reorder
+   // permutes it (T81).
    //
    // Nothing can depend on the old behaviour: what it wrote was uninitialised memory.
    template <typename T>

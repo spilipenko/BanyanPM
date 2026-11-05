@@ -95,8 +95,6 @@ void octree::allocateParticleMemory(tree_structure &tree)
 
   DMTAG(tree.bodies_Ppos);
   tree.bodies_Ppos.cmalloc(n_bodies+1, true, 0, my_dev::dev_mem<real4>::ALIAS_PPOS);   //Memory to store predicted positions, host mapped (T65 item 3)
-  DMTAG(tree.bodies_Pvel);
-  tree.bodies_Pvel.cmalloc(n_bodies+1, true, 0, my_dev::dev_mem<real4>::ALIAS_PVEL);   //Memory to store predicted velocities, host mapped (T65 item 3)
 
   DMTAG(tree.bodies_vel);
   tree.bodies_vel.cmalloc_unified(n_bodies, my_dev::dev_mem<real4>::ALIAS_VEL);
@@ -311,8 +309,6 @@ void octree::reallocateParticleMemory(tree_structure &tree)
 
   DMTAG(tree.bodies_Ppos);
   tree.bodies_Ppos.cresize(n_bodies+1, reduce);   //Memory to store predicted positions
-  DMTAG(tree.bodies_Pvel);
-  tree.bodies_Pvel.cresize(n_bodies+1, reduce);   //Memory to store predicted velocities
 
   DMTAG(tree.bodies_vel);
   tree.bodies_vel.cresize (n_bodies, reduce);

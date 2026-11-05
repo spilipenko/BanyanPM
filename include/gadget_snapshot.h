@@ -76,13 +76,16 @@ struct GadgetParticleData
 // byte-identical file to gadget_snapshot_write().
 //
 // Positions come from `pos4` as x,y,z,MASS at stride 4 (the port's real4 bodies_Ppos, whose .w is
-// the mass); velocities from `vel4` at stride 4, optionally indirected through `velPerm`.
+// the mass); velocities from `vel4` at stride 4, in the same order as the positions.
+//
+// A `velPerm` field used to sit beside `vel4`, indirecting the velocity index, because the
+// pre-kick snapshot read bodies_Pvel (unpermuted) alongside bodies_Ppos (permuted). T81 gave the
+// port a single velocity buffer in the same order as the positions, so nothing can set it.
 struct GadgetSnapshotSource
 {
   size_t                    n       = 0;
   const float              *pos4    = nullptr;   // 4 floats/particle: x, y, z, mass
   const float              *vel4    = nullptr;   // 4 floats/particle: x, y, z, (unused)
-  const unsigned int       *velPerm = nullptr;   // vel index = velPerm[i]; null = identity
   const unsigned long long *id      = nullptr;
   const int                *type    = nullptr;   // null = every particle is type 1 (Halo/DM)
   // Undo, on the way out, a translation that was applied to every particle at load, so the
