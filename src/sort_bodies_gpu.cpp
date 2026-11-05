@@ -115,7 +115,7 @@ void octree::getBoundariesGroups(tree_structure &tree, real4 &r_min, real4 &r_ma
   LOG("min: %f\t%f\t%f\tmax: %f\t%f\t%f \n", r_min.x,r_min.y,r_min.z,r_max.x,r_max.y,r_max.z);
 }
 
-void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullShuffle) {
+void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate) {
 
   //We assume the bodies are already on the GPU
   devContext->startTiming(execStream->s());
@@ -153,14 +153,18 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
 
   my_dev::dev_mem<uint> tempB, tempC,  tempD;
   my_dev::dev_mem<char> tempE;
+  // T81 B: the sort permutation is a transient scratch view, not a persistent map -- the old
+  // oriParticleOrder member is gone. It lives only for the duration of this function.
+  my_dev::dev_mem<uint> permBuf;
   //The generalBuffer1 has size uint*4*N*3 = uint*12*N
-  size_t genBufOffset2 = 0;   // T72: size_t -- this chain reaches 7.25*N uints
+  size_t genBufOffset2 = 0;   // T72: size_t -- this chain reaches 8.25*N uints
 
   genBufOffset2 = srcValues.cmalloc_copy(tree.generalBuffer1, tree.n, 0);  //uint*N -uint5*N
   genBufOffset2 = tempB    .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint5*N-uint6*N
   genBufOffset2 = tempC    .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint6*N-uint7*N
   genBufOffset2 = tempD    .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint7*N-uint8*N
   genBufOffset2 = tempE    .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint8*N-uint9*N
+  genBufOffset2 = permBuf  .cmalloc_copy(tree.generalBuffer1, tree.n, genBufOffset2); //uint9*N-uint10*N
 
   //Compute the keys directly into srcValues which then will be sorted into tree.bodies_key below
   build_key_list.setWork(tree.n, 128);
@@ -180,8 +184,8 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
 
   // If srcValues and buffer are different, then the original values
   // are preserved, if they are the same srcValues will be overwritten
-  if(tree.n > 0) gpuSort(srcValues, tree.oriParticleOrder, tempB, tempC, tempD, tempE, tree.n);
-  dataReorder(tree.n, tree.oriParticleOrder, srcValues, tree.bodies_key, true, true);
+  if(tree.n > 0) gpuSort(srcValues, permBuf, tempB, tempC, tempD, tempE, tree.n);
+  dataReorder(tree.n, permBuf, srcValues, tree.bodies_key, true, true);
 
 #if 0
   tree.bodies_key.d2h();
@@ -200,78 +204,34 @@ void octree::sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullS
   //Call the reorder data functions
   devContext->startTiming(execStream->s());
 
-  //JB this if statement is required until I fix the order
-  //of functions in main.cpp  
-
-  if(!doFullShuffle)
+  // T81 item B: permute EVERY per-particle array, so nothing survives the sort in a stale order and
+  // no oriParticleOrder map is needed. bodies_acc0 and bodies_time join bodies_Ppos/bodies_vel/
+  // bodies_ids (added in item A); bodies_acc1 is NOT here -- it is written after the sort by
+  // approximate_gravity (and was wrongly in the old full-shuffle list). The old "!doFullShuffle"
+  // probe branch is gone: full shuffle is now the only mode.
   {
     my_dev::dev_mem<real4>  real4Buffer1;
     my_dev::dev_mem<ullong> ullBuffer;
     my_dev::dev_mem<float>  realBuffer;
+    my_dev::dev_mem<int2>   timeBuffer;   // Phase 2: bodies_time is ticks
 
     // C-A-22: these views deliberately SHARE one region. dataReorder gathers dIn into scratch and
     // copies it straight back, so scratch is dead the moment the call returns, and the calls below
-    // are issued sequentially on execStream -- no two are ever live at once. Chaining the offsets
-    // (as an earlier defensive change tagged "BUG4 FIX" did) reserves 7N uints for a job that needs
-    // 4N. The prior audit's actual Bug 4 was correct_particles corrupting inactive particles'
-    // acc0/time slots -- a different bug in a different file (gadget-audit T12); nothing here was
-    // ever observed to fail. Verified by bit-identical snapshots, not by this argument alone.
+    // are issued sequentially on execStream -- no two are ever live at once.
     real4Buffer1.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
     ullBuffer.   cmalloc_copy(tree.generalBuffer1, tree.n, 0);
     realBuffer.  cmalloc_copy(tree.generalBuffer1, tree.n, 0);
+    timeBuffer.  cmalloc_copy(tree.generalBuffer1, tree.n, 0);
 
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Ppos, real4Buffer1, true, true);
-    // T81: bodies_vel joined this list, which is what retired bodies_Pvel. With the velocity in
-    // CURRENT order, correct_particles reads and writes it at the same slot -- an in-place
-    // read-modify-write -- instead of reading a separate unpermuted snapshot at the old slot and
-    // writing the real array at the new one. gadget_pm_kick and the pre-kick energy sum likewise
-    // index it directly. Measured cost of this one line at 512^3: +47 ms/step of gather, against
-    // 16 B/particle (2.00 GiB) of buffer and 16 B/particle/step of predict writes removed. See
-    // tickets/T81; the shared scratch argument below applies unchanged.
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_vel,  real4Buffer1, true, true);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_ids,  ullBuffer,    true, true);
+    dataReorder(tree.n, permBuf, tree.bodies_Ppos, real4Buffer1, true, true);
+    dataReorder(tree.n, permBuf, tree.bodies_vel,  real4Buffer1, true, true);
+    dataReorder(tree.n, permBuf, tree.bodies_ids,  ullBuffer,    true, true);
+    dataReorder(tree.n, permBuf, tree.bodies_acc0, real4Buffer1, true, true);
+    dataReorder(tree.n, permBuf, tree.bodies_time, timeBuffer,   true, true);
 #if BONSAI_DENSITY
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_h,    realBuffer,   true, true);          //Density values
+    dataReorder(tree.n, permBuf, tree.bodies_h,    realBuffer,   true, true);          //Density values
 #endif
   }
-  else
-  {
-    //Call the reorder data functions
-    //generalBuffer is always at least 3xfloat4*N
-    my_dev::dev_mem<real4>    real4Buffer1;
-    my_dev::dev_mem<int2>     timeBuffer;   // Phase 2: bodies_time is ticks
-    my_dev::dev_mem<ullong>   ullBuffer;
-    my_dev::dev_mem<float>    realBuffer;
-    // C-A-22, same reasoning as the !doFullShuffle branch above: one shared region, because every
-    // dataReorder call below completes before the next is issued and none of them reads a previous
-    // call's scratch. real4Buffer1 is already reused across six consecutive calls here, which is
-    // the same argument applied to one type; this extends it across types. 9N uints -> 4N.
-    real4Buffer1.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
-    timeBuffer.cmalloc_copy(tree.generalBuffer1, tree.n, 0);
-    ullBuffer.   cmalloc_copy(tree.generalBuffer1, tree.n, 0);
-    realBuffer.  cmalloc_copy(tree.generalBuffer1, tree.n, 0);
-
-    //Position, velocity and acc0
-    // bodies_pos is no longer a distinct array (it is bound to bodies_Ppos, which this branch
-    // reorders on its own a few lines below) and its allocation is 1 element, so reordering it
-    // here would write tree.n elements past the end. That overran silently at N=1000 -- the
-    // acceptance set still passed, bit-identical -- and only faulted at 512^3.
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_vel, real4Buffer1);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_acc0, real4Buffer1);
-
-    //Acc1, Predicted position and velocity
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_acc1, real4Buffer1);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_Ppos, real4Buffer1);
-    // bodies_Pvel was reordered here until T81 removed the buffer.
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_time, timeBuffer);
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_ids, ullBuffer);
-
-    //Density values
-#if BONSAI_DENSITY
-    dataReorder(tree.n, tree.oriParticleOrder, tree.bodies_h, realBuffer);
-#endif
-
-  } //end if
   
   devContext->stopTiming("Data-reordering", 1, execStream->s());
 

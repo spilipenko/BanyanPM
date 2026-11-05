@@ -21,43 +21,29 @@
 //
 // THE INVARIANT, verified against runtime/src/sort_bodies_gpu.cpp (not from comments):
 //
-//   Phase 1  predict_particles, before sort_bodies. oriParticleOrder is identity (correct_particles
-//            reset it at the end of the previous step), so every buffer may be indexed directly.
+// Since T81 item B, sort_bodies permutes EVERY per-particle buffer every step (bodies_key,
+// bodies_Ppos, bodies_vel, bodies_ids, bodies_acc0, bodies_time, and bodies_h under
+// BONSAI_DENSITY), so there is exactly ONE particle index space in every phase: the current
+// sorted order. There is no "original order" and no permutation map -- the four bugs above were
+// all a consequence of a buffer surviving the sort unpermuted, and that class is now unwriteable.
 //
-//   Phase 2  after sort_bodies, through approximate_gravity, up to correct_particles. This is
-//            where the two spaces diverge and where every one of the four bugs above lived.
-//              SPACE_CURRENT  -- permuted by sort_bodies (or produced after it): index directly.
-//              SPACE_ORIGINAL -- NOT permuted: index as buf[oriParticleOrder[idx]].
-//
-//   Phase 3  correct_particles rewrites pos/vel/acc0/time at the NEW index for every particle and
-//            sets oriParticleOrder[idx] = idx, which re-unifies the spaces for the next Phase 1.
-//
-// sort_bodies' default per-step path (!doFullShuffle) permutes exactly four buffers:
-// bodies_key (:184), bodies_Ppos, bodies_ids, bodies_h (:221-223). The doFullShuffle path
-// permutes nine, but is not taken by the normal per-iteration call.
+// Buffers produced AFTER the sort (bodies_acc1, bodies_forceSoftening, bodies_typeDevice,
+// body2group_list, ...) are also in the current order by construction. A particle buffer is
+// therefore always indexable with CurrentIdx; IdSpace remains only for GravPM, which is indexed by
+// particle id so it survives the re-sort between PM steps.
 //===========================================================================================
 
-// CLASSIFICATION RULE -- corrected 2026-09-06, after it produced two wrong entries.
+// CLASSIFICATION RULE -- corrected 2026-09-06, after it produced two wrong entries, and superseded
+// by T81 item B, which permutes every particle buffer every step and thereby removed the ORIGINAL
+// space entirely. A buffer can still be WRITTEN after the sort in the current order (bodies_acc1,
+// bodies_forceSoftening, bodies_typeDevice) without ever being permuted; those are SPACE_CURRENT
+// because they are produced at the current index, not because they were permuted.
 //
-// WRONG rule (what the first version of this registry used):
-//     "not permuted by sort_bodies  =>  SPACE_ORIGINAL"
-// That is a non-sequitur. A buffer can also be WRITTEN after the sort, in the current order,
-// without ever being permuted -- bodies_acc1, bodies_dens, bodies_typeDevice and
-// bodies_forceSoftening are all like this. The naive rule classified every one of them as
-// ORIGINAL; three were wrong, and one of those (bodies_forceSoftening) had already caused a real
-// latent bug in T27's fix.
-//
-// CORRECT rule: find the LAST WRITE before the phase-2 read, and ask what index it used.
-//     written before sort_bodies, not permuted            -> SPACE_ORIGINAL
-//     permuted by sort_bodies                             -> SPACE_CURRENT
-//     written after sort_bodies at the current index      -> SPACE_CURRENT
-//
-// Every entry below now cites its writer, not merely its absence from the reorder list.
+// Every entry below cites its writer, not merely its presence/absence in the reorder list.
 
 enum BufferSpace
 {
-  SPACE_CURRENT,    // Phase 2: index directly with the current sorted index.
-  SPACE_ORIGINAL,   // Phase 2: MUST go through oriParticleOrder[idx].
+  SPACE_CURRENT,    // Particle-indexed: sort permutes it, or it is written after the sort.
   SPACE_NODE,       // Indexed by tree node id; rebuilt after the sort, so no translation.
   SPACE_GROUP,      // Indexed by group id; likewise rebuilt after the sort.
   SPACE_GLOBAL      // Not particle-indexed at all (tables, scratch, reductions).
@@ -85,24 +71,23 @@ struct BufferSpec
 // Order follows octree.h's declaration order.
 static const BufferSpec kBufferRegistry[] =
 {
-  // --- particle buffers permuted by sort_bodies' default path -------------------------------
-  {"bodies_key",            SPACE_CURRENT,  EV_VERIFIED, "reordered sort_bodies_gpu.cpp:184"},
-  {"bodies_Ppos",           SPACE_CURRENT,  EV_VERIFIED, "reordered :221; drifted every step for ALL particles"},
-  {"bodies_ids",            SPACE_CURRENT,  EV_VERIFIED, "reordered :222 -- this is why raw slots churn"},
-  {"bodies_h",              SPACE_CURRENT,  EV_VERIFIED, "reordered :223. NOW WRITE-ONLY for physics: with BONSAI_DENSITY=0 its only readers are gone (adjustH and the walk density). Still written by compute_leaf and reordered by dataReorder, and still exchanged by the nProcs>1 paths in parallel.cpp -- which is why it is still full size. 512 MB at 512^3, the next cut"},
+  // --- particle buffers permuted by sort_bodies (T81 B: ALL of them) --------------------------
+  {"bodies_key",            SPACE_CURRENT,  EV_VERIFIED, "reordered sort_bodies_gpu.cpp"},
+  {"bodies_Ppos",           SPACE_CURRENT,  EV_VERIFIED, "reordered; drifted every step for ALL particles"},
+  {"bodies_ids",            SPACE_CURRENT,  EV_VERIFIED, "reordered -- this is why raw slots churn"},
+  {"bodies_vel",            SPACE_CURRENT,  EV_VERIFIED, "reordered (T81 A); correct_particles updates it in place"},
+  {"bodies_acc0",           SPACE_CURRENT,  EV_VERIFIED, "reordered (T81 B); the T23 Bug 2 class is now unwriteable"},
+  {"bodies_time",           SPACE_CURRENT,  EV_VERIFIED, "reordered (T81 B); the C-D-03b class is now unwriteable"},
+  {"bodies_h",              SPACE_CURRENT,  EV_VERIFIED, "reordered. NOW WRITE-ONLY for physics: with BONSAI_DENSITY=0 its only readers are gone (adjustH and the walk density). Still written by compute_leaf and reordered by dataReorder, and still exchanged by the nProcs>1 paths in parallel.cpp -- which is why it is still full size. 512 MB at 512^3, the next cut"},
+  {"bodies_pos",            SPACE_CURRENT,  EV_VERIFIED, "T81 B; bound to bodies_Ppos (C-A-22 fold), so already permuted"},
 
-  // --- particle buffers NOT permuted: translate in Phase 2 ----------------------------------
-  {"bodies_pos",            SPACE_ORIGINAL, EV_VERIFIED, "T12; rewritten at NEW idx by correct_particles"},
-  {"bodies_vel",            SPACE_CURRENT,  EV_VERIFIED, "T81: permuted by sort_bodies; correct_particles updates it in place"},
-  {"bodies_acc0",           SPACE_ORIGINAL, EV_VERIFIED, "T23 Bug 2 -- computeGroupMaxAccel must translate"},
-  {"bodies_time",           SPACE_ORIGINAL, EV_VERIFIED, "C-D-03b -- setActiveGroups must translate"},
-  {"bodies_forceSoftening", SPACE_CURRENT,  EV_VERIFIED, "written AFTER the sort by recomputeSoftening (gpu_iterate.cpp:592); bodies_type is rebuilt from the resorted bodies_ids at :2120, so CURRENT order. T27 said ORIGINAL and was wrong; I copied that claim into this registry without checking it."},
+  // --- produced after the sort, so already in the current space -----------------------------
+  {"bodies_forceSoftening", SPACE_CURRENT,  EV_VERIFIED, "written AFTER the sort by recomputeSoftening (gpu_iterate.cpp); bodies_type is rebuilt from the resorted bodies_ids, so CURRENT order. T27 said ORIGINAL and was wrong; I copied that claim into this registry without checking it."},
   {"bodies_dens",           SPACE_CURRENT,  EV_VERIFIED, "DISABLED (BONSAI_DENSITY=0 in node_specs.h): allocated at 1 element. When on, written by the walk at `addr`, the same index it writes acc_out/active_inout with. Carries no gravity: softening comes from bodies_forceSoftening, not bodies_h"},
-  {"bodies_typeDevice",     SPACE_CURRENT,  EV_VERIFIED, "written by recomputeSoftening AFTER the sort, in lockstep with bodies_forceSoftening (gpu_iterate.cpp:2161)"},
+  {"bodies_typeDevice",     SPACE_CURRENT,  EV_VERIFIED, "written by recomputeSoftening AFTER the sort, in lockstep with bodies_forceSoftening (gpu_iterate.cpp)"},
 
   // --- produced after the sort, so already in the current space -----------------------------
   {"bodies_acc1",           SPACE_CURRENT,  EV_VERIFIED, "written by approximate_gravity at the new idx"},
-  {"oriParticleOrder",      SPACE_CURRENT,  EV_VERIFIED, "IS the map: current idx -> original idx"},
 
   // --- node / group indexed ------------------------------------------------------------------
   {"level_list",            SPACE_NODE,   EV_INFERRED, ""},
@@ -146,7 +131,6 @@ inline const char *bufferSpaceName(BufferSpace s)
   switch (s)
   {
     case SPACE_CURRENT:  return "CURRENT";
-    case SPACE_ORIGINAL: return "ORIGINAL";
     case SPACE_NODE:     return "NODE";
     case SPACE_GROUP:    return "GROUP";
     default:             return "GLOBAL";

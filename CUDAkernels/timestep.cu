@@ -543,11 +543,10 @@ KERNEL_DECLARE(predict_particles)(const int 	n_bodies,
 // translation correct_particles() already applies to this exact buffer.
 KERNEL_DECLARE(setActiveGroups)(const int n_bodies,
                                             int tc,          // Ti_current, in ticks
-                                            OriginalOrder<int2> time,
+                                            CurrentOrder<int2> time,
                                             CurrentOrder<const uint> body2grouplist,
                                             GroupOrder<uint> valid_list,   /* activeGrpList */
-                                            const int n_groups,
-                                            CurrentOrder<const uint> oriParticleOrder){
+                                            const int n_groups){
   const uint bid = blockIdx.y * gridDim.x + blockIdx.x;
   const uint tid = threadIdx.x;
   const CurrentIdx idx = { bid * blockDim.x + tid };
@@ -556,20 +555,12 @@ KERNEL_DECLARE(setActiveGroups)(const int n_bodies,
   // unsigned explicitly, instead of relying on the usual arithmetic conversions to do it.
   if (idx.v >= (unsigned int) n_bodies) return;
 
-  // C-D-03b, and the reason this kernel is worth typing: body2grouplist is rebuilt AFTER the sort
-  // (CurrentOrder) while bodies_time is never resorted (OriginalOrder). Pairing them on one index
-  // meant due particles were never activated, t_current was pinned, and 99.6% of all iterations
-  // did nothing -- for weeks, silently.
-  //
-  // The GADGET_HIP_CD03B_FIX_INDEX=0 branch exists to REPRODUCE that bug for A/B work, so the
-  // type system has to permit it -- but only as a named, deliberate construction, never as the
-  // accident of reusing the same integer.
-  const OriginalIdx timeIdx = g_cd03b_fix_index
-      ? to_original(idx, oriParticleOrder)
-      : OriginalIdx{ idx.v };                  // the C-D-03b bug, on purpose
+  // T81 item B: bodies_time is permuted by sort_bodies (CurrentOrder), so it is indexed directly --
+  // the C-D-03b translation that paired an unpermuted bodies_time with the post-sort
+  // body2grouplist is gone, and the bug it reproduced can no longer be written.
   // Integer equality. As float32 scale factors this comparison missed the rendezvous by 1 ULP and
   // cost a whole system step (T24/T38); it cannot now.
-  const int te = time[timeIdx].y;
+  const int te = time[idx].y;
 
   //Set the group to active if the time current = time end of
   //this particle. Can be that multiple particles write to the
@@ -620,26 +611,19 @@ static __device__ __forceinline__ float tiMidpointD(const float a1, const float 
 
 KERNEL_DECLARE(correct_particles)(const int n_bodies,
                                   /*  1 */   float tc,
-// THIS KERNEL IS WHERE THE TWO SPACES RE-UNIFY, which is why its parameter list mixes them more
-// than any other. `pos` is CurrentOrder because it is WRITTEN at the current slot, which is what
-// establishes the order the next Phase 1 treats as original. What is still read from the previous
-// step's layout (acc0, time) is OriginalOrder and goes through unsorted[].
-//
-// T81: `vel` is now CurrentOrder on BOTH sides. sort_bodies permutes bodies_vel along with
-// bodies_Ppos/bodies_ids, so this kernel reads and writes the velocity at the SAME slot -- an
-// in-place read-modify-write, race-free because each thread touches only its own idx. That is what
-// retired bodies_Pvel: the snapshot existed only to make the read-at-old / write-at-new pairing
-// safe.
-                                  /*  2 */   OriginalOrder<int2> time,        // ticks
+// T81: every particle buffer is permuted by sort_bodies, so this kernel reads and writes every
+// array at the SAME slot -- an in-place read-modify-write, race-free because each thread touches
+// only its own idx. Item A retired bodies_Pvel and put bodies_vel here on both sides; item B did
+// the same for bodies_time and bodies_acc0, so there is no translation anywhere in this kernel.
+                                  /*  2 */   CurrentOrder<int2> time,         // ticks
                                   /*  3 */   CurrentOrder<const uint> active_list,
                                   /*  4 */   CurrentOrder<real4> vel,         // read AND written, same slot
-                                  /*  5 */   OriginalOrder<const real4> acc0,
+                                  /*  5 */   CurrentOrder<const real4> acc0,
                                   /*  6 */   CurrentOrder<const real4> acc1,
                                   /*  7 */   CurrentOrder<float> body_h,
                                   /*  8 */   CurrentOrder<const float2> body_dens,
                                   /*  9 */   CurrentOrder<real4> pos,         // written at the new slot
                                   /* 10 */   CurrentOrder<const real4> pPos,
-                                  /* 11 */   CurrentOrder<uint> unsorted,     // read, then reset to identity
                                   /* 12 */   CurrentOrder<real4> acc0_new,
                                   /* 13 */   CurrentOrder<int2> time_new,     // ticks
                                   /* 14 */   int    comovingIntegrationOn,
@@ -672,15 +656,13 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
     // corruption iteration, matching every corrupted probe index to active_list[idx]==0). Fix:
     // pass through the particle's existing (old-order) acc0/time unchanged instead of leaving its
     // scratch slot untouched, using the same unsortedIdx indirection the active path uses below.
-    const OriginalIdx cd03_o = to_original(idx, unsorted);
     // C-D-03: a particle promoted by its group but not actually due keeps drifting, is not kicked,
     // and keeps its existing time bin -- exactly what Gadget-2 does for a non-due particle.
-    const bool cd03_notDue = g_cd03_strict_active && (time[cd03_o].y != Ti_current);
+    const bool cd03_notDue = g_cd03_strict_active && (time[idx].y != Ti_current);
     if (active_list[idx] != 1 || cd03_notDue)
     {
-      const OriginalIdx unsortedIdx = cd03_o;
-      acc0_new[idx] = acc0[unsortedIdx];
-      time_new[idx] = time[unsortedIdx];
+      acc0_new[idx] = acc0[idx];
+      time_new[idx] = time[idx];
 
       // TICKET T12 FIX: pos/vel (bodies_pos/bodies_vel) are NEVER reordered by sort_bodies()'s
       // default per-iteration resort (only bodies_Ppos/bodies_ids/bodies_h are -- see
@@ -720,20 +702,16 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
       // also what Gadget-2 does, since velocity only changes at a particle's own sync event.
       pos[idx] = pPos[idx];
 
-      unsorted[idx] = idx.v;
       return;
     }
   #endif
 
 
-  // The bug T12 root-caused here was reading an unpermuted buffer with the current slot index.
-  // For the velocity that spelling is no longer merely rejected by the types -- it is now the
-  // CORRECT one, because sort_bodies permutes bodies_vel (T81). For bodies_time and bodies_acc0 it
-  // is still wrong, and still a compile error: they remain OriginalOrder and need unsorted[].
-  const OriginalIdx unsortedIdx = to_original(idx, unsorted);
+  // T81 item B: bodies_time and bodies_acc0 are now permuted by sort_bodies too, so every buffer
+  // in this kernel is CurrentOrder and indexed directly -- the T12 class is unwritable.
 
   float4 a1 = acc1[idx];
-  float  tb = gadget_ti_to_a(time[unsortedIdx].x, logTimeBegin, dPerTick, comovingIntegrationOn); // old Ti_begstep
+  float  tb = gadget_ti_to_a(time[idx].x, logTimeBegin, dPerTick, comovingIntegrationOn); // old Ti_begstep
   // T81: the particle's own velocity, at its own slot -- bodies_vel is permuted by sort_bodies, so
   // this is both the pre-kick velocity (including any long-range kick gadget_pm_kick applied to
   // this same slot earlier in correct()) and the slot that is written back below.
@@ -752,7 +730,7 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
   // global sync time (identical whenever the particle is genuinely due; different exactly when
   // group activation promoted it early).
   const float teOld  = g_cd02_kick_tend
-                         ? gadget_ti_to_a(time[unsortedIdx].y, logTimeBegin, dPerTick, comovingIntegrationOn)
+                         ? gadget_ti_to_a(time[idx].y, logTimeBegin, dPerTick, comovingIntegrationOn)
                          : tc;
   const float tstart = tiMidpointD(tb, teOld, comovingIntegrationOn);        // midpoint of old step
   const float tend   = tiMidpointD(tc,
@@ -772,9 +750,8 @@ KERNEL_DECLARE(correct_particles)(const int n_bodies,
   vel     [idx] = v;
   acc0_new[idx] = a1;
   time_new[idx] = make_int2(Ti_current, newEnd[idx]);  // Ti_begstep = old Ti_endstep; Ti_endstep = new
-  // THE RE-UNIFICATION: from here the two spaces coincide again, which is what lets the next
-  // Phase 1 index every buffer directly (buffer_registry.h, Phase 3).
-  unsorted[idx] = idx.v;  //Have to reset it in case we do not resort the particles
+  // T81 item B: the buffers are already in their next-step order; nothing to reset -- sort_bodies
+  // permutes everything every step.
 
   //Adjust the search radius for the next iteration to get closer to the
   //requested number of neighbours
@@ -973,8 +950,7 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
                                        float    dtDisplacement,
                                        int      comovingFlag,
                                        CurrentOrder<int> newEnd,          /* ticks */
-                                       OriginalOrder<int2> time,          /* C-D-13: (begin,end) ticks */
-                                       CurrentOrder<const uint> unsorted, /* oriParticleOrder */
+                                       CurrentOrder<int2> time,           /* C-D-13: (begin,end) ticks */
                                        CurrentOrder<const real4> bodies_acc,      /* acc1 */
                                        CurrentOrder<const float> bodies_forceSoftening,
                                        CurrentOrder<const uint> active_list,
@@ -992,9 +968,8 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
   const int tid =  threadIdx.y * blockDim.x + threadIdx.x;
   const int dim =  blockDim.x * blockDim.y;
 
-  // Spaces per include/buffer_registry.h: bodies_acc1, forceSoftening, activePartlist and
-  // bodies_ids are all CURRENT (written or permuted after the sort); bodies_time is the one
-  // ORIGINAL buffer here, which is why it alone is read through unsorted[].
+  // Spaces per include/buffer_registry.h: every buffer here is CURRENT (written or permuted after
+  // the sort) since T81 item B -- bodies_time is no longer ORIGINAL and needs no translation.
   const CurrentIdx idx = { (unsigned int)(bid * dim + tid) };
   if (idx.v >= (unsigned int) n_bodies) return;
 
@@ -1157,9 +1132,8 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
     // new step still divides the remaining span, which keeps it on the lattice. This test was
     // previously applied to a non-power-of-two tick count and was therefore essentially never
     // satisfiable -- every growth was blocked (C-D-13).
-    const OriginalIdx o = to_original(idx, unsorted);
-    const int tiEndOld = time[o].y;
-    const int tiBegOld = time[o].x;
+    const int tiEndOld = time[idx].y;
+    const int tiBegOld = time[idx].x;
     const int sOldTick = tiEndOld - tiBegOld;
     atomicAdd(&g_cd13_reached, 1u);
     if (sOldTick > 0 && ti_step > sOldTick) atomicAdd(&g_cd13_grow, 1u);
@@ -1204,7 +1178,7 @@ extern "C"  __global__ void compute_dt(const int n_bodies,
   // particle and kills a healthy run, and only ever on statistics iterations, which is maximally
   // confusing. Report only for particles that are genuinely due, i.e. the ones whose step is really
   // committed.
-  const bool t7_notDue = g_cd03_strict_active && (time[to_original(idx, unsorted)].y != tc);
+  const bool t7_notDue = g_cd03_strict_active && (time[idx].y != tc);
   if (!t7_notDue && !(newEnd[idx] > tc))
   {
     if (atomicAdd(&g_t7_nonadvancing, 1u) == 0u)
@@ -1388,30 +1362,24 @@ KERNEL_DECLARE(compute_energy_double)(const int n_bodies,
 // need bodies_ids (8 B/particle) resident every step purely to reach the id-space GravPM. Emitting
 // the scalar instead also replaces a real4 acc0 transfer (16 B/particle) with a float one.
 //
-// INDEX SPACES, all three of them (the recurring hazard -- see buffer_registry.h):
-//   idx           current sorted order      -- this thread's slot
-//   o = unsorted[idx]  original order       -- bodies_acc0, and the output, are in THIS space
+// INDEX SPACES (see buffer_registry.h):
+//   idx           current sorted order      -- this thread's slot; acc and magOri live here (T81 B)
 //   ids[idx]      id space                  -- GravPM is stored here so it survives the re-sort
 extern "C" __global__ void gadget_aold_mag(const int    n_bodies,
-                                           OriginalOrder<const real4> acc,
-                                           CurrentOrder<const uint> unsorted,   /* oriParticleOrder */
+                                           CurrentOrder<const real4> acc,
                                            CurrentOrder<const unsigned long long> ids,
                                            IdSpace<const GFreeAcc> gpmx,   /* G-free; null -> tree only */
                                            IdSpace<const GFreeAcc> gpmy,
                                            IdSpace<const GFreeAcc> gpmz,
                                            const GCarrier  G,       /* bare G: acc is already G-scaled */
-                                           OriginalOrder<float> magOri)  /* |a|, same space as acc */
+                                           CurrentOrder<float> magOri)  /* |a|, same space as acc */
 {
   const int bid = blockIdx.y * gridDim.x + blockIdx.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  // Three spaces here: idx is the slot, o is the same particle's slot in the unpermuted buffers,
-  // id is its particle id. acc and magOri are both OriginalOrder and so both take o -- writing
-  // magOri[idx] was silent before and does not compile now.
+  // idx is the slot, id is the particle id. acc and magOri are both CurrentOrder and take idx.
   const CurrentIdx idx = { (unsigned int)(bid * (blockDim.x * blockDim.y) + tid) };
   if (idx.v >= (unsigned int) n_bodies) return;
-  const OriginalIdx o = to_original(idx, unsorted);
-  if (o.v >= (uint) n_bodies) return;
-  const real4 a = acc[o];
+  const real4 a = acc[idx];
   float ax = a.x, ay = a.y, az = a.z;
   if (!gpmx.is_null())
   {
@@ -1426,15 +1394,14 @@ extern "C" __global__ void gadget_aold_mag(const int    n_bodies,
       az += gpmz[id] * G;
     }
   }
-  magOri[o] = sqrtf(ax*ax + ay*ay + az*az);
+  magOri[idx] = sqrtf(ax*ax + ay*ay + az*az);
 }
 
 static __device__ void compute_energy_double_prekickD(const int n_bodies,
                                             CurrentOrder<const real4> pos,
                                             CurrentOrder<const real4> vel,    /* bodies_vel, pre-kick: correct() has not run yet */
                                             CurrentOrder<const real4> acc,    /* acc1 */
-                                            CurrentOrder<const uint> unsorted,
-                                            OriginalOrder<const int2> time,   // Phase 2: ticks
+                                            CurrentOrder<const int2> time,    // Phase 2: ticks
                                             float  tc,
                                             int    comovingFlag,
                                             const float *gravKickTable,
@@ -1466,14 +1433,12 @@ static __device__ void compute_energy_double_prekickD(const int n_bodies,
     {
       const CurrentIdx j = { i + (half ? blockSize : 0) };
       if (j.v >= (unsigned int) n_bodies) continue;
-      // T81: pos, acc and now vel are all post-sort (CurrentOrder) and indexed directly. Only
-      // bodies_time is still unpermuted, so it alone goes through unsorted[] -- one translation,
-      // expressed in the types rather than in prose.
-      const OriginalIdx u = to_original(j, unsorted);
+      // T81: every buffer here (pos, vel, acc, time) is post-sort (CurrentOrder) and indexed
+      // directly; the translation is gone.
       real4 temp = vel[j];
       if (g_energy_extrap)
       {
-        const int2   t    = time[u];
+        const int2   t    = time[j];
         // Ti_begstep/Ti_endstep are ticks; convert before taking the kick midpoint.
         const float  tmid = tiMidpointD(gadget_ti_to_a(t.x, logTimeBegin, dPerTick, comovingFlag),
                                         gadget_ti_to_a(t.y, logTimeBegin, dPerTick, comovingFlag),
@@ -1553,8 +1518,7 @@ KERNEL_DECLARE(compute_energy_double_prekick)(const int n_bodies,
                                             CurrentOrder<const real4> pos,
                                             CurrentOrder<const real4> vel,    /* bodies_vel, pre-kick: correct() has not run yet */
                                             CurrentOrder<const real4> acc,    /* acc1 */
-                                            CurrentOrder<const uint> unsorted,
-                                            OriginalOrder<const int2> time,   // Phase 2: ticks
+                                            CurrentOrder<const int2> time,    // Phase 2: ticks
                                             float  tc,
                                             int    comovingFlag,
                                             const float *gravKickTable,
@@ -1571,7 +1535,7 @@ KERNEL_DECLARE(compute_energy_double_prekick)(const int n_bodies,
                                             GCarrier dtGravKickPM,          /* PM midpoint -> now, times G */
                                             double2 *energy) {
   extern __shared__ double shDDataKin[];
-  compute_energy_double_prekickD(n_bodies, pos, vel, acc, unsorted, time, tc, comovingFlag,
+  compute_energy_double_prekickD(n_bodies, pos, vel, acc, time, tc, comovingFlag,
                                   gravKickTable, logTimeBegin, dPerTick, logTimeMax,
                                   forceSoftening, selfCoef, cc10Coef,
                                   ids, gpmx, gpmy, gpmz, dtGravKickPM, energy, shDDataKin);
@@ -1613,15 +1577,6 @@ void timestep_test_compute_dt(int n, float tc, float errTolIntAccuracy, float at
     std::vector<int2> h_time(n, make_int2(0, 0));
     hipMemcpy(d_time, h_time.data(), n * sizeof(int2), hipMemcpyHostToDevice);
   }
-  // time[] is indexed through oriParticleOrder in the real call path; the harness is a flat
-  // synthetic set, so identity is the correct mapping here.
-  uint *d_unsorted = nullptr;
-  CU_SAFE_CALL(hipMalloc((void**)&d_unsorted, n * sizeof(uint)));
-  {
-    std::vector<uint> h_uns(n);
-    for (int i = 0; i < n; i++) h_uns[i] = (uint) i;
-    hipMemcpy(d_unsorted, h_uns.data(), n * sizeof(uint), hipMemcpyHostToDevice);
-  }
 
   const int block = 128;
   const dim3 grid((n + block - 1) / block, 1);
@@ -1630,10 +1585,7 @@ void timestep_test_compute_dt(int n, float tc, float errTolIntAccuracy, float at
                       minSizeTimestep, dtDisplacement, comovingFlag,
                       // The wrappers have no implicit conversion from a raw pointer -- that is what
                       // makes them enforce anything -- so this harness states each space explicitly.
-                      // It feeds a flat synthetic set where oriParticleOrder is the identity, so
-                      // current and original coincide here; saying so in the braces is the point.
-                      CurrentOrder<int>{d_newEnd}, OriginalOrder<int2>{d_time},
-                      CurrentOrder<const uint>{d_unsorted},
+                      CurrentOrder<int>{d_newEnd}, CurrentOrder<int2>{d_time},
                       CurrentOrder<const real4>{d_acc},
                       CurrentOrder<const float>{d_soft},
                       CurrentOrder<const uint>{d_active},
@@ -1650,7 +1602,7 @@ void timestep_test_compute_dt(int n, float tc, float errTolIntAccuracy, float at
   hipMemcpy(h_newEnd.data(), d_newEnd, n * sizeof(int), hipMemcpyDeviceToHost);
   for (int i = 0; i < n; i++) h_dtOut[i] = h_newEnd[i] - tc;
 
-  hipFree(d_acc); hipFree(d_soft); hipFree(d_newEnd); hipFree(d_active); hipFree(d_time); hipFree(d_unsorted);
+  hipFree(d_acc); hipFree(d_soft); hipFree(d_newEnd); hipFree(d_active); hipFree(d_time);
 }
 
 // Phase 5 ticket 05 (PLAN.md): direct-launch test for the device-side driftFactorD() lookup
@@ -1784,8 +1736,7 @@ unsigned int dtglobals_read_badidx(void)
 
 KERNEL_DECLARE(gadget_timestep_globals)(const int n,
                                         const real4 *pos,          // current order: mass in .w
-                                        const real4 *vel,          // ORIGINAL order
-                                        const uint  *unsorted,     // oriParticleOrder
+                                        const real4 *vel,          // current order (T81 B)
                                         const int   *typeDevice,   // current order
                                         double *outVSum,           // [6]
                                         double *outMinMass,        // [6]
@@ -1807,7 +1758,7 @@ KERNEL_DECLARE(gadget_timestep_globals)(const int n,
     const int t = typeDevice[idx];
     if (t >= 0 && t < 6)
     {
-      const uint  o = unsorted[idx];
+      const uint  o = idx;   // T81 B: vel is current-order, so o == idx; the bounds guard below is now dead
       // Bounds guard: an out-of-range index here reads outside `vel`, which faults the device
       // rather than returning a wrong answer, so it has to be checked and not assumed.
       //

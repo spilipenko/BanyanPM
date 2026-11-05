@@ -299,7 +299,8 @@ class tree_structure
     // but the array itself must always exist so the kernel signature doesn't need two variants.
     my_dev::dev_mem<int>   bodies_typeDevice;
 
-    my_dev::dev_mem<uint>   oriParticleOrder;  //Used in the correct function to speedup reorder
+    // T81 item B removed oriParticleOrder: sort_bodies permutes every particle buffer, so there is
+    // no "original order" to record. The sort's permutation is a transient generalBuffer1 view.
 
     
     my_dev::dev_mem<uint2> level_list;    //List containing the start and end positions of each level
@@ -339,7 +340,7 @@ class tree_structure
     // forced-descent rule actually tests -- hence the sign channel rather than a second buffer.
     // Sized and indexed exactly like cellSizeInfo, which the walk already fetches per cell.
     my_dev::dev_mem<float>  nodeSoftInfo;
-    my_dev::dev_mem<float>  bodies_aoldMag;   //T45: per-particle |tree + PM| in ORIGINAL order (matches
+    my_dev::dev_mem<float>  bodies_aoldMag;   //T45: per-particle |tree + PM| in CURRENT order (matches
                                              //bodies_acc0); only allocated when the PM cadence is on
     my_dev::dev_mem<float>  groupMaxAccInfo;  //Per-group max |a_old|, Springel(2005) MAC input (Phase 3)
     my_dev::dev_mem<float>  groupMaxSofteningInfo;  //T27: per-group max Gadget-2 ForceSoftening,
@@ -489,19 +490,12 @@ protected:
   //     t_current / t_previous / iter / the snapshot counter / the snapshot and statistics
   //     cadence cursors / the displacement ceiling
   //
-  // INDEX SPACE: the file is written entirely in ONE order, so reading it back is
-  // indistinguishable from a fresh IC load and sort_bodies rebuilds the permutation from scratch.
-  // That order is NOT the IC load order, despite what this comment said until T81: the per-step
-  // permutation is reset to the identity by correct_particles every step, so "original" here means
-  // the order as of the PREVIOUS step's correct_particles. Nothing depends on which it is, because
-  // the reader re-sorts, but the distinction matters if anyone tries to match this file against
-  // the IC by slot.
-  //
-  // The default per-iteration reorder permutes bodies_Ppos, bodies_ids and (since T81) bodies_vel,
-  // so those three are un-permuted through oriParticleOrder on the way out; bodies_time and
-  // bodies_acc0 are already in that order and are written straight. Getting this wrong would pair
-  // each particle's position with another's velocity -- the same defect class as
-  // C-B-13/C-C-18/C-D-08, and invisible until the run diverged.
+  // INDEX SPACE: the file is written entirely in ONE order -- the current sorted order, since T81
+  // item B permutes every particle buffer and correct_particles updates them in place -- so reading
+  // it back is indistinguishable from a fresh IC load and sort_bodies rebuilds the sort from
+  // scratch. Nothing depends on which order it is, because the reader re-sorts, but every array
+  // must be written in the SAME order: pairing one array's slot with another's would be the
+  // C-B-13/C-C-18/C-D-08 defect class, invisible until the run diverged.
 public:  // main() configures the restart from the CLI/parameterfile, so these are not protected.
   bool   writeRestartFile(const char *path);
   bool   readRestartFile(const char *path);
@@ -688,7 +682,7 @@ public:
    void dataReorder2(const int N, my_dev::dev_mem<uint> &permutation,
                      my_dev::dev_mem<T>  &dIn, my_dev::dev_mem<T>  &dOut);
 
-    void sort_bodies(tree_structure &tree, bool doDomainUpdate, bool doFullShuffle = false);
+    void sort_bodies(tree_structure &tree, bool doDomainUpdate);
     void getBoundaries(tree_structure &tree, real4 &r_min, real4 &r_max);
     void getBoundariesGroups(tree_structure &tree, real4 &r_min, real4 &r_max);  
 

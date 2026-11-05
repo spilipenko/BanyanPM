@@ -144,8 +144,6 @@ void octree::allocateParticleMemory(tree_structure &tree)
   tree.bodies_typeDevice.ccalloc_unified(n_bodies, my_dev::dev_mem<int>::ALIAS_TYPEDEV);
 
 
-  DMTAG(tree.oriParticleOrder);
-  tree.oriParticleOrder.cmalloc_unified(n_bodies, my_dev::dev_mem<uint>::ALIAS_ORIORDER);      //To desort the bodies tree later on
   //iteration properties / information
   DMTAG(tree.activePartlist);
   tree.activePartlist.ccalloc_unified(n_bodies+2, my_dev::dev_mem<uint>::ALIAS_ACTIVEPART);   //+2 since we use the last two values as a atomicCounter (for grp count and semaphore access)
@@ -335,8 +333,6 @@ void octree::reallocateParticleMemory(tree_structure &tree)
   tree.bodies_dens.cresize(1, reduce);        // density subsystem off, see node_specs.h
 #endif
   
-  DMTAG(tree.oriParticleOrder);
-  tree.oriParticleOrder.cresize(n_bodies,   reduce);     //To desort the bodies tree later on
   //iteration properties / information
   DMTAG(tree.activePartlist);
   tree.activePartlist.cresize(  n_bodies+2, reduce);      //+1 since we use the last value as a atomicCounter

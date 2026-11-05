@@ -862,7 +862,10 @@ namespace my_dev {
       ALIAS_ACC1        = 1u << 9,
       ALIAS_TIME        = 1u << 10,
       ALIAS_TYPEDEV     = 1u << 11,
-      ALIAS_ORIORDER    = 1u << 12,
+      // Bit 12 was ALIAS_ORIORDER, retired with oriParticleOrder in T81 item B. Deliberately NOT
+      // reused for the same reason as bit 1: the alias word is settable as a bitmask via
+      // GADGET_HIP_UNIFIED_ARRAYS, and renumbering would silently change every value already
+      // recorded in a ticket.
       ALIAS_ACTIVEPART  = 1u << 13,
       ALIAS_BODY2GROUP  = 1u << 14,
       ALIAS_TREESCRATCH = 1u << 15,  // n_children, node_bodies
