@@ -207,8 +207,15 @@ TimeMax             1.0
 Omega0              0.3
 
 % [HONOURED] Dark energy density parameter. Same consumers as Omega0; curvature is taken as
-% 1 - Omega0 - OmegaLambda.
+% 1 - Omega0 - OmegaLambda - OmegaRad.
 OmegaLambda         0.7
+
+% [HONOURED, OPTIONAL — default 0] Radiation density in units of the critical density at z=0.
+% Enters ONLY the background expansion H(a): the drift/kick factors and the timestep Hubble factor.
+% Radiation is smooth and sources no potential, so it does NOT enter the mean matter density (the
+% RMS-displacement spacing) -- matching Gadget-2.0.9's own decision. Needed to start runs at
+% z > 1000, where radiation dominates. Omit this key for a matter+Lambda run.
+OmegaRad            0.0
 
 % [HONOURED] Baryon density parameter -- and it does something even in a run with no gas. The
 % RMS-displacement timestep limit computes each type's mean interparticle spacing from its own
