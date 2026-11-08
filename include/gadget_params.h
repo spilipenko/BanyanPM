@@ -13,10 +13,11 @@
 // Scope, per PHASE5_PARAMS_SNAPSHOT_SPEC.md Sec 0: `read_parameter_file()` (begrun.c:280-752)
 // registers all 65 tags with ZERO compile-time (#ifdef) gating -- every tag is required in every
 // real `.param` file regardless of PERIODIC/PMGRID/etc, confirmed against both shipped example
-// files. So this struct holds all 65 fields unconditionally; which ones actually drive behavior
-// in this DM-only, SPH-less, MPI-less port is a matter for the *consumers* of this struct (later
-// Phase 5 tickets), not for the parser itself -- SPH-only/MPI-only tags are still parsed and
-// stored here, never rejected as unknown, matching real-world `.param` files that list all 65
+// files. This port adds one more tag, `OmegaRad` (T82), which is the single OPTIONAL one (default 0
+// when absent). So this struct holds all 66 fields unconditionally; which ones actually drive
+// behavior in this DM-only, SPH-less, MPI-less port is a matter for the *consumers* of this struct
+// (later Phase 5 tickets), not for the parser itself -- SPH-only/MPI-only tags are still parsed
+// and stored here, never rejected as unknown, matching real-world `.param` files that list all 65
 // keys unconditionally (spec Sec 1.6).
 struct GadgetParams
 {
@@ -50,6 +51,12 @@ struct GadgetParams
                                      // interparticle spacing, and hence a dt_displacement, set
                                      // from Omega0 minus the baryons it does not have.
   double OmegaLambda = 0.0;
+  // T82: radiation density in units of the critical density at z=0 (allvars.h:319 in the
+  // Gadget-2.0.9 fork). OPTIONAL -- the parser leaves it at 0 when the tag is absent, unlike every
+  // other tag (see the note on gadget_params_parse below). Only drives the background expansion
+  // H(a); it must NOT enter the mean matter density (displacement constraint, potential
+  // normalisation) because radiation is smooth and sources no potential.
+  double OmegaRad = 0.0;
   double HubbleParam = 0.0;          // "little h" -- header/output bookkeeping only, not used to
                                       // rescale internal G/Hubble (spec Sec 1.5, tag 15)
   double BoxSize = 0.0;
@@ -140,10 +147,11 @@ struct GadgetParams
 
 // Parses a Gadget-2 `.param` file into `out`, matching read_parameter_file()'s exact semantics
 // (begrun.c:280-752, PHASE5_PARAMS_SNAPSHOT_SPEC.md Sec 1.1): whitespace-tokenized `tag value`
-// pairs, a line is a comment only if its first token starts with '%', each of the 65 known tags
-// must appear exactly once (duplicate or unrecognized tag is a hard error), and a tag missing by
-// EOF is a hard error -- there is no default-value mechanism anywhere in this parser, matching the
-// source exactly.
+// pairs, a line is a comment only if its first token starts with '%', and a duplicate or
+// unrecognized tag is a hard error. A tag missing by EOF is a hard error for every tag EXCEPT the
+// few marked OPTIONAL, which keep their C++ default instead -- the one divergence from stock
+// Gadget-2's "no defaults anywhere" rule, introduced deliberately: `OmegaRad` is optional and
+// defaults to 0 so existing parameter files (which predate it) keep working unchanged.
 //
 // On success, returns true and `out` holds every parsed value (deriveUnits() is called
 // automatically before returning). On failure, returns false and `errors` holds one human-readable

@@ -23,6 +23,9 @@ struct TagEntry
   const char *name;
   TagType     type;
   void       *addr;
+  // T82: when true, a missing tag is NOT an error -- the field keeps its C++ default. The only
+  // optional tag today is OmegaRad (default 0), so pre-T82 parameter files keep working unchanged.
+  bool        optional = false;
 };
 
 // SEC_PER_MEGAYEAR / GRAVITY / HUBBLE: physical constants Gadget-2 hardcodes in allvars.h (61,
@@ -53,6 +56,7 @@ std::vector<TagEntry> buildTagTable(GadgetParams &p)
     { "Omega0",                    TagType::DOUBLE, &p.Omega0 },
     { "OmegaBaryon",               TagType::DOUBLE, &p.OmegaBaryon },
     { "OmegaLambda",               TagType::DOUBLE, &p.OmegaLambda },
+    { "OmegaRad",                  TagType::DOUBLE, &p.OmegaRad,    true },
     { "HubbleParam",               TagType::DOUBLE, &p.HubbleParam },
     { "BoxSize",                   TagType::DOUBLE, &p.BoxSize },
     { "PeriodicBoundariesOn",      TagType::INT,    &p.PeriodicBoundariesOn },
@@ -216,12 +220,11 @@ bool gadget_params_parse(const std::string &filename, bool builtWithPeriodic, Ga
     seen[it->second] = true;
   }
 
-  // begrun.c:662-670 -- any tag never matched by EOF is a hard error. Every one of the 65 tags is
-  // required unconditionally (PHASE5_PARAMS_SNAPSHOT_SPEC.md Sec 0) -- there is no default-value
-  // mechanism to fall back to.
+  // begrun.c:662-670 -- any tag never matched by EOF is a hard error, EXCEPT the few marked
+  // optional (T82), which keep their C++ default instead (OmegaRad defaults to 0).
   for (size_t i = 0; i < table.size(); ++i)
   {
-    if (!seen[i])
+    if (!seen[i] && !table[i].optional)
       errors.push_back(filename + ": missing required tag '" + std::string(table[i].name) +
                         "'");
   }

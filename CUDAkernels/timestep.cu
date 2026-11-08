@@ -290,9 +290,6 @@ __constant__ int g_cd02_kick_tend = 0;
 // branch, so the early dt computed for it is discarded.
 __constant__ int g_cd03_strict_active = 0;
 
-// C-D-03b: use oriParticleOrder to read bodies_time in setActiveGroups (see that kernel's comment).
-__constant__ int g_cd03b_fix_index = 0;
-
 // T14/energy: apply Gadget-2's kick-time velocity extrapolation in the energy diagnostic.
 __constant__ int g_energy_extrap = 0;
 
@@ -339,13 +336,6 @@ void energy_set_extrap(int on)
   hipMemcpyToSymbol(HIP_SYMBOL(g_energy_extrap), &on, sizeof(int));
   fprintf(stderr, "[ENERGY-EXTRAP] kinetic energy uses %s\n",
           on ? "kick-time extrapolated velocities (Gadget-2)" : "raw stored velocities (legacy)");
-}
-
-void cd03b_set_fix_index(int on)
-{
-  hipMemcpyToSymbol(HIP_SYMBOL(g_cd03b_fix_index), &on, sizeof(int));
-  fprintf(stderr, "[CD03B-ACTIVE-INDEX] setActiveGroups reads bodies_time via %s\n",
-          on ? "oriParticleOrder (correct)" : "the raw sorted index (legacy)");
 }
 
 void cd03_set_strict_active(int on)

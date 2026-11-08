@@ -31,7 +31,8 @@ struct GadgetDriftTables
 
 // init_drift_table(), driftfac.c:26-60. Builds both cumulative tables in one pass.
 void gadget_init_drift_tables(double timeBegin, double timeMax, double omega0,
-                               double omegaLambda, double hubble, GadgetDriftTables &out);
+                               double omegaLambda, double omegaRad, double hubble,
+                               GadgetDriftTables &out);
 
 // get_drift_factor()/get_gravkick_factor(), driftfac.c:67-174 (structurally identical for both --
 // this is the shared lookup+interpolate+difference logic). `time0`/`time1` are scale factors `a`

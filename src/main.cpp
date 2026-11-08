@@ -1386,7 +1386,7 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     {
       GadgetDriftTables tables;
       gadget_init_drift_tables(/*timeBegin=*/0.02, /*timeMax=*/1.0, /*omega0=*/0.3,
-                                /*omegaLambda=*/0.7, /*hubble=*/0.1, tables);
+                                /*omegaLambda=*/0.7, /*omegaRad=*/0.0, /*hubble=*/0.1, tables);
 
       struct Case { float t0, t1; int wantKick; const char *label; };
       const std::vector<Case> cases = {
@@ -2034,11 +2034,6 @@ int bonsai_main(int argc, char** argv, MPI_Comm comm, int shrMemPID)
     const char *k3 = getenv("GADGET_HIP_CD03_STRICT_ACTIVE");
     cd02_set_kick_tend(k2 ? atoi(k2) : 1);
     cd03_set_strict_active(k3 ? atoi(k3) : 1);
-    // C-D-03b is a correctness fix (index-space mismatch, same class as the old T12/T23/T27
-    // bugs). Default ON: verified bit-identical on the synchronous path and it is what makes the
-    // individual-timestep path advance at all. GADGET_HIP_CD03B_FIX_INDEX=0 restores the old bug.
-    const char *k3b = getenv("GADGET_HIP_CD03B_FIX_INDEX");
-    cd03b_set_fix_index(k3b ? atoi(k3b) : 1);
     const char *ee = getenv("GADGET_HIP_ENERGY_EXTRAP");
     energy_set_extrap(ee ? atoi(ee) : 1);
     const char *cl = getenv("GADGET_HIP_CD04_LADDER");

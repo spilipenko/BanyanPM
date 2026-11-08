@@ -5,12 +5,15 @@
 // gadget_softening.h) because ticket 05 (comoving integration / driftfac.c tables) will reuse
 // gadget_hubble_a() too -- prefactored now rather than duplicated later.
 
-// H(a) = Hubble * sqrt(Omega0/a^3 + (1-Omega0-OmegaLambda)/a^2 + OmegaLambda), exactly as
-// computed in Gadget-2's own timestep.c:52-55 (and driftfac.c's integrands, which use the
-// identical formula -- PHASE5_ZOOM_COMOVING_SPEC.md Sec 2.1/3.1). `Hubble` here is
-// `All.Hubble = HUBBLE_cgs * UnitTime_in_s` (ticket 01's `GadgetParams::Hubble`), not H0 in
+// H(a) = Hubble * sqrt(Omega0/a^3 + (1-Omega0-OmegaLambda-OmegaRad)/a^2 + OmegaLambda + OmegaRad/a^4),
+// exactly as computed in Gadget-2's own timestep.c:52-55 (and driftfac.c's integrands, which use
+// the identical formula -- PHASE5_ZOOM_COMOVING_SPEC.md Sec 2.1/3.1). `OmegaRad` (T82) is the
+// radiation density at z=0; it enters ONLY here -- radiation is smooth and sources no potential,
+// so the mean matter density / displacement constraint must NOT be given this term. `Hubble` here
+// is `All.Hubble = HUBBLE_cgs * UnitTime_in_s` (ticket 01's `GadgetParams::Hubble`), not H0 in
 // physical units.
-double gadget_hubble_a(double Omega0, double OmegaLambda, double Hubble, double time);
+double gadget_hubble_a(double Omega0, double OmegaLambda, double OmegaRad, double Hubble,
+                       double time);
 
 // find_dt_displacement_constraint(), timestep.c:566-644, now including the PMGRID/
 // PLACEHIGHRESREGION Asmth[0]/[1] refinement (timestep.c:623-628) -- previously deferred here

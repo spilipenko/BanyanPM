@@ -3801,7 +3801,7 @@ void octree::recomputeTimestepGlobals(tree_structure &tree)
 
   const double time    = (double) get_t_current();
   const double hubble_a = gadget_hubble_a(gadgetParams.Omega0, gadgetParams.OmegaLambda,
-                                           gadgetParams.Hubble, time);
+                                           gadgetParams.OmegaRad, gadgetParams.Hubble, time);
   const double hfac = hubble_a * time * time; // hfac = a^2*H(a), timestep.c:66
 
   // Phase 5 ticket 07 (PLAN.md): PMGRID/PLACEHIGHRESREGION Asmth[0]/[1] refinement
@@ -3868,7 +3868,8 @@ void octree::initComovingTables()
 
   GadgetDriftTables tables;
   gadget_init_drift_tables(gadgetParams.TimeBegin, gadgetParams.TimeMax, gadgetParams.Omega0,
-                            gadgetParams.OmegaLambda, gadgetParams.Hubble, tables);
+                            gadgetParams.OmegaLambda, gadgetParams.OmegaRad, gadgetParams.Hubble,
+                            tables);
 
   for (int i = 0; i < GADGET_DRIFT_TABLE_LENGTH; ++i)
   {
@@ -4947,7 +4948,7 @@ void octree::correct(tree_structure &tree)
         ts_atime    = (float) time;
         ts_fac1     = (float) (1.0 / (time * time));
         ts_hubble_a = (float) gadget_hubble_a(gadgetParams.Omega0, gadgetParams.OmegaLambda,
-                                               gadgetParams.Hubble, time);
+                                               gadgetParams.OmegaRad, gadgetParams.Hubble, time);
       }
       else
       {

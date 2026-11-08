@@ -57,7 +57,6 @@ void ca01_set_cc_skip(int on);
 // Contracts C-D-02 / C-D-03: kick-interval end point and per-particle activation predicate.
 void cd02_set_kick_tend(int on);
 void cd03_set_strict_active(int on);
-void cd03b_set_fix_index(int on);
 void energy_set_extrap(int on);
 void cd04_set_timeline_ladder(int on);
 void energy_set_force_all_active(int on);

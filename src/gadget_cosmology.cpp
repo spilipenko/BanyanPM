@@ -2,11 +2,13 @@
 
 #include <cmath>
 
-double gadget_hubble_a(double Omega0, double OmegaLambda, double Hubble, double time)
+double gadget_hubble_a(double Omega0, double OmegaLambda, double OmegaRad, double Hubble,
+                       double time)
 {
-  // timestep.c:52-55, exact formula.
+  // timestep.c:52-55, exact formula, plus the T82 radiation term OmegaRad/a^4.
   const double h2 = Omega0 / (time * time * time) +
-                     (1.0 - Omega0 - OmegaLambda) / (time * time) + OmegaLambda;
+                     (1.0 - Omega0 - OmegaLambda - OmegaRad) / (time * time) +
+                     OmegaLambda + OmegaRad / (time * time * time * time);
   return Hubble * std::sqrt(h2);
 }
 

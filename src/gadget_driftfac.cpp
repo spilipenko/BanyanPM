@@ -38,13 +38,14 @@ double lookupTable(const float *table, double logTimeBegin, double logTimeMax, d
 } // namespace
 
 void gadget_init_drift_tables(double timeBegin, double timeMax, double omega0,
-                               double omegaLambda, double hubble, GadgetDriftTables &out)
+                               double omegaLambda, double omegaRad, double hubble,
+                               GadgetDriftTables &out)
 {
   out.logTimeBegin = std::log(timeBegin);
   out.logTimeMax   = std::log(timeMax);
   const double dloga = (out.logTimeMax - out.logTimeBegin) / GADGET_DRIFT_TABLE_LENGTH;
 
-  auto Hofa = [&](double a) { return gadget_hubble_a(omega0, omegaLambda, hubble, a); };
+  auto Hofa = [&](double a) { return gadget_hubble_a(omega0, omegaLambda, omegaRad, hubble, a); };
   // Substituting x=log(a): da = a*dx, so integrating in x needs an extra factor of `a`.
   auto driftIntegrand = [&](double loga) {
     const double a = std::exp(loga);
