@@ -426,14 +426,19 @@ is present only in the file holding the one species whose header mass is zero.
 z = 0; default 0) is validated against a modified GADGET-2 that carries the same `OmegaRad/a⁴` term
 in the Friedmann equation. The test is the growth of dark-matter "dresses" around primordial black
 holes from z = 30000 through the radiation era to a = 0.5 (256³, 16.8 M DM particles + 171 PBHs,
-Ωm = 0.315, ΩΛ = 0.685, Ωrad = 9.33e-5, comoving softening 5e-5). The dress mass M/M_BH matches the
-reference to **0.009% at a = 0.5** (99.757 vs 99.748), with a **median per-snapshot ratio of
-1.00006** across all 26 epochs. The radiation-era snapshots (a ≲ a_eq = 2.96e-4) agree too — both
-codes sit below the `a/a_eq` line there, which is the radiation-domination signature — so the
-expansion history, not just the endpoint, is right. Around the dress-formation epoch
-(a ≈ 2e-3…1e-2) individual snapshots scatter by up to ~10%, which is the two solvers' different
-softening/MAC resolution of the turnaround radius; it converges to < 0.1% for a ≳ 0.04. The
-comparison harness is `minihalo_growth.jl` in `~/work/PBH_BanyanPM/` (Julia; not shipped here).
+Ωm = 0.315, ΩΛ = 0.685, Ωrad = 9.33e-5, comoving softening 5e-5, PMGRID 256). The turnaround radius
+and enclosed dress mass are measured per PBH with the reference paper's own protocol (100 000
+nearest neighbours, nearest-PBH merger cleaning, median statistic).
+
+Through the radiation era and early matter era (a ≲ 0.03) the median dress mass agrees with the
+reference to **~1%** (Gadget/BanyanPM ratio 1.004–1.014 over the 171-PBH sample), and both codes
+sit below the `a/a_eq` line at a < a_eq = 2.96e-4 — the radiation-domination signature — so the
+expansion history is right. At late a the curves separate: at a = 0.5 the median dress mass is
+**≈12% lower** than the reference (259 vs 294 M/M_BH; the mean is ≈20% lower, 322 vs 402). This
+late-time gap tracks the dress growth's measured sensitivity to the force softening — halving ε
+changes the late-a dress mass by a factor ~3 — so it reflects two-body relaxation of the dress
+outskirts rather than the background expansion. The comparison harness is `minihalo_growth.jl` in
+`~/work/PBH_BanyanPM/` (Julia; not shipped here).
 
 Note that this validates dark-matter-only, periodic, TreePM runs at one resolution, the zoom path at
 one much smaller resolution, and the radiation background against the modified-GADGET-2 reference.
